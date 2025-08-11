@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stock Analyzer</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+</head>
+<body class="bg-light">
+  <div class="container py-4">
+    <h1 class="mb-3">Stock Analyzer</h1>
+
+    <!-- Flash messages from Flask -->
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="alert alert-danger">
+          {% for m in messages %}<div>{{ m }}</div>{% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <!-- Debug (hidden unless ?debug=1) -->
+    <details id="debug-panel" class="mb-3" style="display:none;">
+      <summary class="small text-muted">Debug (click to expand)</summary>
+      <pre id="dbg" class="p-2 border bg-white small" style="max-height:220px; overflow:auto;"></pre>
+    </details>
+
+    <!-- Analyze single ticker -->
+    <form method="post" class="mt-2">
+      <div class="row g-2 align-items-end">
+        <div class="col-sm-6">
+          <label for="ticker" class="form-label">Enter Stock Ticker</label>
+          <input type="text" name="ticker" id="ticker" class="form-control" placeholder="AAPL" required>
+        </div>
+        <div class="col-auto">
+          <button type="submit" class="btn btn-primary">Analyze</button>
+        </div>
+      </div>
+    </form>
+
+    <!-- Refresh recommendations -->
+    <form action="/seek" method="get" class="mt-3">
+      <button type="submit" class="btn btn-outline-secondary">Refresh Top 5 Picks</button>
+    </form>
+
+    <hr>
+    <h3 class="h5">Results</h3>
+    <div id="metrics" class="mb-3"></div>
+
+    <div id="chart" class="mb-3"></div>
+    <div id="rsi-chart" class="mb-5"></div>
+
+    <h3 class="h5 mt-4">Top 5 Stock Picks</h3>
+    <ul id="recs" class="list-group mb-4"></ul>
+  </div>
+
+  <script>
+(function () {
+  // Pre-serialized JSON from app.py
+  const r        = {{ result_json | default('{}') | safe }};
+  const recsData = {{ recommendations_json | default('[]') | safe }};
+
+  // Debug (hidden unless ?debug=1)
+  const showDebug = new URLSearchParams(location.search).get('debug') === '1';
+  const dbgPanel  = document.getElementById('debug-panel');
+  const dbgEl     = document.getElementById('dbg');
+  if (showDebug && dbgPanel) {
+    dbgPanel.style.display = '';
+    if (dbgEl) {
+      dbgEl.textContent =
+        'result = ' + JSON.stringify(r, null, 2) + '\n\n' +
+        'recommendations = ' + JSON.stringify(recsData, null, 2);
+    }
+  }
+
+  // Render metrics
+  const metricsDiv = document.getElementById('metrics');
+  if (r && Object.keys(r).length) {
+    const keys = ['Symbol','Close','RSI','50-day MA','200-day MA','Recommendation'];
+    const html = keys.filter(k => r[k] !== undefined)
+      .map(k => `<div><strong>${k}:</strong> ${r[k]}</div>`)
+      .join('');
+    metricsDiv.innerHTML = html || '<div class="text-muted">No metrics.</div>';
+  } else {
+    metricsDiv.innerHTML = '<div class="text-muted">No analysis yet.</div>';
+  }
+
+  // ----- Recommendations (single declaration) -----
+  const recsUl = document.getElementById('recs');
+  const renderRecs = (list) => {
+    const items = Array.isArray(list) ? list : [];
+    recsUl.innerHTML = items.map(item => {
+      const why = Array.isArray(item.Why) ? item.Why.slice(0,3).join('; ') : '';
+      const score = (item.Score !== undefined) ? ` — score ${item.Score}` : '';
+      return `<li class="list-group-item">
+                <strong>${item.Symbol}</strong>: ${item.Recommendation}${score}
+                ${why ? `<div class="text-muted small">${why}</div>` : ''}
+              </li>`;
+    }).join('');
+  };
+  renderRecs(recsData);
+
+  // ----- Charts -----
+  const chartDiv = document.getElementById('chart');
+  const rsiDiv   = document.getElementById('rsi-chart');
+  const cd = (r && r['Chart Data']) ? r['Chart Data'] : [];
+
+  if (Array.isArray(cd) && cd.length) {
+    const dates  = cd.map(d => d.Date);
+    const close  = cd.map(d => d.Close);
+    const sma50  = cd.map(d => d['SMA_50']);
+    const sma200 = cd.map(d => d['SMA_200']);
+
+    Plotly.newPlot(chartDiv, [
+      { x: dates, y: close,  type: 'scatter', mode: 'lines', name: 'Close' },
+      { x: dates, y: sma50,  type: 'scatter', mode: 'lines', name: 'SMA 50',  line: { dash: 'dash' } },
+      { x: dates, y: sma200, type: 'scatter', mode: 'lines', name: 'SMA 200', line: { dash: 'dot' } }
+    ], { title: 'Price (last ~180 days)', height: 420, showlegend: true });
+
+    const rsi = cd.map(d => d.RSI);
+    const line30 = { x: dates, y: dates.map(() => 30), type: 'scatter', mode: 'lines', name: '30', line: { dash: 'dot' }, hoverinfo: 'skip' };
+    const line70 = { x: dates, y: dates.map(() => 70), type: 'scatter', mode: 'lines', name: '70', line: { dash: 'dot' }, hoverinfo: 'skip' };
+    Plotly.newPlot(rsiDiv, [
+      { x: dates, y: rsi, type: 'scatter', mode: 'lines', name: 'RSI' },
+      line30, line70
+    ], { title: 'RSI', height: 300, showlegend: true, yaxis: { range: [0, 100] } });
+  } else {
+    chartDiv.innerHTML = '<div class="text-muted">No chart data available.</div>';
+    rsiDiv.innerHTML   = '';
+  }
+
+  // ----- Refresh picks: recompute on server, then fetch fresh -----
+  const recsForm = document.getElementById('refresh-recs');
+  if (recsForm) {
+    recsForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await fetch('/seek', { method: 'GET', cache: 'no-store' }); // trigger recompute
+        const res  = await fetch('/api/recommendations', { cache: 'no-store' });
+        const json = await res.json();
+        const list = (json && json.ok && Array.isArray(json.data)) ? json.data : [];
+        renderRecs(list);
+      } catch (err) {
+        console.error('Failed to refresh recommendations', err);
+      }
+    });
+  }
+
+  // ----- Backtest runner -----
+  const btBtn   = document.getElementById('run-backtest');
+  const btYears = document.getElementById('bt-years');
+  const btOut   = document.getElementById('bt-metrics');
+  const btChart = document.getElementById('bt-curve');
+
+  if (btBtn) {
+    btBtn.addEventListener('click', async () => {
+      try {
+        const sym = (r && r.Symbol) ? r.Symbol : (document.getElementById('ticker').value || '').trim().toUpperCase();
+        if (!sym) { btOut.textContent = 'Enter a ticker first.'; return; }
+        const years = btYears ? parseInt(btYears.value, 10) : 3;
+
+        btOut.textContent = 'Running backtest...';
+        const res  = await fetch(`/api/backtest/${encodeURIComponent(sym)}?years=${years}`, { cache: 'no-store' });
+        const json = await res.json();
+        if (!json.ok) { btOut.textContent = 'Backtest error: ' + (json.error || 'unknown'); return; }
+        const { metrics, equity_curve } = json.data;
+
+        btOut.innerHTML = `
+          <div><strong>CAGR:</strong> ${(metrics['CAGR']*100).toFixed(2)}%</div>
+          <div><strong>Max Drawdown:</strong> ${(metrics['Max Drawdown']*100).toFixed(2)}%</div>
+          <div><strong>Volatility:</strong> ${(metrics['Volatility']*100).toFixed(2)}%</div>
+          <div><strong>Sharpe:</strong> ${metrics['Sharpe'].toFixed(2)}</div>
+          <div><strong>Trades:</strong> ${metrics['Trades']}</div>
+          <div><strong>Win Rate:</strong> ${(metrics['Win Rate']*100).toFixed(1)}%</div>
+          <div><strong>Avg Win:</strong> ${(metrics['Avg Win']*100).toFixed(2)}%</div>
+          <div><strong>Avg Loss:</strong> ${(metrics['Avg Loss']*100).toFixed(2)}%</div>
+        `;
+
+        if (Array.isArray(equity_curve) && equity_curve.length) {
+          const dates = equity_curve.map(p => p.Date);
+          const eq    = equity_curve.map(p => p.Equity);
+          Plotly.newPlot(btChart, [
+            { x: dates, y: eq, type: 'scatter', mode: 'lines', name: 'Equity' }
+          ], { title: `Equity Curve (${sym})`, height: 320, showlegend: false });
+        } else {
+          btChart.innerHTML = '<div class="text-muted">No equity data.</div>';
+        }
+      } catch (e) {
+        btOut.textContent = 'Backtest error.';
+        console.error(e);
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>
