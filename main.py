@@ -33,12 +33,31 @@ class Monster:
     speed: int
     type: str
     moves: List[Move] = field(default_factory=list)
+    exp: int = 0
+    exp_to_next: int = 20
 
     def is_fainted(self) -> bool:
         return self.current_hp <= 0
 
     def heal(self) -> None:
         self.current_hp = self.max_hp
+
+    def gain_experience(self, amount: int) -> List[str]:
+        """Add experience and return messages for any level ups."""
+        messages: List[str] = []
+        self.exp += amount
+        while self.exp >= self.exp_to_next:
+            self.exp -= self.exp_to_next
+            self.level += 1
+            # Simple stat growth for prototype level ups
+            self.max_hp += 3
+            self.attack += 2
+            self.defense += 2
+            self.speed += 1
+            self.current_hp = self.max_hp
+            self.exp_to_next = max(20, int(self.exp_to_next * 1.3))
+            messages.append(f"{self.name} grew to level {self.level}!")
+        return messages
 
 
 # ----------------------------------------------------------------------------
@@ -69,6 +88,8 @@ def create_monster_templates(move_library: Dict[str, Move]) -> Dict[str, Monster
             speed=10,
             type="ember",
             moves=[move_library["Cinder Snap"], move_library["Nuzzle"]],
+            exp=0,
+            exp_to_next=20,
         ),
         "Splashfin": Monster(
             name="Splashfin",
@@ -80,6 +101,8 @@ def create_monster_templates(move_library: Dict[str, Move]) -> Dict[str, Monster
             speed=9,
             type="aqua",
             moves=[move_library["Ripple Shot"], move_library["Nuzzle"]],
+            exp=0,
+            exp_to_next=20,
         ),
         "Budling": Monster(
             name="Budling",
@@ -91,6 +114,8 @@ def create_monster_templates(move_library: Dict[str, Move]) -> Dict[str, Monster
             speed=8,
             type="flora",
             moves=[move_library["Leaf Gust"], move_library["Nuzzle"]],
+            exp=0,
+            exp_to_next=20,
         ),
     }
 
@@ -101,12 +126,14 @@ def clone_monster(template: Monster) -> Monster:
         name=template.name,
         level=template.level,
         max_hp=template.max_hp,
-        current_hp=template.max_hp,
+        current_hp=template.current_hp,
         attack=template.attack,
         defense=template.defense,
         speed=template.speed,
         type=template.type,
         moves=list(template.moves),
+        exp=template.exp,
+        exp_to_next=template.exp_to_next,
     )
 
 
@@ -118,14 +145,18 @@ TILE_SIZE = 32
 WINDOW_WIDTH, WINDOW_HEIGHT = 640, 480
 MAP_LAYOUT = [
     "####################",
-    "#..............GGGG#",
-    "#..######..........#",
-    "#..#....#..........#",
-    "#..#....#....GGGG..#",
-    "#..#....#..........#",
-    "#..######..........#",
+    "#....GGGGGG....GG..#",
+    "#..######....####..#",
+    "#..#....#....#..#..#",
+    "#..#....#....#..#..#",
+    "#....CCCCCCCC......#",
+    "#....C......C..GG..#",
+    "#....C.DD..D.C.....#",
+    "#....CCCCCCCC......#",
     "#..................#",
-    "#..GGGG............#",
+    "#.SSS......GGGG....#",
+    "#.SHS......GGGG....#",
+    "#.SDS......GGGG....#",
     "#..................#",
     "####################",
 ]
@@ -136,6 +167,10 @@ TILE_TYPES = {
     "#": {"color": (70, 70, 70), "walkable": False, "name": "Wall"},
     ".": {"color": (200, 200, 160), "walkable": True, "name": "Ground"},
     "G": {"color": (120, 200, 120), "walkable": True, "name": "Grass"},
+    "C": {"color": (150, 150, 180), "walkable": False, "name": "Great Hall"},
+    "D": {"color": (230, 210, 150), "walkable": True, "name": "Door"},
+    "S": {"color": (140, 140, 170), "walkable": False, "name": "House Wall"},
+    "H": {"color": (170, 230, 200), "walkable": True, "name": "Healing Floor"},
 }
 
 
@@ -210,6 +245,10 @@ def accuracy_check(move: Move) -> bool:
     return random.random() <= move.accuracy
 
 
+def calculate_exp_gain(defeated: Monster) -> int:
+    return 10 + defeated.level * 5
+
+
 def start_battle(player_monster: Monster, wild_monsters: List[Monster]) -> BattleState:
     enemy_template = random.choice(wild_monsters)
     enemy = clone_monster(enemy_template)
@@ -227,7 +266,7 @@ def draw_text(surface: pygame.Surface, text: str, position: tuple[int, int], fon
     surface.blit(rendered, position)
 
 
-def draw_overworld(screen: pygame.Surface, player: Player, font: pygame.font.Font) -> None:
+def draw_overworld(screen: pygame.Surface, player: Player, font: pygame.font.Font, message: Optional[str]) -> None:
     for y, row in enumerate(MAP_LAYOUT):
         for x, tile in enumerate(row):
             tile_info = TILE_TYPES[tile]
@@ -236,7 +275,8 @@ def draw_overworld(screen: pygame.Surface, player: Player, font: pygame.font.Fon
             pygame.draw.rect(screen, (30, 30, 30), rect, 1)
 
     pygame.draw.rect(screen, (220, 60, 60), player.rect())
-    draw_text(screen, "Use arrow keys to explore. Walk on grass to find creatures!", (10, WINDOW_HEIGHT - 25), font)
+    hint = message or "Use arrow keys to explore. Walk on grass to find creatures!"
+    draw_text(screen, hint, (10, WINDOW_HEIGHT - 25), font)
 
 
 def draw_hp_bar(surface: pygame.Surface, font: pygame.font.Font, monster: Monster, position: tuple[int, int]) -> None:
@@ -254,6 +294,12 @@ def draw_battle(screen: pygame.Surface, battle: BattleState, font: pygame.font.F
     screen.fill((220, 220, 255))
     draw_hp_bar(screen, font, battle.player_monster, (40, 320))
     draw_hp_bar(screen, font, battle.enemy_monster, (360, 120))
+    draw_text(
+        screen,
+        f"EXP: {battle.player_monster.exp}/{battle.player_monster.exp_to_next}",
+        (40, 350),
+        small_font,
+    )
 
     # Basic placeholders for monsters
     pygame.draw.circle(screen, (255, 120, 80), (120, 260), 40)
@@ -339,8 +385,17 @@ def execute_player_turn(battle: BattleState, move: Move) -> None:
         battle.queue_message(f"It dealt {damage} damage!")
 
         if defender.is_fainted():
+            exp_gain = calculate_exp_gain(defender)
+
+            def award_exp() -> None:
+                level_messages = attacker.gain_experience(exp_gain)
+                for message in level_messages:
+                    battle.queue_message(message)
+                battle.after_battle_callback = lambda: setattr(battle, "ended", True)
+
             battle.queue_message(f"Wild {defender.name} fainted!")
-            battle.after_battle_callback = lambda: setattr(battle, "ended", True)
+            battle.queue_message(f"{attacker.name} gained {exp_gain} EXP!", callback=award_exp)
+            battle.pending_enemy_turn = False
             return
 
     battle.pending_enemy_turn = True
@@ -394,6 +449,8 @@ def main() -> None:
     player = Player(tile_x=2, tile_y=2)
     game_mode = "overworld"
     active_battle: Optional[BattleState] = None
+    overworld_message: Optional[str] = None
+    overworld_message_timer = 0
 
     def end_battle() -> None:
         nonlocal game_mode, active_battle
@@ -430,21 +487,33 @@ def main() -> None:
                     if can_walk(new_x, new_y):
                         player.tile_x = new_x
                         player.tile_y = new_y
-                        if on_grass(new_x, new_y) and encounter_chance():
+                        tile_symbol = tile_at(new_x, new_y)
+                        if tile_symbol == "H":
+                            for monster in player_party:
+                                monster.heal()
+                            overworld_message = "Your party was restored at the roadside house!"
+                            overworld_message_timer = 180
+                        if tile_symbol == "G" and encounter_chance():
                             game_mode = "battle"
                             active_battle = start_battle(player_party[0], wild_pool)
-                    
+                            overworld_message = None
+
             elif game_mode == "battle" and active_battle:
                 handle_battle_input(event, active_battle)
 
         screen.fill((0, 0, 0))
 
         if game_mode == "overworld":
-            draw_overworld(screen, player, font)
+            draw_overworld(screen, player, font, overworld_message)
         elif game_mode == "battle" and active_battle:
             draw_battle(screen, active_battle, font, small_font)
             if getattr(active_battle, "ended", False) and not active_battle.message_queue and not active_battle.pending_enemy_turn:
                 end_battle()
+
+        if overworld_message_timer > 0:
+            overworld_message_timer -= 1
+            if overworld_message_timer == 0:
+                overworld_message = None
 
         pygame.display.flip()
         clock.tick(60)
