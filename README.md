@@ -35,6 +35,12 @@ recommendations so that the UI can load quickly.
    pip install -r requirements.txt
    ```
 
+   The requirements pin `pandas==2.1.4`, which is the latest release that offers
+   pre-built wheels for macOS + Python 3.10 without compilation errors. If you
+   see a build failure referencing `pandas`, confirm the virtual environment is
+   active and rerun `pip install pandas==2.1.4` manually before retrying the
+   requirements install.
+
 3. **Configure Alpaca paper credentials** – either export environment variables or create a
    `.env` file (loaded automatically via [python-dotenv](https://pypi.org/project/python-dotenv/))
    alongside `app.py`:
