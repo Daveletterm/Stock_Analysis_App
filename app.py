@@ -13,8 +13,11 @@ import numpy as np
 import yfinance as yf
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
 
 from paper_trading import AlpacaPaperBroker
+
+load_dotenv()
 
 # -----------------------------
 # App setup
@@ -31,6 +34,17 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("stockapp")
+
+try:  # Optional dependency used for some advanced indicators
+    import pandas_ta as _pandas_ta  # type: ignore
+
+    HAS_PANDAS_TA = True
+except ImportError:
+    HAS_PANDAS_TA = False
+    _pandas_ta = None
+    logger.info(
+        "pandas-ta not installed; advanced technical indicators will be skipped."
+    )
 
 # Paper trading configuration
 paper_broker = AlpacaPaperBroker()
@@ -173,6 +187,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["LL_20"] = df["Low"].rolling(20, min_periods=1).min().astype(float)
     df["HH_252"] = df["High"].rolling(252, min_periods=1).max().astype(float)
     df["pct_from_52w_high"] = (df["Close"] / df["HH_252"] - 1.0).replace([np.inf, -np.inf], np.nan)
+    if HAS_PANDAS_TA:
+        try:
+            df["EMA_21"] = _pandas_ta.ema(df["Close"], length=21)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("pandas-ta EMA calculation failed: %s", exc)
+            df["EMA_21"] = pd.NA
+    else:
+        df["EMA_21"] = pd.NA
     return df
 
 
