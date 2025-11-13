@@ -9,7 +9,12 @@
 </head>
 <body class="bg-light">
   <div class="container py-4">
-    <h1 class="mb-3">Stock Analyzer</h1>
+    <div class="d-flex flex-wrap justify-content-between align-items-center mb-3">
+      <h1 class="mb-0">Stock Analyzer</h1>
+      <div class="mt-2 mt-sm-0">
+        <a class="btn btn-outline-primary" href="/paper">Paper Trading Desk</a>
+      </div>
+    </div>
 
     <!-- Flash messages from Flask -->
     {% with messages = get_flashed_messages() %}
@@ -40,20 +45,35 @@
     </form>
 
     <!-- Refresh recommendations -->
-    <form action="/seek" method="get" class="mt-3">
-      <button type="submit" class="btn btn-outline-secondary">Refresh Top 5 Picks</button>
-    </form>
+      <form id="refresh-recs" action="/seek" method="get" class="mt-3">
+        <button type="submit" class="btn btn-outline-secondary">Refresh Top 5 Picks</button>
+      </form>
 
-    <hr>
-    <h3 class="h5">Results</h3>
-    <div id="metrics" class="mb-3"></div>
+      <hr>
+      <h3 class="h5">Results</h3>
+      <div id="metrics" class="mb-3"></div>
 
-    <div id="chart" class="mb-3"></div>
-    <div id="rsi-chart" class="mb-5"></div>
+      <div id="chart" class="mb-3"></div>
+      <div id="rsi-chart" class="mb-5"></div>
 
-    <h3 class="h5 mt-4">Top 5 Stock Picks</h3>
-    <ul id="recs" class="list-group mb-4"></ul>
-  </div>
+      <section class="mb-5">
+        <h3 class="h5">Quick Backtest</h3>
+        <div class="row g-2 align-items-end mb-3">
+          <div class="col-auto">
+            <label for="bt-years" class="form-label">Years</label>
+            <input type="number" id="bt-years" class="form-control" value="3" min="1" max="10">
+          </div>
+          <div class="col-auto">
+            <button id="run-backtest" type="button" class="btn btn-secondary">Run Backtest</button>
+          </div>
+        </div>
+        <div id="bt-metrics" class="mb-3 text-muted"></div>
+        <div id="bt-curve"></div>
+      </section>
+
+      <h3 class="h5 mt-4">Top 5 Stock Picks</h3>
+      <ul id="recs" class="list-group mb-4"></ul>
+    </div>
 
   <script>
 (function () {

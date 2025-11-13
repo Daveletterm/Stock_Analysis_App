@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Paper Trading Desk</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+  <div class="container py-4">
+    <div class="d-flex flex-wrap justify-content-between align-items-center mb-3">
+      <h1 class="mb-0">Paper Trading Desk</h1>
+      <div class="mt-2 mt-sm-0">
+        <a class="btn btn-outline-secondary" href="/">Back to Analyzer</a>
+      </div>
+    </div>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="alert alert-info">
+          {% for m in messages %}<div>{{ m }}</div>{% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    {% if broker_error %}
+      <div class="alert alert-warning">{{ broker_error }}</div>
+    {% endif %}
+
+    {% if not broker_enabled %}
+      <p class="text-muted">Configure <code>ALPACA_PAPER_KEY_ID</code> and <code>ALPACA_PAPER_SECRET_KEY</code> environment variables, then restart the server.</p>
+    {% else %}
+      <section class="mb-4">
+        <h2 class="h4">Account Snapshot</h2>
+        {% if account %}
+          <div class="row g-3">
+            <div class="col-md-3 col-sm-6">
+              <div class="card shadow-sm">
+                <div class="card-body">
+                  <div class="text-muted text-uppercase small">Equity</div>
+                  <div class="fs-5">${{ account.equity | default(0) | float | round(2) }}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-3 col-sm-6">
+              <div class="card shadow-sm">
+                <div class="card-body">
+                  <div class="text-muted text-uppercase small">Cash</div>
+                  <div class="fs-5">${{ account.cash | default(0) | float | round(2) }}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-3 col-sm-6">
+              <div class="card shadow-sm">
+                <div class="card-body">
+                  <div class="text-muted text-uppercase small">Buying Power</div>
+                  <div class="fs-5">${{ account.buying_power | default(0) | float | round(2) }}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-3 col-sm-6">
+              <div class="card shadow-sm">
+                <div class="card-body">
+                  <div class="text-muted text-uppercase small">Today's P&amp;L</div>
+                  <div class="fs-5 {% if todays_pl is not none and todays_pl >= 0 %}text-success{% elif todays_pl is not none %}text-danger{% endif %}">
+                    {% if todays_pl is not none %}${{ todays_pl | round(2) }}{% else %}N/A{% endif %}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        {% else %}
+          <p class="text-muted">Account details unavailable.</p>
+        {% endif %}
+      </section>
+
+      <section class="mb-5">
+        <h2 class="h4">Submit Order</h2>
+        <p class="text-muted small">Guardrails cap each order at {{ (PAPER_MAX_POSITION_PCT * 100) | round(1) }}% of equity and ${{ PAPER_MAX_POSITION_NOTIONAL | round(2) }} notional. Default bracket adds a {{ (PAPER_DEFAULT_STOP_LOSS_PCT * 100) | round(1) }}% stop loss / {{ (PAPER_DEFAULT_TAKE_PROFIT_PCT * 100) | round(1) }}% take profit.</p>
+        <form action="/paper/order" method="post" class="row g-3 align-items-end">
+          <div class="col-sm-2">
+            <label for="symbol" class="form-label">Symbol</label>
+            <input type="text" class="form-control" id="symbol" name="symbol" placeholder="AAPL" required>
+          </div>
+          <div class="col-sm-2">
+            <label for="quantity" class="form-label">Quantity</label>
+            <input type="number" class="form-control" id="quantity" name="quantity" min="1" value="1" required>
+          </div>
+          <div class="col-sm-2">
+            <label for="side" class="form-label">Side</label>
+            <select class="form-select" id="side" name="side">
+              <option value="buy" selected>Buy</option>
+              <option value="sell">Sell</option>
+            </select>
+          </div>
+          <div class="col-sm-2">
+            <label for="order_type" class="form-label">Order Type</label>
+            <select class="form-select" id="order_type" name="order_type">
+              <option value="market" selected>Market</option>
+              <option value="limit">Limit</option>
+            </select>
+          </div>
+          <div class="col-sm-2">
+            <label for="limit_price" class="form-label">Limit Price</label>
+            <input type="number" step="0.01" class="form-control" id="limit_price" name="limit_price" placeholder="Only for limit">
+          </div>
+          <div class="col-sm-2">
+            <label for="time_in_force" class="form-label">Time in Force</label>
+            <select class="form-select" id="time_in_force" name="time_in_force">
+              <option value="day" selected>Day</option>
+              <option value="gtc">GTC</option>
+            </select>
+          </div>
+          <div class="col-sm-3">
+            <label for="stop_loss_pct" class="form-label">Stop Loss %</label>
+            <input type="number" step="0.1" class="form-control" id="stop_loss_pct" name="stop_loss_pct" placeholder="Default {{ (PAPER_DEFAULT_STOP_LOSS_PCT * 100) | round(1) }}">
+          </div>
+          <div class="col-sm-3">
+            <label for="take_profit_pct" class="form-label">Take Profit %</label>
+            <input type="number" step="0.1" class="form-control" id="take_profit_pct" name="take_profit_pct" placeholder="Default {{ (PAPER_DEFAULT_TAKE_PROFIT_PCT * 100) | round(1) }}">
+          </div>
+          <div class="col-sm-12">
+            <button type="submit" class="btn btn-primary">Submit Order</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="mb-4">
+        <h2 class="h4">Open Positions</h2>
+        {% if positions %}
+          <div class="table-responsive">
+            <table class="table table-sm table-striped">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Qty</th>
+                  <th>Market Value</th>
+                  <th>Avg Entry</th>
+                  <th>Unrealized P&amp;L</th>
+                  <th>Today P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for pos in positions %}
+                  <tr>
+                    <td>{{ pos.symbol }}</td>
+                    <td>{{ pos.qty | default(0) }}</td>
+                    <td>${{ pos.market_value | default(0) | float | round(2) }}</td>
+                    <td>${{ pos.avg_entry_price | default(0) | float | round(2) }}</td>
+                    <td class="{% if pos.unrealized_pl | default(0) | float >= 0 %}text-success{% else %}text-danger{% endif %}">${{ pos.unrealized_pl | default(0) | float | round(2) }}</td>
+                    <td class="{% if pos.unrealized_intraday_pl | default(0) | float >= 0 %}text-success{% else %}text-danger{% endif %}">${{ pos.unrealized_intraday_pl | default(0) | float | round(2) }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="text-muted">No open positions.</p>
+        {% endif %}
+      </section>
+
+      <section>
+        <h2 class="h4">Recent Orders</h2>
+        {% if orders %}
+          <div class="table-responsive">
+            <table class="table table-sm table-striped">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Qty</th>
+                  <th>Type</th>
+                  <th>Status</th>
+                  <th>Submitted</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for o in orders %}
+                  <tr>
+                    <td class="text-break">{{ o.id }}</td>
+                    <td>{{ o.symbol }}</td>
+                    <td>{{ o.side }}</td>
+                    <td>{{ o.qty }}</td>
+                    <td>{{ o.type }}</td>
+                    <td>{{ o.status }}</td>
+                    <td>{{ o.submitted_at }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="text-muted">No recent orders.</p>
+        {% endif %}
+      </section>
+    {% endif %}
+  </div>
+</body>
+</html>

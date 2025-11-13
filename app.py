@@ -6,12 +6,15 @@ import threading
 import logging
 from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+
+from paper_trading import AlpacaPaperBroker
 
 # -----------------------------
 # App setup
@@ -28,6 +31,13 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("stockapp")
+
+# Paper trading configuration
+paper_broker = AlpacaPaperBroker()
+PAPER_MAX_POSITION_PCT = float(os.getenv("PAPER_MAX_POSITION_PCT", "0.1"))
+PAPER_MAX_POSITION_NOTIONAL = float(os.getenv("PAPER_MAX_POSITION_NOTIONAL", "5000"))
+PAPER_DEFAULT_STOP_LOSS_PCT = float(os.getenv("PAPER_STOP_LOSS_PCT", "0.05"))
+PAPER_DEFAULT_TAKE_PROFIT_PCT = float(os.getenv("PAPER_TAKE_PROFIT_PCT", "0.1"))
 
 # -----------------------------
 # Globals & caches
@@ -125,6 +135,32 @@ def to_plain(obj):
     return obj
 
 
+@lru_cache(maxsize=256)
+def fetch_latest_price(ticker: str) -> float:
+    """Fetch the most recent closing price for guardrail calculations."""
+    hist = yf.Ticker(ticker).history(period="5d")
+    if hist is None or hist.empty:
+        hist = yf.download(ticker, period="1d", auto_adjust=True, progress=False)
+    if hist is None or hist.empty:
+        raise ValueError(f"No recent price data for {ticker}")
+    price = hist["Close"].iloc[-1]
+    return float(price)
+
+
+def parse_percent(value, default):
+    try:
+        if value is None or value == "":
+            raise ValueError
+        val = float(value)
+        if val > 1:
+            val = val / 100.0
+        if val < 0:
+            raise ValueError
+        return val
+    except Exception:
+        return default
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Close"] = df["Close"].astype(float)
@@ -185,6 +221,82 @@ def score_stock(df: pd.DataFrame) -> tuple[float, list[str]]:
         reasons.append("low volatility (<4% ATR)")
 
     return round(float(score), 2), reasons
+
+
+def place_guarded_paper_order(
+    symbol: str,
+    qty: int,
+    side: str,
+    order_type: str = "market",
+    limit_price: float | None = None,
+    stop_loss_pct: float | None = None,
+    take_profit_pct: float | None = None,
+    time_in_force: str = "day",
+):
+    if not paper_broker.enabled:
+        raise RuntimeError("Paper trading credentials are not configured")
+    if not TICKER_RE.match(symbol):
+        raise ValueError("Enter a valid ticker symbol")
+    if qty <= 0:
+        raise ValueError("Quantity must be positive")
+    if side not in {"buy", "sell"}:
+        raise ValueError("Side must be 'buy' or 'sell'")
+    if order_type not in {"market", "limit"}:
+        raise ValueError("Order type must be market or limit")
+
+    symbol = symbol.upper()
+    entry_price = None
+    if order_type == "limit":
+        if limit_price is None or limit_price <= 0:
+            raise ValueError("Provide a positive limit price")
+        entry_price = float(limit_price)
+    if entry_price is None:
+        entry_price = fetch_latest_price(symbol)
+    notional = float(entry_price) * qty
+
+    account = paper_broker.get_account()
+    equity = float(account.get("equity") or account.get("cash") or 0.0)
+    buying_power = float(account.get("buying_power") or account.get("cash") or 0.0)
+
+    if PAPER_MAX_POSITION_NOTIONAL and notional > PAPER_MAX_POSITION_NOTIONAL:
+        raise ValueError(
+            f"Order notional ${notional:,.2f} exceeds max allowed ${PAPER_MAX_POSITION_NOTIONAL:,.2f}"
+        )
+    if PAPER_MAX_POSITION_PCT and equity > 0 and notional > equity * PAPER_MAX_POSITION_PCT:
+        allowed = equity * PAPER_MAX_POSITION_PCT
+        raise ValueError(
+            f"Order notional ${notional:,.2f} exceeds {PAPER_MAX_POSITION_PCT*100:.1f}% of equity (${allowed:,.2f})"
+        )
+    if side == "buy" and buying_power and notional > buying_power:
+        raise ValueError("Not enough buying power for this order")
+
+    payload: dict[str, object] = {
+        "symbol": symbol,
+        "qty": qty,
+        "side": side,
+        "type": order_type,
+        "time_in_force": time_in_force,
+    }
+    if order_type == "limit":
+        payload["limit_price"] = round(float(limit_price), 2)
+
+    if side == "buy":
+        stop_loss_pct = PAPER_DEFAULT_STOP_LOSS_PCT if stop_loss_pct is None else max(stop_loss_pct, 0.0)
+        take_profit_pct = (
+            PAPER_DEFAULT_TAKE_PROFIT_PCT if take_profit_pct is None else max(take_profit_pct, 0.0)
+        )
+        if stop_loss_pct or take_profit_pct:
+            payload["order_class"] = "bracket"
+            if take_profit_pct:
+                payload["take_profit"] = {
+                    "limit_price": round(entry_price * (1 + take_profit_pct), 2)
+                }
+            if stop_loss_pct:
+                payload["stop_loss"] = {
+                    "stop_price": round(entry_price * (1 - stop_loss_pct), 2)
+                }
+
+    return paper_broker.submit_order(payload)
 
 
 # -----------------------------
@@ -522,6 +634,142 @@ def api_analyze(ticker: str):
         return jsonify({"ok": True, "data": data})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/paper", methods=["GET"])
+def paper_dashboard():
+    account = None
+    positions = []
+    orders = []
+    broker_error = None
+    todays_pl = None
+    if not paper_broker.enabled:
+        broker_error = "Set ALPACA_PAPER_KEY_ID and ALPACA_PAPER_SECRET_KEY to enable paper trading."
+    else:
+        try:
+            account = paper_broker.get_account()
+            positions = list(paper_broker.get_positions())
+            orders = list(paper_broker.list_orders(status="all", limit=25))
+            if account:
+                try:
+                    equity = float(account.get("equity") or 0.0)
+                    last_equity = float(account.get("last_equity") or equity)
+                    todays_pl = equity - last_equity
+                except Exception:
+                    todays_pl = None
+        except Exception as exc:
+            broker_error = str(exc)
+            logger.exception("Failed to load paper trading data")
+    return render_template(
+        "paper.html",
+        broker_enabled=paper_broker.enabled,
+        broker_error=broker_error,
+        account=account,
+        positions=positions,
+        orders=orders,
+        todays_pl=todays_pl,
+        PAPER_MAX_POSITION_PCT=PAPER_MAX_POSITION_PCT,
+        PAPER_MAX_POSITION_NOTIONAL=PAPER_MAX_POSITION_NOTIONAL,
+        PAPER_DEFAULT_STOP_LOSS_PCT=PAPER_DEFAULT_STOP_LOSS_PCT,
+        PAPER_DEFAULT_TAKE_PROFIT_PCT=PAPER_DEFAULT_TAKE_PROFIT_PCT,
+    )
+
+
+@app.route("/paper/order", methods=["POST"])
+def paper_order_submit():
+    try:
+        symbol = request.form.get("symbol", "").strip().upper()
+        qty = int(request.form.get("quantity", "0"))
+        side = request.form.get("side", "buy").lower()
+        order_type = request.form.get("order_type", "market").lower()
+        limit_price = request.form.get("limit_price")
+        tif = request.form.get("time_in_force", "day")
+        stop_loss_pct = parse_percent(request.form.get("stop_loss_pct"), PAPER_DEFAULT_STOP_LOSS_PCT)
+        take_profit_pct = parse_percent(request.form.get("take_profit_pct"), PAPER_DEFAULT_TAKE_PROFIT_PCT)
+        limit_price_val = float(limit_price) if limit_price else None
+        order = place_guarded_paper_order(
+            symbol,
+            qty,
+            side,
+            order_type,
+            limit_price_val,
+            stop_loss_pct,
+            take_profit_pct,
+            tif,
+        )
+        flash(f"Order submitted: {order.get('id', 'n/a')}")
+    except Exception as exc:
+        flash(f"Order failed: {exc}")
+    return redirect(url_for("paper_dashboard"))
+
+
+@app.route("/api/paper/account")
+def api_paper_account():
+    if not paper_broker.enabled:
+        return jsonify({"ok": False, "error": "paper trading disabled"}), 400
+    try:
+        return jsonify({"ok": True, "data": paper_broker.get_account()})
+    except Exception as exc:
+        logger.exception("Account fetch failed")
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.route("/api/paper/positions")
+def api_paper_positions():
+    if not paper_broker.enabled:
+        return jsonify({"ok": False, "error": "paper trading disabled"}), 400
+    try:
+        return jsonify({"ok": True, "data": list(paper_broker.get_positions())})
+    except Exception as exc:
+        logger.exception("Positions fetch failed")
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.route("/api/paper/orders")
+def api_paper_orders():
+    if not paper_broker.enabled:
+        return jsonify({"ok": False, "error": "paper trading disabled"}), 400
+    try:
+        status = request.args.get("status", "all")
+        limit = int(request.args.get("limit", 50))
+        return jsonify({"ok": True, "data": list(paper_broker.list_orders(status=status, limit=limit))})
+    except Exception as exc:
+        logger.exception("Orders fetch failed")
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.route("/api/paper/order", methods=["POST"])
+def api_paper_order():
+    if not paper_broker.enabled:
+        return jsonify({"ok": False, "error": "paper trading disabled"}), 400
+    try:
+        payload = request.get_json(force=True, silent=False)
+        symbol = str(payload.get("symbol", "")).strip().upper()
+        qty = int(payload.get("qty") or payload.get("quantity") or 0)
+        side = str(payload.get("side", "buy")).lower()
+        order_type = str(payload.get("type", payload.get("order_type", "market"))).lower()
+        limit_price = payload.get("limit_price")
+        tif = str(payload.get("time_in_force", "day"))
+        stop_loss_pct = None
+        take_profit_pct = None
+        if "stop_loss_pct" in payload:
+            stop_loss_pct = parse_percent(payload.get("stop_loss_pct"), PAPER_DEFAULT_STOP_LOSS_PCT)
+        if "take_profit_pct" in payload:
+            take_profit_pct = parse_percent(payload.get("take_profit_pct"), PAPER_DEFAULT_TAKE_PROFIT_PCT)
+        order = place_guarded_paper_order(
+            symbol,
+            qty,
+            side,
+            order_type,
+            float(limit_price) if limit_price else None,
+            stop_loss_pct,
+            take_profit_pct,
+            tif,
+        )
+        return jsonify({"ok": True, "data": order})
+    except Exception as exc:
+        logger.exception("Paper order failed")
+        return jsonify({"ok": False, "error": str(exc)}), 400
 
 
 @app.route("/api/health")
