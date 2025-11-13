@@ -9,7 +9,12 @@
 </head>
 <body class="bg-light">
   <div class="container py-4">
-    <h1 class="mb-3">Stock Analyzer</h1>
+    <div class="d-flex flex-wrap justify-content-between align-items-center mb-3">
+      <h1 class="mb-0">Stock Analyzer</h1>
+      <div class="mt-2 mt-sm-0">
+        <a class="btn btn-outline-primary" href="/paper">Paper Trading Desk</a>
+      </div>
+    </div>
 
     <!-- Flash messages from Flask -->
     {% with messages = get_flashed_messages() %}

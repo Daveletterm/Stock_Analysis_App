@@ -14,6 +14,8 @@ recommendations so that the UI can load quickly.
 - **Top five ideas** – cached recommendations driven by quantitative screens and heuristics.
 - **Backtesting endpoint** – evaluate a ticker over a configurable lookback window to produce
   performance metrics and an equity curve suitable for visualization.
+- **Paper trading desk** – submit bracketed orders against Alpaca's paper API with position sizing
+  guardrails and review account balances, open positions, and recent orders.
 - **JSON APIs** – `/api/analyze/<ticker>`, `/api/recommendations`, and `/api/backtest/<ticker>`
   make it simple to integrate the service with other tools.
 
@@ -24,11 +26,24 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 export FLASK_APP=app.py
+# Configure Alpaca paper credentials
+export ALPACA_PAPER_KEY_ID="..."
+export ALPACA_PAPER_SECRET_KEY="..."
 flask run --debug
 ```
 
 The application starts on `http://127.0.0.1:5000/` by default.  When running in debug mode the
-background jobs that refresh recommendations also start automatically.
+background jobs that refresh recommendations also start automatically.  Visit `/paper` to access the
+paper-trading desk once Alpaca credentials are configured.
+
+### Paper trading guardrails
+
+- Set `PAPER_MAX_POSITION_PCT` (default `0.10`) to cap each order at a percentage of account equity.
+- Set `PAPER_MAX_POSITION_NOTIONAL` (default `5000`) to limit the absolute notional per order.
+- Adjust `PAPER_STOP_LOSS_PCT` and `PAPER_TAKE_PROFIT_PCT` (defaults `0.05` and `0.10`) to control
+  the protective bracket that wraps buy orders.
+- API endpoints under `/api/paper/*` expose account, positions, orders, and allow programmatic order
+  submission.
 
 ## Recommendations for Next Steps
 
