@@ -326,21 +326,30 @@ def parse_percent(value, default):
         return default
 
 
+def _coerce_numeric_series(values, index) -> pd.Series:
+    """Return a 1D float Series aligned to *index* regardless of the input shape."""
+
+    if isinstance(values, pd.DataFrame):
+        if values.shape[1] == 0:
+            return pd.Series(index=index, dtype=float)
+        values = values.iloc[:, 0]
+    if isinstance(values, pd.Series):
+        series = values.reindex(index)
+    else:
+        series = pd.Series(values, index=index)
+    return pd.to_numeric(series, errors="coerce")
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         if col in df.columns:
-            series = df[col]
-            if isinstance(series, pd.DataFrame):
-                series = series.iloc[:, 0]
-            df[col] = pd.to_numeric(series, errors="coerce")
+            df[col] = _coerce_numeric_series(df[col], df.index)
 
     close_series = df.get("Close")
     if close_series is None:
         raise ValueError("Close column missing for indicator computation")
-    if isinstance(close_series, pd.DataFrame):
-        close_series = close_series.iloc[:, 0]
-    close_series = pd.to_numeric(close_series, errors="coerce")
+    close_series = _coerce_numeric_series(close_series, df.index)
     df["Close"] = close_series
 
     df["SMA_50"] = close_series.rolling(50, min_periods=1).mean()
@@ -348,11 +357,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["RSI"] = compute_rsi(close_series)  # 14
 
     atr = compute_atr(df, 14)
-    if isinstance(atr, pd.DataFrame):
-        atr_series = atr.iloc[:, 0]
-    else:
-        atr_series = pd.to_numeric(atr, errors="coerce")
-    df["ATR14"] = atr_series
+    df["ATR14"] = _coerce_numeric_series(atr, df.index)
     df["ATR_pct"] = (df["ATR14"] / close_series).clip(lower=0)
     df["HH_20"] = df["High"].rolling(20, min_periods=1).max().astype(float)
     df["LL_20"] = df["Low"].rolling(20, min_periods=1).min().astype(float)
@@ -889,7 +894,11 @@ def fast_filter_ticker(ticker: str) -> bool:
         return False
     if hist is None or hist.empty or "Volume" not in hist.columns:
         return False
-    avg_vol = float(hist["Volume"].tail(30).mean()) if not hist["Volume"].empty else 0.0
+    volume_series = _coerce_numeric_series(_col_series(hist, "Volume", ticker), hist.index)
+    if volume_series.empty:
+        return False
+    avg_vol = volume_series.tail(30).mean()
+    avg_vol = float(avg_vol) if pd.notna(avg_vol) else 0.0
     return avg_vol > 1_000_000
 
 
