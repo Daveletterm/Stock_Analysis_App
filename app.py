@@ -8,13 +8,18 @@ from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
+import requests
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
 
 from paper_trading import AlpacaPaperBroker
+
+load_dotenv()
 
 # -----------------------------
 # App setup
@@ -31,6 +36,17 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("stockapp")
+
+try:  # Optional dependency used for some advanced indicators
+    import pandas_ta as _pandas_ta  # type: ignore
+
+    HAS_PANDAS_TA = True
+except ImportError:
+    HAS_PANDAS_TA = False
+    _pandas_ta = None
+    logger.info(
+        "pandas-ta not installed; advanced technical indicators will be skipped."
+    )
 
 # Paper trading configuration
 paper_broker = AlpacaPaperBroker()
@@ -173,6 +189,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["LL_20"] = df["Low"].rolling(20, min_periods=1).min().astype(float)
     df["HH_252"] = df["High"].rolling(252, min_periods=1).max().astype(float)
     df["pct_from_52w_high"] = (df["Close"] / df["HH_252"] - 1.0).replace([np.inf, -np.inf], np.nan)
+    if HAS_PANDAS_TA:
+        try:
+            df["EMA_21"] = _pandas_ta.ema(df["Close"], length=21)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("pandas-ta EMA calculation failed: %s", exc)
+            df["EMA_21"] = pd.NA
+    else:
+        df["EMA_21"] = pd.NA
     return df
 
 
@@ -305,12 +329,50 @@ def place_guarded_paper_order(
 
 def update_sp500() -> None:
     logger.info("Updating S&P 500 list if stale…")
-    if datetime.now() - _sp500["updated"] > timedelta(hours=24):
-        tbl = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        with _lock:
-            _sp500["tickers"] = tbl["Symbol"].tolist()
-            _sp500["updated"] = datetime.now()
-        logger.info("Cached %d tickers", len(_sp500["tickers"]))
+    if datetime.now() - _sp500["updated"] <= timedelta(hours=24):
+        return
+
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning("Failed to fetch S&P 500 constituents: %s", exc)
+        return
+
+    try:
+        tables = pd.read_html(response.text)
+    except Exception as exc:
+        logger.warning("Failed to parse S&P 500 table: %s", exc)
+        return
+
+    if not tables:
+        logger.warning("No tables found when parsing S&P 500 page")
+        return
+
+    table = tables[0]
+    if "Symbol" not in table.columns:
+        logger.warning("S&P 500 table missing 'Symbol' column")
+        return
+
+    tickers = [str(t).strip().upper() for t in table["Symbol"].dropna()]
+    if not tickers:
+        logger.warning("Parsed S&P 500 table but found no tickers")
+        return
+
+    with _lock:
+        _sp500["tickers"] = tickers
+        _sp500["updated"] = datetime.now()
+    logger.info("Cached %d S&P 500 tickers", len(tickers))
 
 
 # -----------------------------
@@ -393,6 +455,10 @@ def seek_recommendations() -> None:
     with _lock:
         tickers = _sp500["tickers"][:]
 
+    if not tickers:
+        logger.warning("S&P 500 cache is empty; skipping recommendation refresh")
+        return
+
     # deterministic daily shuffle to avoid A* bias
     rng = random.Random(date.today().toordinal())
     rng.shuffle(tickers)
@@ -408,14 +474,22 @@ def seek_recommendations() -> None:
         except Exception:
             continue
 
-    hist_all = yf.download(
-        filtered,
-        period="1y",
-        group_by="ticker",
-        auto_adjust=True,
-        threads=True,
-        progress=False,
-    )
+    if not filtered:
+        logger.warning("No tickers passed the liquidity filter; keeping existing recommendations")
+        return
+
+    try:
+        hist_all = yf.download(
+            filtered,
+            period="1y",
+            group_by="ticker",
+            auto_adjust=True,
+            threads=True,
+            progress=False,
+        )
+    except Exception as exc:
+        logger.warning("Batch history download failed: %s", exc)
+        hist_all = pd.DataFrame()
 
     def worker(sym: str) -> dict:
         try:
@@ -428,8 +502,8 @@ def seek_recommendations() -> None:
             if df is None or df.empty:
                 df = yf.download(sym, period="1y", auto_adjust=True, progress=False)
             if df is None or df.empty:
-                logger.warning("No hist for %s in batch", sym)
-                return {"Symbol": sym, "Recommendation": "HOLD", "Score": 0.0, "Why": ["no data"]}
+                logger.warning("Skipping %s: no historical data", sym)
+                return None
 
             # Ensure we have needed cols
             if isinstance(df["Close"], pd.DataFrame):
@@ -437,7 +511,16 @@ def seek_recommendations() -> None:
                     df["Close"] = df["Close"][sym]
                 else:
                     df["Close"] = df["Close"].iloc[:, 0]
+
+            missing = [col for col in ("High", "Low", "Close") if col not in df.columns]
+            if missing:
+                logger.warning("Skipping %s: missing columns %s", sym, ", ".join(missing))
+                return None
+
             df = df[["High", "Low", "Close"]].dropna().copy()
+            if df.empty:
+                logger.warning("Skipping %s: insufficient price data after cleaning", sym)
+                return None
             df = compute_indicators(df)
             score, reasons = score_stock(df)
             rec = "BUY" if score >= 3.5 else "HOLD"
@@ -447,7 +530,7 @@ def seek_recommendations() -> None:
             return {"Symbol": sym, "Recommendation": "HOLD", "Score": 0.0, "Why": [f"error: {e}"]}
 
     with ThreadPoolExecutor(max_workers=5) as ex:
-        results = list(ex.map(worker, filtered))
+        results = [res for res in ex.map(worker, filtered) if res]
 
     # rank by score desc, then symbol
     results.sort(key=lambda x: (-x.get("Score", 0.0), x.get("Symbol", "")))
@@ -542,22 +625,6 @@ def backtest_ticker(ticker: str, years: int = 3, cost_bps: float = 5.0) -> dict:
         },
         "equity_curve": curve.to_dict(orient="records"),
     }
-
-
-# -----------------------------
-# Data sources
-# -----------------------------
-
-def update_sp500() -> None:
-    logger.info("Updating S&P 500 list if stale…")
-    if datetime.now() - _sp500["updated"] > timedelta(hours=24):
-        tbl = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        with _lock:
-            _sp500["tickers"] = tbl["Symbol"].tolist()
-            _sp500["updated"] = datetime.now()
-        logger.info("Cached %d tickers", len(_sp500["tickers"]))
-
-
 # -----------------------------
 # Scheduler (avoid double-start)
 # -----------------------------
@@ -603,7 +670,10 @@ def home():
 @app.route("/seek")
 def seek_and_redirect():
     # Keep legacy redirect endpoint (still works if user hits it)
-    seek_recommendations()
+    try:
+        seek_recommendations()
+    except Exception:
+        logger.exception("Recommendation refresh failed")
     return redirect(url_for("home"))
 
 
