@@ -25,6 +25,13 @@ from market_data import get_price_history as load_price_history
 
 load_dotenv()
 
+try:  # pragma: no cover - optional import varies by yfinance version
+    from yfinance.shared.exceptions import YFRateLimitError  # type: ignore
+except Exception:  # pragma: no cover - fallback when module layout changes
+    YFRateLimitError = ()  # type: ignore
+
+load_dotenv()
+
 # -----------------------------
 # App setup
 # -----------------------------
@@ -64,6 +71,8 @@ PAPER_DEFAULT_TAKE_PROFIT_PCT = float(os.getenv("PAPER_TAKE_PROFIT_PCT", "0.1"))
 # -----------------------------
 _lock = threading.Lock()
 _sp500 = {"tickers": [], "updated": datetime.min}
+_price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = {}
+PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations = []
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 
