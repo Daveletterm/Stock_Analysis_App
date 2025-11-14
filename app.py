@@ -25,13 +25,6 @@ from market_data import get_price_history as load_price_history
 
 load_dotenv()
 
-try:  # pragma: no cover - optional import varies by yfinance version
-    from yfinance.shared.exceptions import YFRateLimitError  # type: ignore
-except Exception:  # pragma: no cover - fallback when module layout changes
-    YFRateLimitError = ()  # type: ignore
-
-load_dotenv()
-
 # -----------------------------
 # App setup
 # -----------------------------
@@ -335,12 +328,32 @@ def parse_percent(value, default):
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["Close"] = df["Close"].astype(float)
-    df["SMA_50"] = df["Close"].rolling(50, min_periods=1).mean()
-    df["SMA_200"] = df["Close"].rolling(200, min_periods=1).mean()
-    df["RSI"] = compute_rsi(df["Close"])  # 14
-    df["ATR14"] = compute_atr(df, 14)
-    df["ATR_pct"] = (df["ATR14"] / df["Close"]).clip(lower=0)
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df.columns:
+            series = df[col]
+            if isinstance(series, pd.DataFrame):
+                series = series.iloc[:, 0]
+            df[col] = pd.to_numeric(series, errors="coerce")
+
+    close_series = df.get("Close")
+    if close_series is None:
+        raise ValueError("Close column missing for indicator computation")
+    if isinstance(close_series, pd.DataFrame):
+        close_series = close_series.iloc[:, 0]
+    close_series = pd.to_numeric(close_series, errors="coerce")
+    df["Close"] = close_series
+
+    df["SMA_50"] = close_series.rolling(50, min_periods=1).mean()
+    df["SMA_200"] = close_series.rolling(200, min_periods=1).mean()
+    df["RSI"] = compute_rsi(close_series)  # 14
+
+    atr = compute_atr(df, 14)
+    if isinstance(atr, pd.DataFrame):
+        atr_series = atr.iloc[:, 0]
+    else:
+        atr_series = pd.to_numeric(atr, errors="coerce")
+    df["ATR14"] = atr_series
+    df["ATR_pct"] = (df["ATR14"] / close_series).clip(lower=0)
     df["HH_20"] = df["High"].rolling(20, min_periods=1).max().astype(float)
     df["LL_20"] = df["Low"].rolling(20, min_periods=1).min().astype(float)
     df["HH_252"] = df["High"].rolling(252, min_periods=1).max().astype(float)
@@ -545,7 +558,11 @@ def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | Non
     df = df.dropna()
     if df.empty:
         return None
-    df = compute_indicators(df)
+    try:
+        df = compute_indicators(df)
+    except Exception as exc:
+        logger.warning("Autopilot indicators failed for %s: %s", symbol, exc)
+        return None
     return df
 
 

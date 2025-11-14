@@ -25,7 +25,7 @@ ALPACA_DATA_BASE_URL = (
     or os.getenv("ALPACA_MARKET_DATA_URL")
     or "https://data.alpaca.markets/v2"
 ).rstrip("/")
-ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "us")
+ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
 
 _broker = AlpacaPaperBroker()
 _data_session = requests.Session()
@@ -57,6 +57,91 @@ def _alpaca_timeframe(interval: str) -> str:
     return mapping.get(interval, "1Day")
 
 
+def _canonical_column(name: str) -> str:
+    return name.replace(" ", "").replace("_", "").lower()
+
+
+def _ensure_series(obj, symbol: str) -> pd.Series:
+    """Return a Series from pandas objects, preferring columns matching symbol."""
+    if isinstance(obj, pd.Series):
+        return obj
+    if isinstance(obj, pd.DataFrame):
+        if obj.empty:
+            return pd.Series(dtype=float, index=obj.index)
+        sym_upper = symbol.upper()
+        for col in obj.columns:
+            if str(col).upper() == sym_upper:
+                return obj[col]
+        return obj.iloc[:, 0]
+    return pd.Series(obj)
+
+
+def _flatten_columns(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+
+    sym_upper = symbol.upper()
+    for level in range(df.columns.nlevels - 1, -1, -1):
+        labels = [str(v).upper() for v in df.columns.get_level_values(level)]
+        if sym_upper in labels:
+            try:
+                return df.xs(sym_upper, axis=1, level=level)
+            except KeyError:
+                try:
+                    return df.xs(symbol, axis=1, level=level)
+                except KeyError:
+                    continue
+
+    flattened = [
+        "_".join(str(part) for part in col if part not in (None, ""))
+        for col in df.columns.to_flat_index()
+    ]
+    df = df.copy()
+    df.columns = flattened
+    return df
+
+
+def _normalize_ohlcv_frame(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    df = _flatten_columns(df, symbol)
+    df = df.copy()
+    df.columns = [str(col).strip() for col in df.columns]
+
+    normalized = pd.DataFrame(index=pd.to_datetime(df.index, utc=True))
+    name_map = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "adjclose": "Adj Close",
+        "volume": "Volume",
+    }
+
+    reverse_lookup = {}
+    for column in df.columns:
+        reverse_lookup.setdefault(_canonical_column(column), column)
+
+    for canonical, final_name in name_map.items():
+        source = reverse_lookup.get(canonical)
+        if not source:
+            continue
+        series = _ensure_series(df[source], symbol)
+        normalized[final_name] = pd.to_numeric(series, errors="coerce")
+
+    if "Adj Close" not in normalized and "Close" in normalized:
+        normalized["Adj Close"] = normalized["Close"]
+
+    ordered_cols = [
+        col for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+        if col in normalized.columns
+    ]
+    normalized = normalized[ordered_cols]
+    normalized = normalized.dropna(how="all")
+    return normalized.sort_index()
+
+
 def _fetch_alpaca_history(symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame:
     """Retrieve bars from Alpaca's data API."""
     if not _broker.enabled:
@@ -75,10 +160,24 @@ def _fetch_alpaca_history(symbol: str, start: datetime, end: datetime, interval:
 
     try:
         response = _data_session.get(url, headers=headers, params=params, timeout=20)
-        response.raise_for_status()
-        payload = response.json()
     except Exception as exc:
         raise PriceDataError(f"Alpaca request failed: {exc}") from exc
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        body = response.text[:500].strip()
+        logger.warning(
+            "Alpaca response error %s for %s: %s", response.status_code, symbol, body
+        )
+        raise PriceDataError(
+            f"Alpaca request failed: {response.status_code} {body}"
+        ) from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise PriceDataError("Alpaca returned invalid JSON") from exc
 
     bars = payload.get("bars") if isinstance(payload, dict) else None
     if not bars:
@@ -106,8 +205,12 @@ def _fetch_alpaca_history(symbol: str, start: datetime, end: datetime, interval:
     if not records:
         raise PriceDataError("Alpaca returned malformed data")
 
-    df = pd.DataFrame.from_records(records).set_index("timestamp").sort_index()
-    df.index = df.index.tz_convert(timezone.utc)
+    df = pd.DataFrame.from_records(records).set_index("timestamp")
+    df.index = pd.to_datetime(df.index, utc=True)
+    df = df.sort_index()
+    df = _normalize_ohlcv_frame(df, symbol)
+    if df is None or df.empty:
+        raise PriceDataError("Alpaca returned no usable data")
     return df
 
 
@@ -121,6 +224,7 @@ def _fetch_yfinance_history(symbol: str, start: datetime, end: datetime, interva
             interval=interval,
             auto_adjust=True,
             progress=False,
+            group_by="ticker",
         )
     except Exception as exc:
         message = str(exc)
@@ -131,14 +235,9 @@ def _fetch_yfinance_history(symbol: str, start: datetime, end: datetime, interva
     if df is None or df.empty:
         raise PriceDataError("Yahoo Finance returned no data")
 
-    df = df.rename(columns=str.title)
-    for col in ("Open", "High", "Low", "Close", "Volume"):
-        if col not in df.columns and col.upper() in df.columns:
-            df[col] = df[col.upper()]
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
-    df.index = pd.to_datetime(df.index).tz_localize(
-        timezone.utc, nonexistent="shift_forward", ambiguous="NaT"
-    )
+    df = _normalize_ohlcv_frame(df, symbol)
+    if df is None or df.empty:
+        raise PriceDataError("Yahoo Finance returned no usable data")
     return df
 
 
