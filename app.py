@@ -7,6 +7,9 @@ import logging
 from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from io import StringIO
+
+import requests
 
 import requests
 
@@ -350,7 +353,7 @@ def update_sp500() -> None:
         return
 
     try:
-        tables = pd.read_html(response.text)
+        tables = pd.read_html(StringIO(response.text))
     except Exception as exc:
         logger.warning("Failed to parse S&P 500 table: %s", exc)
         return
@@ -359,12 +362,36 @@ def update_sp500() -> None:
         logger.warning("No tables found when parsing S&P 500 page")
         return
 
-    table = tables[0]
-    if "Symbol" not in table.columns:
+    table = None
+    symbol_col = None
+    for candidate in tables:
+        df = candidate.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                " ".join(str(part).strip() for part in col if str(part) != "nan").strip()
+                for col in df.columns
+            ]
+        else:
+            df.columns = [str(col).strip() for col in df.columns]
+
+        for col in df.columns:
+            normalized = col.lower()
+            if normalized in {"symbol", "ticker symbol", "ticker"}:
+                table = df
+                symbol_col = col
+                break
+        if table is not None:
+            break
+
+    if table is None or symbol_col is None:
         logger.warning("S&P 500 table missing 'Symbol' column")
         return
 
-    tickers = [str(t).strip().upper() for t in table["Symbol"].dropna()]
+    tickers = [
+        str(t).strip().upper()
+        for t in table[symbol_col].dropna()
+        if isinstance(t, (str, int, float)) and str(t).strip()
+    ]
     if not tickers:
         logger.warning("Parsed S&P 500 table but found no tickers")
         return
