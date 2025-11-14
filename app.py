@@ -5,11 +5,13 @@ import json
 import random
 import threading
 import logging
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from io import StringIO
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import requests
 
@@ -73,6 +75,14 @@ OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
 
 
+@dataclass
+class OptionSelection:
+    contract: Optional[dict[str, Any]]
+    premium: Optional[float]
+    meta: Optional[dict[str, Any]]
+    diagnostics: Optional[dict[str, Any]] = None
+
+
 # -----------------------------
 # Autopilot configuration
 # -----------------------------
@@ -118,8 +128,10 @@ AUTOPILOT_STRATEGIES = {
         "lookback": "9mo",
     },
     "options_momentum": {
-        "label": "Momentum Calls (Options)",
-        "description": "Buy liquid near-dated calls on top scoring momentum names.",
+        "label": "Momentum Options",
+        "description": (
+            "Seek liquid, near-dated contracts on top-scoring names with conservative risk controls."
+        ),
         "asset_class": "option",
         "min_score": 3.4,
         "exit_score": 2.4,
@@ -134,7 +146,13 @@ AUTOPILOT_STRATEGIES = {
         "min_open_interest": 75,
         "min_volume": 10,
         "target_delta": 0.4,
-        "contract_type": "call",
+        "min_delta": 0.25,
+        "max_delta": 0.65,
+        "max_spread_pct": 0.45,
+        "max_implied_volatility": 3.0,
+        "max_premium_pct_of_spot": 0.35,
+        "contract_type": "auto",
+        "allow_opposite_contract": True,
         "max_contracts_per_trade": 5,
         "lookback": "6mo",
     },
@@ -324,17 +342,46 @@ def option_contract_delta(contract: dict[str, Any]) -> float | None:
     return safe_float(delta, None)
 
 
-def option_mid_price(contract: dict[str, Any]) -> float | None:
+def _option_quote(contract: dict[str, Any]) -> Optional[dict[str, Any]]:
     if not isinstance(contract, dict):
         return None
-    quote = None
     for key in ("last_quote", "quote", "latest_quote"):
         value = contract.get(key)
         if isinstance(value, dict):
-            quote = value
-            break
-    bid = safe_float(quote.get("bid_price")) if quote else None
-    ask = safe_float(quote.get("ask_price")) if quote else None
+            return value
+    return None
+
+
+def option_bid_ask(contract: dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    quote = _option_quote(contract)
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    if quote:
+        for bid_key in ("bid_price", "bid", "bp"):
+            bid = safe_float(quote.get(bid_key), None)
+            if bid is not None:
+                break
+        for ask_key in ("ask_price", "ask", "ap"):
+            ask = safe_float(quote.get(ask_key), None)
+            if ask is not None:
+                break
+    return bid, ask
+
+
+def option_implied_volatility(contract: dict[str, Any]) -> float | None:
+    if not isinstance(contract, dict):
+        return None
+    iv = contract.get("implied_volatility")
+    if iv is None and isinstance(contract.get("greeks"), dict):
+        greeks = contract["greeks"]
+        iv = greeks.get("iv") or greeks.get("implied_volatility")
+    return safe_float(iv, None)
+
+
+def option_mid_price(contract: dict[str, Any]) -> float | None:
+    if not isinstance(contract, dict):
+        return None
+    bid, ask = option_bid_ask(contract)
     if bid and ask:
         return (bid + ask) / 2.0
     if ask:
@@ -678,8 +725,11 @@ def _autopilot_select_option_contract(
     strategy: dict[str, Any],
     *,
     underlying_price: float,
-) -> tuple[dict[str, Any], float, dict[str, Any]] | None:
+    score: float | None = None,
+) -> OptionSelection:
     """Pick an option contract that matches the strategy's risk profile."""
+
+    diagnostics: dict[str, Any] = {"symbol": symbol.upper()}
 
     window = strategy.get("options_expiry_window", (21, 45))
     if (
@@ -696,67 +746,269 @@ def _autopilot_select_option_contract(
         max_days = max(min_days + 1, int(window[1]))
     except Exception:
         max_days = max(min_days + 1, 45)
+    diagnostics["expiry_window_days"] = {"min": min_days, "max": max_days}
 
     expiration_from = date.today() + timedelta(days=min_days)
     expiration_to = date.today() + timedelta(days=max_days)
 
-    option_type = str(strategy.get("contract_type", "call")).lower() or "call"
+    contract_pref = str(strategy.get("contract_type", "call")).lower().strip()
+    allow_opposite = bool(strategy.get("allow_opposite_contract", False))
+    contract_types: list[str] = []
+    if contract_pref in {"call", "put"}:
+        contract_types.append(contract_pref)
+        if allow_opposite:
+            alt = "put" if contract_pref == "call" else "call"
+            if alt not in contract_types:
+                contract_types.append(alt)
+    else:
+        contract_types = ["call", "put"]
+    if score is not None and score < 0 and "put" in contract_types:
+        contract_types = ["put"] + [ct for ct in contract_types if ct != "put"]
+    diagnostics["contract_types_considered"] = contract_types
+
     target_delta = abs(safe_float(strategy.get("target_delta"), 0.35)) or 0.35
-    min_open_interest = max(0, int(safe_float(strategy.get("min_open_interest"), 0)))
-    min_volume = max(0, int(safe_float(strategy.get("min_volume"), 0)))
+    min_open_interest_base = max(0, int(safe_float(strategy.get("min_open_interest"), 0)))
+    min_volume_base = max(0, int(safe_float(strategy.get("min_volume"), 0)))
 
-    contracts = fetch_option_contracts(
-        symbol,
-        expiration_date_from=expiration_from,
-        expiration_date_to=expiration_to,
-        option_type=option_type,
-        limit=800,
+    min_delta_cfg = strategy.get("min_delta")
+    max_delta_cfg = strategy.get("max_delta")
+    min_delta = (
+        safe_float(min_delta_cfg, None)
+        if min_delta_cfg is not None and min_delta_cfg != ""
+        else None
     )
-    if not contracts:
-        return None
+    max_delta = (
+        safe_float(max_delta_cfg, None)
+        if max_delta_cfg is not None and max_delta_cfg != ""
+        else None
+    )
 
-    best_choice: tuple[dict[str, Any], float, dict[str, Any]] | None = None
-    best_score: tuple[float, float, float, float] | None = None
+    spread_cfg = strategy.get("max_spread_pct")
+    max_spread_pct = (
+        safe_float(spread_cfg, None)
+        if spread_cfg is not None and spread_cfg != ""
+        else None
+    )
+    if not max_spread_pct or max_spread_pct <= 0:
+        max_spread_pct = 0.5
+
+    premium_cap_cfg = strategy.get("max_premium_pct_of_spot")
+    max_premium_pct = (
+        safe_float(premium_cap_cfg, None)
+        if premium_cap_cfg is not None and premium_cap_cfg != ""
+        else None
+    )
+
+    max_iv_cfg = strategy.get("max_implied_volatility")
+    max_iv = (
+        safe_float(max_iv_cfg, None)
+        if max_iv_cfg is not None and max_iv_cfg != ""
+        else None
+    )
+
+    diagnostics["risk_filters"] = {
+        "target_delta": target_delta,
+        "min_delta": min_delta,
+        "max_delta": max_delta,
+        "max_spread_pct": max_spread_pct,
+        "max_premium_pct": max_premium_pct,
+        "max_implied_vol": max_iv,
+        "min_open_interest": min_open_interest_base,
+        "min_volume": min_volume_base,
+    }
+
+    chains: dict[str, list[dict[str, Any]]] = {}
+    chain_sizes: dict[str, int] = {}
+    chain_errors: dict[str, str] = {}
+    for option_type in contract_types:
+        try:
+            chain = fetch_option_contracts(
+                symbol,
+                expiration_date_from=expiration_from,
+                expiration_date_to=expiration_to,
+                option_type=option_type,
+                limit=800,
+            )
+        except PriceDataError as exc:
+            chain = []
+            chain_errors[option_type] = str(exc)
+        chains[option_type] = chain
+        chain_sizes[option_type] = len(chain)
+    diagnostics["chain_sizes"] = chain_sizes
+    if chain_errors:
+        diagnostics["chain_errors"] = chain_errors
+
+    total_contracts = sum(chain_sizes.values())
+    diagnostics["total_contracts"] = total_contracts
+    if total_contracts == 0:
+        diagnostics["base_rejections"] = {"empty_chain": len(contract_types)}
+        return OptionSelection(None, None, None, diagnostics)
+
+    base_rejections: Counter[str] = Counter()
+    candidates: list[dict[str, Any]] = []
+    for option_type, chain in chains.items():
+        for contract in chain:
+            contract_symbol = str(contract.get("symbol", "")).strip()
+            if not contract_symbol:
+                base_rejections["missing_symbol"] += 1
+                continue
+            parsed = parse_option_symbol(contract_symbol)
+            if not parsed:
+                base_rejections["unparseable_symbol"] += 1
+                continue
+            days_out = option_days_to_expiration(parsed)
+            if days_out is None:
+                base_rejections["invalid_expiration"] += 1
+                continue
+            if days_out < min_days or days_out > max_days:
+                base_rejections["expiry_window"] += 1
+                continue
+            price = option_mid_price(contract)
+            if price is None or price <= 0:
+                base_rejections["no_mark_price"] += 1
+                continue
+            bid, ask = option_bid_ask(contract)
+            if ask is None or ask <= 0:
+                base_rejections["no_ask_price"] += 1
+                continue
+            if bid is None or bid <= 0:
+                base_rejections["no_bid_price"] += 1
+                continue
+            spread_pct = max(0.0, (ask - bid) / ask) if ask else None
+            if spread_pct is None:
+                base_rejections["invalid_spread"] += 1
+                continue
+            oi = safe_float(contract.get("open_interest"), None)
+            volume = safe_float(contract.get("volume"), None)
+            delta = option_contract_delta(contract)
+            iv = option_implied_volatility(contract)
+            premium_pct = (price / underlying_price) if underlying_price else None
+            candidates.append(
+                {
+                    "contract": contract,
+                    "symbol": contract_symbol,
+                    "parsed": parsed,
+                    "option_type": option_type,
+                    "days_out": days_out,
+                    "open_interest": oi,
+                    "volume": volume,
+                    "price": price,
+                    "spread_pct": spread_pct,
+                    "delta": delta,
+                    "delta_abs": abs(delta) if delta is not None else None,
+                    "iv": iv,
+                    "premium_pct": premium_pct,
+                }
+            )
+    diagnostics["base_rejections"] = dict(base_rejections)
+    diagnostics["candidates_considered"] = len(candidates)
+
+    if not candidates:
+        return OptionSelection(None, None, None, diagnostics)
+
+    passes = [
+        {"label": "strict", "oi_scale": 1.0, "vol_scale": 1.0, "spread_scale": 1.0, "delta_widen": 0.0},
+        {"label": "relaxed", "oi_scale": 0.6, "vol_scale": 0.6, "spread_scale": 1.35, "delta_widen": 0.15},
+    ]
+    diagnostics["evaluation_passes"] = [p["label"] for p in passes]
+
+    final_rejections: Counter[str] = Counter()
+    best_choice: Optional[dict[str, Any]] = None
+    best_score: Optional[tuple[float, float, float, float, float, float]] = None
+    best_pass = None
     target_mid = (min_days + max_days) / 2.0
 
-    for contract in contracts:
-        contract_symbol = str(contract.get("symbol", "")).strip()
-        if not contract_symbol:
-            continue
-        parsed = parse_option_symbol(contract_symbol)
-        if not parsed:
-            continue
-        days_out = option_days_to_expiration(parsed)
-        if days_out is None or days_out < min_days or days_out > max_days:
-            continue
-        oi = safe_float(contract.get("open_interest"), None)
-        if min_open_interest and (oi is None or oi < min_open_interest):
-            continue
-        volume = safe_float(contract.get("volume"), None)
-        if min_volume and (volume is None or volume < min_volume):
-            continue
-        price = option_mid_price(contract)
-        if price is None or price <= 0:
-            continue
-        delta = option_contract_delta(contract)
-        if delta is not None:
-            delta_gap = abs(abs(delta) - target_delta)
-        else:
-            strike = safe_float(contract.get("strike_price"), parsed.get("strike"))
-            if strike and underlying_price:
-                delta_gap = abs(strike - underlying_price) / underlying_price
-            else:
-                delta_gap = 5.0
-        expiry_gap = abs(days_out - target_mid)
-        liquidity_penalty = 0.0
-        if oi and oi > 0:
-            liquidity_penalty = 1.0 / (oi + 1.0)
-        score = (delta_gap, expiry_gap, liquidity_penalty, price)
-        if best_score is None or score < best_score:
-            best_score = score
-            best_choice = (contract, price, parsed)
+    for idx, pass_cfg in enumerate(passes, start=1):
+        min_oi = min_open_interest_base
+        if min_oi:
+            min_oi = max(15, int(round(min_oi * pass_cfg["oi_scale"])))
+        min_vol = min_volume_base
+        if min_vol:
+            min_vol = max(2, int(round(min_vol * pass_cfg["vol_scale"])))
+        spread_limit = max_spread_pct * pass_cfg["spread_scale"] if max_spread_pct else None
+        if spread_limit:
+            spread_limit = min(spread_limit, 0.9)
+        min_delta_pass = min_delta
+        max_delta_pass = max_delta
+        if min_delta_pass is not None:
+            min_delta_pass = max(0.05, min_delta_pass * (1 - pass_cfg["delta_widen"]))
+        if max_delta_pass is not None:
+            max_delta_pass = min(0.95, max_delta_pass + pass_cfg["delta_widen"])
 
-    return best_choice
+        for metrics in candidates:
+            reasons: list[str] = []
+            oi = metrics["open_interest"]
+            vol = metrics["volume"]
+            spread_pct = metrics["spread_pct"]
+            delta_abs = metrics["delta_abs"]
+            iv = metrics["iv"]
+            premium_pct = metrics["premium_pct"]
+
+            if min_oi and (oi is None or oi < min_oi):
+                reasons.append("open_interest")
+            if min_vol and (vol is None or vol < min_vol):
+                reasons.append("volume")
+            if spread_limit and (spread_pct is None or spread_pct > spread_limit):
+                reasons.append("bid_ask_spread")
+            if min_delta_pass is not None and delta_abs is not None and delta_abs < min_delta_pass:
+                reasons.append("delta_below_min")
+            if max_delta_pass is not None and delta_abs is not None and delta_abs > max_delta_pass:
+                reasons.append("delta_above_max")
+            if max_iv and iv and iv > max_iv:
+                reasons.append("implied_volatility")
+            if max_premium_pct and premium_pct and premium_pct > max_premium_pct:
+                reasons.append("premium_to_spot")
+
+            if reasons:
+                if idx == len(passes):
+                    for reason in reasons:
+                        final_rejections[reason] += 1
+                continue
+
+            delta_for_score = delta_abs if delta_abs is not None else target_delta
+            delta_gap = abs(delta_for_score - target_delta)
+            expiry_gap = abs(metrics["days_out"] - target_mid)
+            spread_component = spread_pct if spread_pct is not None else 1.0
+            liquidity_penalty = 1.0 / ((oi or 0.0) + 1.0)
+            type_penalty = 0.0 if metrics["option_type"] == contract_types[0] else 0.25
+            score_tuple = (
+                delta_gap,
+                expiry_gap,
+                spread_component,
+                liquidity_penalty,
+                type_penalty,
+                metrics["price"],
+            )
+            if best_score is None or score_tuple < best_score:
+                best_score = score_tuple
+                best_choice = metrics
+                best_pass = pass_cfg["label"]
+
+        if best_choice:
+            break
+
+    diagnostics["final_rejections"] = dict(final_rejections)
+
+    if not best_choice:
+        return OptionSelection(None, None, None, diagnostics)
+
+    diagnostics["selected_contract"] = {
+        "symbol": best_choice["symbol"],
+        "option_type": best_choice["option_type"],
+        "days_out": best_choice["days_out"],
+        "open_interest": best_choice["open_interest"],
+        "volume": best_choice["volume"],
+        "spread_pct": best_choice["spread_pct"],
+        "delta": best_choice["delta"],
+        "selection_pass": best_pass,
+    }
+
+    return OptionSelection(
+        best_choice["contract"],
+        best_choice["price"],
+        best_choice["parsed"],
+        diagnostics,
+    )
 
 
 def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | None:
@@ -1033,15 +1285,53 @@ def run_autopilot_cycle() -> None:
                         symbol,
                         strategy,
                         underlying_price=spot_price,
+                        score=score,
                     )
                 except PriceDataError as exc:
                     errors.append(f"options {symbol} chain failed: {exc}")
                     continue
-                if not selection:
-                    summary_lines.append(f"No option contracts matched filters for {symbol}.")
+                diag = selection.diagnostics or {}
+                if diag:
+                    try:
+                        logger.debug(
+                            "Option selection diagnostics for %s: %s",
+                            symbol.upper(),
+                            json.dumps(to_plain(diag)),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Option selection diagnostics for %s: %s",
+                            symbol.upper(),
+                            diag,
+                        )
+                contract_data = selection.contract
+                premium = selection.premium
+                parsed = selection.meta or {}
+                if not contract_data or premium is None or premium <= 0:
+                    reason_bits = []
+                    rejection_counts = Counter()
+                    base_rejects = diag.get("base_rejections") if isinstance(diag.get("base_rejections"), dict) else {}
+                    final_rejects = diag.get("final_rejections") if isinstance(diag.get("final_rejections"), dict) else {}
+                    try:
+                        rejection_counts.update(Counter(base_rejects))
+                        rejection_counts.update(Counter(final_rejects))
+                    except Exception:
+                        rejection_counts = Counter()
+                    if rejection_counts:
+                        for reason, count in rejection_counts.most_common(3):
+                            reason_bits.append(f"{reason}:{count}")
+                    summary_lines.append(
+                        "No option contracts matched filters for {}.{}".format(
+                            symbol,
+                            f" ({', '.join(reason_bits)})" if reason_bits else "",
+                        )
+                    )
                     continue
-                contract, premium, parsed = selection
-                contract_symbol = str(contract.get("symbol", "")).replace(" ", "").upper()
+                contract_symbol = (
+                    str(contract_data.get("symbol", "")).replace(" ", "").upper()
+                    if isinstance(contract_data, dict)
+                    else ""
+                )
                 if not contract_symbol or contract_symbol in held_and_pending:
                     continue
                 unit_cost = premium * OPTION_CONTRACT_MULTIPLIER
