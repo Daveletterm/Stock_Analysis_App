@@ -5,11 +5,13 @@ import json
 import random
 import threading
 import logging
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from io import StringIO
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import requests
 
@@ -21,6 +23,7 @@ from dotenv import load_dotenv
 
 from paper_trading import AlpacaPaperBroker
 from market_data import PriceDataError
+from market_data import fetch_option_contracts
 from market_data import get_price_history as load_price_history
 
 load_dotenv()
@@ -68,6 +71,16 @@ _price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = 
 PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations = []
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
+OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
+OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
+
+
+@dataclass
+class OptionSelection:
+    contract: Optional[dict[str, Any]]
+    premium: Optional[float]
+    meta: Optional[dict[str, Any]]
+    diagnostics: Optional[dict[str, Any]] = None
 
 
 # -----------------------------
@@ -113,6 +126,35 @@ AUTOPILOT_STRATEGIES = {
         "stop_loss_pct": 0.065,
         "take_profit_pct": 0.2,
         "lookback": "9mo",
+    },
+    "options_momentum": {
+        "label": "Momentum Options",
+        "description": (
+            "Seek liquid, near-dated contracts on top-scoring names with conservative risk controls."
+        ),
+        "asset_class": "option",
+        "min_score": 3.4,
+        "exit_score": 2.4,
+        "max_positions": 4,
+        "max_position_pct": 0.06,
+        "max_total_allocation": 0.4,
+        "min_entry_notional": 150.0,
+        "options_take_profit_pct": 0.85,
+        "options_stop_loss_pct": 0.45,
+        "options_expiry_buffer": 5,
+        "options_expiry_window": (21, 45),
+        "min_open_interest": 75,
+        "min_volume": 10,
+        "target_delta": 0.4,
+        "min_delta": 0.25,
+        "max_delta": 0.65,
+        "max_spread_pct": 0.45,
+        "max_implied_volatility": 3.0,
+        "max_premium_pct_of_spot": 0.35,
+        "contract_type": "auto",
+        "allow_opposite_contract": True,
+        "max_contracts_per_trade": 5,
+        "lookback": "6mo",
     },
 }
 
@@ -249,6 +291,118 @@ def safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def parse_option_symbol(contract_symbol: str) -> dict[str, Any] | None:
+    """Return metadata about an OCC option symbol (underlying, expiry, strike)."""
+
+    if not contract_symbol:
+        return None
+    cleaned = contract_symbol.replace(" ", "").upper()
+    match = OPTION_SYMBOL_RE.match(cleaned)
+    if not match:
+        return None
+    underlying, yymmdd, cp_flag, strike_str = match.groups()
+    try:
+        expiration = datetime.strptime(yymmdd, "%y%m%d").date()
+    except ValueError:
+        return None
+    strike_val = safe_float(int(strike_str) / 1000.0, 0.0)
+    if strike_val is None:
+        strike_val = 0.0
+    return {
+        "symbol": cleaned,
+        "underlying": underlying,
+        "expiration": expiration,
+        "type": "call" if cp_flag == "C" else "put",
+        "strike": float(strike_val),
+    }
+
+
+def option_days_to_expiration(meta: dict[str, Any] | None) -> int | None:
+    if not meta or "expiration" not in meta:
+        return None
+    expiration = meta["expiration"]
+    if isinstance(expiration, str):
+        try:
+            expiration = datetime.strptime(expiration, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    if isinstance(expiration, datetime):
+        expiration = expiration.date()
+    if not isinstance(expiration, date):
+        return None
+    return (expiration - date.today()).days
+
+
+def option_contract_delta(contract: dict[str, Any]) -> float | None:
+    if not isinstance(contract, dict):
+        return None
+    delta = contract.get("delta")
+    if delta is None and isinstance(contract.get("greeks"), dict):
+        delta = contract["greeks"].get("delta")
+    return safe_float(delta, None)
+
+
+def _option_quote(contract: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if not isinstance(contract, dict):
+        return None
+    for key in ("last_quote", "quote", "latest_quote"):
+        value = contract.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def option_bid_ask(contract: dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    quote = _option_quote(contract)
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    if quote:
+        for bid_key in ("bid_price", "bid", "bp"):
+            bid = safe_float(quote.get(bid_key), None)
+            if bid is not None:
+                break
+        for ask_key in ("ask_price", "ask", "ap"):
+            ask = safe_float(quote.get(ask_key), None)
+            if ask is not None:
+                break
+    return bid, ask
+
+
+def option_implied_volatility(contract: dict[str, Any]) -> float | None:
+    if not isinstance(contract, dict):
+        return None
+    iv = contract.get("implied_volatility")
+    if iv is None and isinstance(contract.get("greeks"), dict):
+        greeks = contract["greeks"]
+        iv = greeks.get("iv") or greeks.get("implied_volatility")
+    return safe_float(iv, None)
+
+
+def option_mid_price(contract: dict[str, Any]) -> float | None:
+    if not isinstance(contract, dict):
+        return None
+    bid, ask = option_bid_ask(contract)
+    if bid and ask:
+        return (bid + ask) / 2.0
+    if ask:
+        return ask
+    if bid:
+        return bid
+    trade = None
+    for key in ("last_trade", "trade", "latest_trade"):
+        value = contract.get(key)
+        if isinstance(value, dict):
+            trade = value
+            break
+    if trade:
+        for price_key in ("price", "last_price", "p"):
+            price_val = trade.get(price_key)
+            price = safe_float(price_val, None)
+            if price is not None:
+                return price
+    return None
+
+
 _PERIOD_RE = re.compile(r"^(\d+)([a-zA-Z]+)$")
 
 
@@ -326,21 +480,30 @@ def parse_percent(value, default):
         return default
 
 
+def _coerce_numeric_series(values, index) -> pd.Series:
+    """Return a 1D float Series aligned to *index* regardless of the input shape."""
+
+    if isinstance(values, pd.DataFrame):
+        if values.shape[1] == 0:
+            return pd.Series(index=index, dtype=float)
+        values = values.iloc[:, 0]
+    if isinstance(values, pd.Series):
+        series = values.reindex(index)
+    else:
+        series = pd.Series(values, index=index)
+    return pd.to_numeric(series, errors="coerce")
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         if col in df.columns:
-            series = df[col]
-            if isinstance(series, pd.DataFrame):
-                series = series.iloc[:, 0]
-            df[col] = pd.to_numeric(series, errors="coerce")
+            df[col] = _coerce_numeric_series(df[col], df.index)
 
     close_series = df.get("Close")
     if close_series is None:
         raise ValueError("Close column missing for indicator computation")
-    if isinstance(close_series, pd.DataFrame):
-        close_series = close_series.iloc[:, 0]
-    close_series = pd.to_numeric(close_series, errors="coerce")
+    close_series = _coerce_numeric_series(close_series, df.index)
     df["Close"] = close_series
 
     df["SMA_50"] = close_series.rolling(50, min_periods=1).mean()
@@ -348,11 +511,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["RSI"] = compute_rsi(close_series)  # 14
 
     atr = compute_atr(df, 14)
-    if isinstance(atr, pd.DataFrame):
-        atr_series = atr.iloc[:, 0]
-    else:
-        atr_series = pd.to_numeric(atr, errors="coerce")
-    df["ATR14"] = atr_series
+    df["ATR14"] = _coerce_numeric_series(atr, df.index)
     df["ATR_pct"] = (df["ATR14"] / close_series).clip(lower=0)
     df["HH_20"] = df["High"].rolling(20, min_periods=1).max().astype(float)
     df["LL_20"] = df["Low"].rolling(20, min_periods=1).min().astype(float)
@@ -425,10 +584,15 @@ def place_guarded_paper_order(
     stop_loss_pct: float | None = None,
     take_profit_pct: float | None = None,
     time_in_force: str = "day",
+    *,
+    asset_class: str | None = None,
+    price_hint: float | None = None,
+    support_brackets: bool = True,
 ):
     if not paper_broker.enabled:
         raise RuntimeError("Paper trading credentials are not configured")
-    if not TICKER_RE.match(symbol):
+    symbol = symbol.strip()
+    if not str(asset_class or "").lower().startswith("option") and not TICKER_RE.match(symbol.upper()):
         raise ValueError("Enter a valid ticker symbol")
     if qty <= 0:
         raise ValueError("Quantity must be positive")
@@ -438,14 +602,22 @@ def place_guarded_paper_order(
         raise ValueError("Order type must be market or limit")
 
     symbol = symbol.upper()
+    is_option = str(asset_class or "").lower() == "option"
+    multiplier = OPTION_CONTRACT_MULTIPLIER if is_option else 1
+
     entry_price = None
-    if order_type == "limit":
+    if price_hint is not None and price_hint > 0:
+        entry_price = float(price_hint)
+    elif order_type == "limit":
         if limit_price is None or limit_price <= 0:
             raise ValueError("Provide a positive limit price")
         entry_price = float(limit_price)
-    if entry_price is None:
+    elif not is_option:
         entry_price = fetch_latest_price(symbol)
-    notional = float(entry_price) * qty
+    else:
+        entry_price = 0.0
+
+    notional = float(entry_price) * qty * multiplier
 
     account = paper_broker.get_account()
     equity = float(account.get("equity") or account.get("cash") or 0.0)
@@ -472,8 +644,10 @@ def place_guarded_paper_order(
     }
     if order_type == "limit":
         payload["limit_price"] = round(float(limit_price), 2)
+    if asset_class:
+        payload["asset_class"] = asset_class
 
-    if side == "buy":
+    if side == "buy" and support_brackets and not is_option:
         stop_loss_pct = PAPER_DEFAULT_STOP_LOSS_PCT if stop_loss_pct is None else max(stop_loss_pct, 0.0)
         take_profit_pct = (
             PAPER_DEFAULT_TAKE_PROFIT_PCT if take_profit_pct is None else max(take_profit_pct, 0.0)
@@ -526,6 +700,13 @@ def update_autopilot_config(*, enabled: bool | None = None, strategy: str | None
     return get_autopilot_status()
 
 
+def _strategy_asset_class(strategy: dict[str, Any]) -> str:
+    asset_class = str(strategy.get("asset_class", "equity")).lower().strip()
+    if asset_class in {"option", "options"}:
+        return "option"
+    return "equity"
+
+
 def _autopilot_order_blocked(symbol: str, open_orders: list[dict]) -> bool:
     for order in open_orders:
         try:
@@ -537,6 +718,297 @@ def _autopilot_order_blocked(symbol: str, open_orders: list[dict]) -> bool:
         except Exception:
             continue
     return False
+
+
+def _autopilot_select_option_contract(
+    symbol: str,
+    strategy: dict[str, Any],
+    *,
+    underlying_price: float,
+    score: float | None = None,
+) -> OptionSelection:
+    """Pick an option contract that matches the strategy's risk profile."""
+
+    diagnostics: dict[str, Any] = {"symbol": symbol.upper()}
+
+    window = strategy.get("options_expiry_window", (21, 45))
+    if (
+        not isinstance(window, (list, tuple))
+        or len(window) != 2
+        or any(v is None for v in window)
+    ):
+        window = (21, 45)
+    try:
+        min_days = max(7, int(window[0]))
+    except Exception:
+        min_days = 21
+    try:
+        max_days = max(min_days + 1, int(window[1]))
+    except Exception:
+        max_days = max(min_days + 1, 45)
+    diagnostics["expiry_window_days"] = {"min": min_days, "max": max_days}
+
+    expiration_from = date.today() + timedelta(days=min_days)
+    expiration_to = date.today() + timedelta(days=max_days)
+
+    contract_pref = str(strategy.get("contract_type", "call")).lower().strip()
+    allow_opposite = bool(strategy.get("allow_opposite_contract", False))
+    contract_types: list[str] = []
+    if contract_pref in {"call", "put"}:
+        contract_types.append(contract_pref)
+        if allow_opposite:
+            alt = "put" if contract_pref == "call" else "call"
+            if alt not in contract_types:
+                contract_types.append(alt)
+    else:
+        contract_types = ["call", "put"]
+    if score is not None and score < 0 and "put" in contract_types:
+        contract_types = ["put"] + [ct for ct in contract_types if ct != "put"]
+    diagnostics["contract_types_considered"] = contract_types
+
+    target_delta = abs(safe_float(strategy.get("target_delta"), 0.35)) or 0.35
+    min_open_interest_base = max(0, int(safe_float(strategy.get("min_open_interest"), 0)))
+    min_volume_base = max(0, int(safe_float(strategy.get("min_volume"), 0)))
+
+    min_delta_cfg = strategy.get("min_delta")
+    max_delta_cfg = strategy.get("max_delta")
+    min_delta = (
+        safe_float(min_delta_cfg, None)
+        if min_delta_cfg is not None and min_delta_cfg != ""
+        else None
+    )
+    max_delta = (
+        safe_float(max_delta_cfg, None)
+        if max_delta_cfg is not None and max_delta_cfg != ""
+        else None
+    )
+
+    spread_cfg = strategy.get("max_spread_pct")
+    max_spread_pct = (
+        safe_float(spread_cfg, None)
+        if spread_cfg is not None and spread_cfg != ""
+        else None
+    )
+    if not max_spread_pct or max_spread_pct <= 0:
+        max_spread_pct = 0.5
+
+    premium_cap_cfg = strategy.get("max_premium_pct_of_spot")
+    max_premium_pct = (
+        safe_float(premium_cap_cfg, None)
+        if premium_cap_cfg is not None and premium_cap_cfg != ""
+        else None
+    )
+
+    max_iv_cfg = strategy.get("max_implied_volatility")
+    max_iv = (
+        safe_float(max_iv_cfg, None)
+        if max_iv_cfg is not None and max_iv_cfg != ""
+        else None
+    )
+
+    diagnostics["risk_filters"] = {
+        "target_delta": target_delta,
+        "min_delta": min_delta,
+        "max_delta": max_delta,
+        "max_spread_pct": max_spread_pct,
+        "max_premium_pct": max_premium_pct,
+        "max_implied_vol": max_iv,
+        "min_open_interest": min_open_interest_base,
+        "min_volume": min_volume_base,
+    }
+
+    chains: dict[str, list[dict[str, Any]]] = {}
+    chain_sizes: dict[str, int] = {}
+    chain_errors: dict[str, str] = {}
+    for option_type in contract_types:
+        try:
+            chain = fetch_option_contracts(
+                symbol,
+                expiration_date_from=expiration_from,
+                expiration_date_to=expiration_to,
+                option_type=option_type,
+                limit=800,
+            )
+        except PriceDataError as exc:
+            chain = []
+            chain_errors[option_type] = str(exc)
+        chains[option_type] = chain
+        chain_sizes[option_type] = len(chain)
+    diagnostics["chain_sizes"] = chain_sizes
+    if chain_errors:
+        diagnostics["chain_errors"] = chain_errors
+
+    total_contracts = sum(chain_sizes.values())
+    diagnostics["total_contracts"] = total_contracts
+    if total_contracts == 0:
+        diagnostics["base_rejections"] = {"empty_chain": len(contract_types)}
+        return OptionSelection(None, None, None, diagnostics)
+
+    base_rejections: Counter[str] = Counter()
+    candidates: list[dict[str, Any]] = []
+    for option_type, chain in chains.items():
+        for contract in chain:
+            contract_symbol = str(contract.get("symbol", "")).strip()
+            if not contract_symbol:
+                base_rejections["missing_symbol"] += 1
+                continue
+            parsed = parse_option_symbol(contract_symbol)
+            if not parsed:
+                base_rejections["unparseable_symbol"] += 1
+                continue
+            days_out = option_days_to_expiration(parsed)
+            if days_out is None:
+                base_rejections["invalid_expiration"] += 1
+                continue
+            if days_out < min_days or days_out > max_days:
+                base_rejections["expiry_window"] += 1
+                continue
+            price = option_mid_price(contract)
+            if price is None or price <= 0:
+                base_rejections["no_mark_price"] += 1
+                continue
+            bid, ask = option_bid_ask(contract)
+            if ask is None or ask <= 0:
+                base_rejections["no_ask_price"] += 1
+                continue
+            if bid is None or bid <= 0:
+                base_rejections["no_bid_price"] += 1
+                continue
+            spread_pct = max(0.0, (ask - bid) / ask) if ask else None
+            if spread_pct is None:
+                base_rejections["invalid_spread"] += 1
+                continue
+            oi = safe_float(contract.get("open_interest"), None)
+            volume = safe_float(contract.get("volume"), None)
+            delta = option_contract_delta(contract)
+            iv = option_implied_volatility(contract)
+            premium_pct = (price / underlying_price) if underlying_price else None
+            candidates.append(
+                {
+                    "contract": contract,
+                    "symbol": contract_symbol,
+                    "parsed": parsed,
+                    "option_type": option_type,
+                    "days_out": days_out,
+                    "open_interest": oi,
+                    "volume": volume,
+                    "price": price,
+                    "spread_pct": spread_pct,
+                    "delta": delta,
+                    "delta_abs": abs(delta) if delta is not None else None,
+                    "iv": iv,
+                    "premium_pct": premium_pct,
+                }
+            )
+    diagnostics["base_rejections"] = dict(base_rejections)
+    diagnostics["candidates_considered"] = len(candidates)
+
+    if not candidates:
+        return OptionSelection(None, None, None, diagnostics)
+
+    passes = [
+        {"label": "strict", "oi_scale": 1.0, "vol_scale": 1.0, "spread_scale": 1.0, "delta_widen": 0.0},
+        {"label": "relaxed", "oi_scale": 0.6, "vol_scale": 0.6, "spread_scale": 1.35, "delta_widen": 0.15},
+    ]
+    diagnostics["evaluation_passes"] = [p["label"] for p in passes]
+
+    final_rejections: Counter[str] = Counter()
+    best_choice: Optional[dict[str, Any]] = None
+    best_score: Optional[tuple[float, float, float, float, float, float]] = None
+    best_pass = None
+    target_mid = (min_days + max_days) / 2.0
+
+    for idx, pass_cfg in enumerate(passes, start=1):
+        min_oi = min_open_interest_base
+        if min_oi:
+            min_oi = max(15, int(round(min_oi * pass_cfg["oi_scale"])))
+        min_vol = min_volume_base
+        if min_vol:
+            min_vol = max(2, int(round(min_vol * pass_cfg["vol_scale"])))
+        spread_limit = max_spread_pct * pass_cfg["spread_scale"] if max_spread_pct else None
+        if spread_limit:
+            spread_limit = min(spread_limit, 0.9)
+        min_delta_pass = min_delta
+        max_delta_pass = max_delta
+        if min_delta_pass is not None:
+            min_delta_pass = max(0.05, min_delta_pass * (1 - pass_cfg["delta_widen"]))
+        if max_delta_pass is not None:
+            max_delta_pass = min(0.95, max_delta_pass + pass_cfg["delta_widen"])
+
+        for metrics in candidates:
+            reasons: list[str] = []
+            oi = metrics["open_interest"]
+            vol = metrics["volume"]
+            spread_pct = metrics["spread_pct"]
+            delta_abs = metrics["delta_abs"]
+            iv = metrics["iv"]
+            premium_pct = metrics["premium_pct"]
+
+            if min_oi and (oi is None or oi < min_oi):
+                reasons.append("open_interest")
+            if min_vol and (vol is None or vol < min_vol):
+                reasons.append("volume")
+            if spread_limit and (spread_pct is None or spread_pct > spread_limit):
+                reasons.append("bid_ask_spread")
+            if min_delta_pass is not None and delta_abs is not None and delta_abs < min_delta_pass:
+                reasons.append("delta_below_min")
+            if max_delta_pass is not None and delta_abs is not None and delta_abs > max_delta_pass:
+                reasons.append("delta_above_max")
+            if max_iv and iv and iv > max_iv:
+                reasons.append("implied_volatility")
+            if max_premium_pct and premium_pct and premium_pct > max_premium_pct:
+                reasons.append("premium_to_spot")
+
+            if reasons:
+                if idx == len(passes):
+                    for reason in reasons:
+                        final_rejections[reason] += 1
+                continue
+
+            delta_for_score = delta_abs if delta_abs is not None else target_delta
+            delta_gap = abs(delta_for_score - target_delta)
+            expiry_gap = abs(metrics["days_out"] - target_mid)
+            spread_component = spread_pct if spread_pct is not None else 1.0
+            liquidity_penalty = 1.0 / ((oi or 0.0) + 1.0)
+            type_penalty = 0.0 if metrics["option_type"] == contract_types[0] else 0.25
+            score_tuple = (
+                delta_gap,
+                expiry_gap,
+                spread_component,
+                liquidity_penalty,
+                type_penalty,
+                metrics["price"],
+            )
+            if best_score is None or score_tuple < best_score:
+                best_score = score_tuple
+                best_choice = metrics
+                best_pass = pass_cfg["label"]
+
+        if best_choice:
+            break
+
+    diagnostics["final_rejections"] = dict(final_rejections)
+
+    if not best_choice:
+        return OptionSelection(None, None, None, diagnostics)
+
+    diagnostics["selected_contract"] = {
+        "symbol": best_choice["symbol"],
+        "option_type": best_choice["option_type"],
+        "days_out": best_choice["days_out"],
+        "open_interest": best_choice["open_interest"],
+        "volume": best_choice["volume"],
+        "spread_pct": best_choice["spread_pct"],
+        "delta": best_choice["delta"],
+        "selection_pass": best_pass,
+    }
+
+    return OptionSelection(
+        best_choice["contract"],
+        best_choice["price"],
+        best_choice["parsed"],
+        diagnostics,
+    )
 
 
 def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | None:
@@ -587,6 +1059,7 @@ def run_autopilot_cycle() -> None:
         risk_key = config.get("risk", "medium")
         strategy = AUTOPILOT_STRATEGIES.get(strategy_key, AUTOPILOT_STRATEGIES["balanced"])
         risk_cfg = AUTOPILOT_RISK_LEVELS.get(risk_key, AUTOPILOT_RISK_LEVELS["medium"])
+        asset_class = _strategy_asset_class(strategy)
 
         account = paper_broker.get_account()
         equity = safe_float(account.get("equity"), safe_float(account.get("cash")))
@@ -606,15 +1079,38 @@ def run_autopilot_cycle() -> None:
             errors.append(f"orders error: {exc}")
             open_orders = []
 
-        held_symbols: dict[str, dict] = {}
-        gross_notional = 0.0
+        held_positions: dict[str, dict[str, dict[str, Any]]] = {"equity": {}, "option": {}}
+        gross_equity_notional = 0.0
+        gross_option_notional = 0.0
+        held_option_underlyings: set[str] = set()
+
         for pos in positions:
-            symbol = str(pos.get("symbol", "")).upper()
+            symbol_raw = str(pos.get("symbol", ""))
+            symbol = symbol_raw.replace(" ", "").upper()
             qty = safe_float(pos.get("qty"), safe_float(pos.get("quantity")))
             if not symbol or qty <= 0:
                 continue
-            held_symbols[symbol] = pos
-            gross_notional += abs(safe_float(pos.get("market_value")))
+            market_value = abs(
+                safe_float(
+                    pos.get("market_value"),
+                    qty * safe_float(pos.get("avg_entry_price"), 0.0),
+                )
+            )
+            asset = str(pos.get("asset_class", "")).lower()
+            is_option_pos = "option" in asset
+            entry: dict[str, Any] = {"position": pos, "qty": qty, "market_value": market_value}
+            if is_option_pos:
+                parsed = parse_option_symbol(symbol)
+                if parsed:
+                    entry["meta"] = parsed
+                    underlying = parsed.get("underlying")
+                    if underlying:
+                        held_option_underlyings.add(underlying)
+                held_positions["option"][symbol] = entry
+                gross_option_notional += market_value
+            else:
+                held_positions["equity"][symbol] = entry
+                gross_equity_notional += market_value
 
         with _lock:
             recs_snapshot = [dict(r) for r in _recommendations]
@@ -632,50 +1128,136 @@ def run_autopilot_cycle() -> None:
         max_total_allocation = max(0.1, strategy.get("max_total_allocation", 1.0) * position_multiplier)
         min_entry_notional = max(50.0, strategy.get("min_entry_notional", 200.0))
 
-        # Exit review
         exit_threshold = strategy.get("exit_score", 2.0)
         lookback = strategy.get("lookback", "1y")
-        for symbol, pos in held_symbols.items():
-            qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
-            if qty < 1:
-                continue
-            df = _autopilot_prepare_dataframe(symbol, lookback)
-            if df is None:
-                errors.append(f"no data for {symbol}; exit review skipped")
-                continue
-            score, reasons = score_stock(df)
-            if score < exit_threshold:
-                if _autopilot_order_blocked(symbol, open_orders):
-                    summary_lines.append(f"Exit pending for {symbol}; open order detected.")
+
+        current_positions = (
+            held_positions["option"] if asset_class == "option" else held_positions["equity"]
+        )
+
+        if asset_class == "option":
+            option_profit = safe_float(strategy.get("options_take_profit_pct"), 0.8)
+            option_stop = abs(safe_float(strategy.get("options_stop_loss_pct"), 0.45))
+            expiry_buffer = max(0, int(safe_float(strategy.get("options_expiry_buffer"), 5)))
+
+            for contract_symbol, entry in current_positions.items():
+                pos = entry["position"]
+                qty = int(abs(entry.get("qty", 0)))
+                if qty < 1:
                     continue
-                qty_int = int(math.floor(qty))
-                if qty_int <= 0:
+                parsed = entry.get("meta") or parse_option_symbol(contract_symbol)
+                underlying = parsed.get("underlying") if parsed else None
+                reasons: list[str] = []
+                plpc = safe_float(pos.get("unrealized_plpc"), None)
+                if plpc is None:
+                    percent = safe_float(pos.get("unrealized_pl_percent"), None)
+                    if percent is not None:
+                        plpc = percent / 100.0
+                if plpc is not None and option_profit and plpc >= option_profit:
+                    reasons.append(f"profit {plpc*100:.0f}% >= target")
+                if plpc is not None and option_stop and plpc <= -option_stop:
+                    reasons.append(f"loss {plpc*100:.0f}% beyond stop")
+                days_out = option_days_to_expiration(parsed)
+                if days_out is not None and days_out <= expiry_buffer:
+                    reasons.append(f"{days_out}d to expiry")
+                if underlying:
+                    df = _autopilot_prepare_dataframe(underlying, lookback)
+                    if df is None:
+                        errors.append(f"no data for {underlying}; option exit skipped")
+                    else:
+                        underlying_score, _ = score_stock(df)
+                        if underlying_score < exit_threshold:
+                            reasons.append(f"score {underlying_score:.2f} < {exit_threshold}")
+                if not reasons:
                     continue
-                try:
-                    place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                if _autopilot_order_blocked(contract_symbol, open_orders):
                     summary_lines.append(
-                        f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
+                        f"Exit pending for {contract_symbol}; open order detected."
+                    )
+                    continue
+                market_price = safe_float(
+                    pos.get("current_price"), safe_float(pos.get("market_price"), None)
+                )
+                try:
+                    place_guarded_paper_order(
+                        contract_symbol,
+                        qty,
+                        "sell",
+                        order_type="market",
+                        stop_loss_pct=None,
+                        take_profit_pct=None,
+                        time_in_force="day",
+                        asset_class="option",
+                        price_hint=market_price,
+                        support_brackets=False,
+                    )
+                    summary_lines.append(
+                        f"Exit {qty} {contract_symbol} ({'; '.join(reasons)})"
                     )
                 except Exception as exc:
-                    errors.append(f"sell {symbol} failed: {exc}")
+                    errors.append(f"sell {contract_symbol} failed: {exc}")
+        else:
+            for symbol, entry in current_positions.items():
+                pos = entry["position"]
+                qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
+                if qty < 1:
+                    continue
+                df = _autopilot_prepare_dataframe(symbol, lookback)
+                if df is None:
+                    errors.append(f"no data for {symbol}; exit review skipped")
+                    continue
+                score, _ = score_stock(df)
+                if score < exit_threshold:
+                    if _autopilot_order_blocked(symbol, open_orders):
+                        summary_lines.append(
+                            f"Exit pending for {symbol}; open order detected."
+                        )
+                        continue
+                    qty_int = int(math.floor(qty))
+                    if qty_int <= 0:
+                        continue
+                    try:
+                        place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                        summary_lines.append(
+                            f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
+                        )
+                    except Exception as exc:
+                        errors.append(f"sell {symbol} failed: {exc}")
 
-        # Entry candidates
-        held_and_pending = set(held_symbols.keys())
+        held_and_pending = set(current_positions.keys())
+        pending_underlyings = set(held_option_underlyings) if asset_class == "option" else set()
         for order in open_orders:
             try:
-                if str(order.get("side", "")).lower() == "buy":
-                    held_and_pending.add(str(order.get("symbol", "")).upper())
+                if str(order.get("side", "")).lower() != "buy":
+                    continue
+                order_symbol = str(order.get("symbol", "")).replace(" ", "").upper()
+                asset = str(order.get("asset_class", "")).lower()
+                if asset_class == "option":
+                    if "option" in asset:
+                        held_and_pending.add(order_symbol)
+                        parsed = parse_option_symbol(order_symbol)
+                        if parsed and parsed.get("underlying"):
+                            pending_underlyings.add(parsed["underlying"])
+                else:
+                    if asset != "option":
+                        held_and_pending.add(order_symbol)
             except Exception:
                 continue
 
         buy_candidates: list[tuple[str, float]] = []
         for rec in recs_snapshot:
             symbol = str(rec.get("Symbol", "")).upper()
-            if not symbol or symbol in held_and_pending:
+            if not symbol:
                 continue
             score = safe_float(rec.get("Score"))
             if score < strategy.get("min_score", 3.0):
                 continue
+            if asset_class == "option":
+                if symbol in pending_underlyings:
+                    continue
+            else:
+                if symbol in held_and_pending:
+                    continue
             buy_candidates.append((symbol, score))
 
         if not buy_candidates:
@@ -683,50 +1265,161 @@ def run_autopilot_cycle() -> None:
 
         buy_candidates.sort(key=lambda item: item[1], reverse=True)
         max_positions = max(1, int(strategy.get("max_positions", 5)))
-        available_slots = max(0, max_positions - len(held_symbols))
+        available_slots = max(0, max_positions - len(current_positions))
+        gross_notional = gross_option_notional if asset_class == "option" else gross_equity_notional
+
+        allocation_warning_logged = False
 
         for symbol, score in buy_candidates:
             if available_slots <= 0:
                 break
-            if _autopilot_order_blocked(symbol, open_orders):
-                continue
-            try:
-                price = fetch_latest_price(symbol)
-            except Exception as exc:
-                errors.append(f"price {symbol} failed: {exc}")
-                continue
 
-            notional_cap_pct = min(max_position_pct, max_total_allocation)
-            target_notional = max(min_entry_notional, equity * notional_cap_pct)
-            if PAPER_MAX_POSITION_NOTIONAL:
-                target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
-            if gross_notional + target_notional > equity * max_total_allocation:
-                summary_lines.append("Max portfolio allocation reached; skipping new entries.")
-                break
-
-            qty = int(target_notional // price)
-            if qty <= 0:
-                continue
-
-            stop_loss_pct = max(0.01, strategy.get("stop_loss_pct", 0.04) * stop_loss_multiplier)
-            take_profit_pct = max(0.02, strategy.get("take_profit_pct", 0.1) * take_profit_multiplier)
-
-            try:
-                place_guarded_paper_order(
-                    symbol,
-                    qty,
-                    "buy",
-                    stop_loss_pct=stop_loss_pct,
-                    take_profit_pct=take_profit_pct,
-                    time_in_force="gtc",
+            if asset_class == "option":
+                try:
+                    spot_price = fetch_latest_price(symbol)
+                except Exception as exc:
+                    errors.append(f"price {symbol} failed: {exc}")
+                    continue
+                try:
+                    selection = _autopilot_select_option_contract(
+                        symbol,
+                        strategy,
+                        underlying_price=spot_price,
+                        score=score,
+                    )
+                except PriceDataError as exc:
+                    errors.append(f"options {symbol} chain failed: {exc}")
+                    continue
+                diag = selection.diagnostics or {}
+                if diag:
+                    try:
+                        logger.debug(
+                            "Option selection diagnostics for %s: %s",
+                            symbol.upper(),
+                            json.dumps(to_plain(diag)),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Option selection diagnostics for %s: %s",
+                            symbol.upper(),
+                            diag,
+                        )
+                contract_data = selection.contract
+                premium = selection.premium
+                parsed = selection.meta or {}
+                if not contract_data or premium is None or premium <= 0:
+                    reason_bits = []
+                    rejection_counts = Counter()
+                    base_rejects = diag.get("base_rejections") if isinstance(diag.get("base_rejections"), dict) else {}
+                    final_rejects = diag.get("final_rejections") if isinstance(diag.get("final_rejections"), dict) else {}
+                    try:
+                        rejection_counts.update(Counter(base_rejects))
+                        rejection_counts.update(Counter(final_rejects))
+                    except Exception:
+                        rejection_counts = Counter()
+                    if rejection_counts:
+                        for reason, count in rejection_counts.most_common(3):
+                            reason_bits.append(f"{reason}:{count}")
+                    summary_lines.append(
+                        "No option contracts matched filters for {}.{}".format(
+                            symbol,
+                            f" ({', '.join(reason_bits)})" if reason_bits else "",
+                        )
+                    )
+                    continue
+                contract_symbol = (
+                    str(contract_data.get("symbol", "")).replace(" ", "").upper()
+                    if isinstance(contract_data, dict)
+                    else ""
                 )
-                gross_notional += qty * price
-                available_slots -= 1
-                summary_lines.append(
-                    f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
-                )
-            except Exception as exc:
-                errors.append(f"buy {symbol} failed: {exc}")
+                if not contract_symbol or contract_symbol in held_and_pending:
+                    continue
+                unit_cost = premium * OPTION_CONTRACT_MULTIPLIER
+                notional_cap_pct = min(max_position_pct, max_total_allocation)
+                target_notional = max(min_entry_notional, equity * notional_cap_pct)
+                max_debit = safe_float(strategy.get("max_position_debit"), None)
+                if max_debit:
+                    target_notional = min(target_notional, max_debit)
+                if PAPER_MAX_POSITION_NOTIONAL:
+                    target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
+                if gross_notional + target_notional > equity * max_total_allocation:
+                    if not allocation_warning_logged:
+                        summary_lines.append(
+                            "Max portfolio allocation reached; skipping new entries."
+                        )
+                        allocation_warning_logged = True
+                    break
+                qty = max(1, int(target_notional // max(unit_cost, 1e-6)))
+                max_contracts = int(safe_float(strategy.get("max_contracts_per_trade"), 0))
+                if max_contracts:
+                    qty = min(qty, max_contracts)
+                if qty <= 0:
+                    continue
+                try:
+                    place_guarded_paper_order(
+                        contract_symbol,
+                        qty,
+                        "buy",
+                        order_type="limit",
+                        limit_price=round(premium, 2),
+                        stop_loss_pct=None,
+                        take_profit_pct=None,
+                        time_in_force="day",
+                        asset_class="option",
+                        price_hint=premium,
+                        support_brackets=False,
+                    )
+                    gross_notional += qty * unit_cost
+                    available_slots -= 1
+                    held_and_pending.add(contract_symbol)
+                    if parsed and parsed.get("underlying"):
+                        pending_underlyings.add(parsed["underlying"])
+                    summary_lines.append(
+                        f"Buy {qty} {contract_symbol} ({symbol} {parsed.get('type', 'call')} {parsed.get('strike', 0):.2f} exp {parsed.get('expiration')}, premium ${premium:.2f})"
+                    )
+                except Exception as exc:
+                    errors.append(f"buy {contract_symbol} failed: {exc}")
+            else:
+                if _autopilot_order_blocked(symbol, open_orders):
+                    continue
+                try:
+                    price = fetch_latest_price(symbol)
+                except Exception as exc:
+                    errors.append(f"price {symbol} failed: {exc}")
+                    continue
+                notional_cap_pct = min(max_position_pct, max_total_allocation)
+                target_notional = max(min_entry_notional, equity * notional_cap_pct)
+                if PAPER_MAX_POSITION_NOTIONAL:
+                    target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
+                if gross_notional + target_notional > equity * max_total_allocation:
+                    if not allocation_warning_logged:
+                        summary_lines.append(
+                            "Max portfolio allocation reached; skipping new entries."
+                        )
+                        allocation_warning_logged = True
+                    break
+                qty = int(target_notional // price)
+                if qty <= 0:
+                    continue
+                stop_loss_pct = max(0.01, strategy.get("stop_loss_pct", 0.04) * stop_loss_multiplier)
+                take_profit_pct = max(0.02, strategy.get("take_profit_pct", 0.1) * take_profit_multiplier)
+                try:
+                    place_guarded_paper_order(
+                        symbol,
+                        qty,
+                        "buy",
+                        stop_loss_pct=stop_loss_pct,
+                        take_profit_pct=take_profit_pct,
+                        time_in_force="gtc",
+                    )
+                    gross_notional += qty * price
+                    available_slots -= 1
+                    held_and_pending.add(symbol)
+                    summary_lines.append(
+                        f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
+                    )
+                except Exception as exc:
+                    errors.append(f"buy {symbol} failed: {exc}")
 
         if not summary_lines:
             summary_lines.append("Cycle complete with no trades.")
@@ -889,7 +1582,11 @@ def fast_filter_ticker(ticker: str) -> bool:
         return False
     if hist is None or hist.empty or "Volume" not in hist.columns:
         return False
-    avg_vol = float(hist["Volume"].tail(30).mean()) if not hist["Volume"].empty else 0.0
+    volume_series = _coerce_numeric_series(_col_series(hist, "Volume", ticker), hist.index)
+    if volume_series.empty:
+        return False
+    avg_vol = volume_series.tail(30).mean()
+    avg_vol = float(avg_vol) if pd.notna(avg_vol) else 0.0
     return avg_vol > 1_000_000
 
 
