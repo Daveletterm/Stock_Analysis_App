@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
@@ -36,6 +37,25 @@ _broker = AlpacaPaperBroker()
 _data_session = requests.Session()
 _cache: Dict[Tuple[str, str, str, str], pd.DataFrame] = {}
 _cache_lock = threading.Lock()
+
+try:
+    _ALPACA_MIN_REQUEST_INTERVAL = max(
+        0.0, float(os.getenv("ALPACA_MIN_REQUEST_INTERVAL", "0.35"))
+    )
+except Exception:  # pragma: no cover - defensive default
+    _ALPACA_MIN_REQUEST_INTERVAL = 0.35
+
+try:
+    _YFINANCE_MIN_REQUEST_INTERVAL = max(
+        0.0, float(os.getenv("YFINANCE_MIN_REQUEST_INTERVAL", "0.6"))
+    )
+except Exception:  # pragma: no cover - defensive default
+    _YFINANCE_MIN_REQUEST_INTERVAL = 0.6
+
+_alpaca_rate_lock = threading.Lock()
+_alpaca_last_request = 0.0
+_yfinance_rate_lock = threading.Lock()
+_yfinance_last_request = 0.0
 
 
 class PriceDataError(RuntimeError):
@@ -71,6 +91,93 @@ def _safe_float(value, default: float | None = None) -> float | None:
         return float(value)
     except Exception:
         return default
+
+
+def _respect_alpaca_rate_limit() -> None:
+    """Ensure Alpaca requests observe the configured minimum spacing."""
+
+    if _ALPACA_MIN_REQUEST_INTERVAL <= 0:
+        return
+
+    global _alpaca_last_request
+    with _alpaca_rate_lock:
+        now = time.monotonic()
+        wait = _ALPACA_MIN_REQUEST_INTERVAL - (now - _alpaca_last_request)
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _alpaca_last_request = now
+
+
+def _respect_yfinance_rate_limit() -> None:
+    """Throttle yfinance downloads to reduce HTTP 429 responses."""
+
+    if _YFINANCE_MIN_REQUEST_INTERVAL <= 0:
+        return
+
+    global _yfinance_last_request
+    with _yfinance_rate_lock:
+        now = time.monotonic()
+        wait = _YFINANCE_MIN_REQUEST_INTERVAL - (now - _yfinance_last_request)
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _yfinance_last_request = now
+
+
+def _alpaca_request(
+    url: str,
+    *,
+    headers: Dict[str, str],
+    params: Dict[str, object],
+    timeout: float,
+    resource: str,
+    max_retries: int = 3,
+) -> requests.Response:
+    """Perform a throttled Alpaca GET request with 429 handling."""
+
+    last_response: requests.Response | None = None
+    for attempt in range(max_retries):
+        _respect_alpaca_rate_limit()
+        try:
+            response = _data_session.get(url, headers=headers, params=params, timeout=timeout)
+        except Exception as exc:  # pragma: no cover - network failure
+            raise PriceDataError(f"Alpaca request failed: {exc}") from exc
+
+        if response.status_code != 429:
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                body = response.text[:500].strip()
+                logger.warning(
+                    "Alpaca response error %s for %s: %s",
+                    response.status_code,
+                    resource,
+                    body,
+                )
+                raise PriceDataError(
+                    f"Alpaca request failed: {response.status_code} {body}"
+                ) from exc
+            return response
+
+        body = response.text[:200].strip()
+        logger.warning(
+            "Alpaca rate limit hit for %s (attempt %d/%d): %s",
+            resource,
+            attempt + 1,
+            max_retries,
+            body or "429 Too Many Requests",
+        )
+        retry_after = _safe_float(response.headers.get("Retry-After"), None)
+        delay = retry_after if retry_after and retry_after > 0 else 1.5 * (attempt + 1)
+        time.sleep(min(delay, 10.0))
+        last_response = response
+
+    if last_response is not None:
+        body = last_response.text[:500].strip()
+        raise PriceDataError(f"Alpaca request failed: 429 {body}")
+
+    raise PriceDataError("Alpaca request failed: rate limited")
 
 
 def _ensure_series(obj, symbol: str) -> pd.Series:
@@ -170,21 +277,13 @@ def _fetch_alpaca_history(symbol: str, start: datetime, end: datetime, interval:
     }
     url = f"{ALPACA_DATA_BASE_URL}/stocks/{symbol}/bars"
 
-    try:
-        response = _data_session.get(url, headers=headers, params=params, timeout=20)
-    except Exception as exc:
-        raise PriceDataError(f"Alpaca request failed: {exc}") from exc
-
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        body = response.text[:500].strip()
-        logger.warning(
-            "Alpaca response error %s for %s: %s", response.status_code, symbol, body
-        )
-        raise PriceDataError(
-            f"Alpaca request failed: {response.status_code} {body}"
-        ) from exc
+    response = _alpaca_request(
+        url,
+        headers=headers,
+        params=params,
+        timeout=20,
+        resource=f"{symbol} bars",
+    )
 
     try:
         payload = response.json()
@@ -250,24 +349,13 @@ def fetch_option_contracts(
 
     url = f"{ALPACA_OPTIONS_BASE_URL}/options/chain/{symbol.upper()}"
 
-    try:
-        response = _data_session.get(url, headers=headers, params=params, timeout=20)
-    except Exception as exc:  # pragma: no cover - network issues
-        raise PriceDataError(f"Alpaca option chain request failed: {exc}") from exc
-
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        body = response.text[:500].strip()
-        logger.warning(
-            "Alpaca option chain error %s for %s: %s",
-            response.status_code,
-            symbol,
-            body,
-        )
-        raise PriceDataError(
-            f"Alpaca option chain request failed: {response.status_code} {body}"
-        ) from exc
+    response = _alpaca_request(
+        url,
+        headers=headers,
+        params=params,
+        timeout=20,
+        resource=f"{symbol} option chain",
+    )
 
     try:
         payload = response.json()
@@ -301,6 +389,7 @@ def fetch_option_contracts(
 
 def _fetch_yfinance_history(symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame:
     """Retrieve bars from yfinance as a fallback."""
+    _respect_yfinance_rate_limit()
     try:
         df = yf.download(
             symbol,
