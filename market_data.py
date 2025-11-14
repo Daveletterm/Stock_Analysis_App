@@ -27,10 +27,11 @@ ALPACA_DATA_BASE_URL = (
     or "https://data.alpaca.markets/v2"
 ).rstrip("/")
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
+_DEFAULT_ALPACA_OPTIONS_BASE_URL = "https://data.alpaca.markets/v1beta1"
 ALPACA_OPTIONS_BASE_URL = (
     os.getenv("ALPACA_OPTIONS_DATA_URL")
     or os.getenv("ALPACA_MARKET_DATA_URL")
-    or "https://data.alpaca.markets/v1beta1"
+    or _DEFAULT_ALPACA_OPTIONS_BASE_URL
 ).rstrip("/")
 
 _broker = AlpacaPaperBroker()
@@ -349,23 +350,48 @@ def fetch_option_contracts(
 
     url = f"{ALPACA_OPTIONS_BASE_URL}/options/chain/{symbol.upper()}"
 
-    try:
-        response = _alpaca_request(
-            url,
+    def _request_chain(chain_url: str) -> requests.Response:
+        return _alpaca_request(
+            chain_url,
             headers=headers,
             params=params,
             timeout=20,
             resource=f"{symbol} option chain",
         )
+
+    try:
+        response = _request_chain(url)
     except PriceDataError as exc:
         message = str(exc)
-        if "404" in message or "not found" in message.lower():
+        if "404" not in message and "not found" not in message.lower():
+            raise
+
+        base_used = ALPACA_OPTIONS_BASE_URL.rstrip("/")
+        default_base = _DEFAULT_ALPACA_OPTIONS_BASE_URL.rstrip("/")
+        if base_used.lower() != default_base.lower():
+            fallback_url = f"{default_base}/options/chain/{symbol.upper()}"
+            logger.info(
+                "Retrying %s option chain against default Alpaca endpoint %s",
+                symbol.upper(),
+                default_base,
+            )
+            try:
+                response = _request_chain(fallback_url)
+            except PriceDataError as fallback_exc:
+                fallback_message = str(fallback_exc)
+                if "404" in fallback_message or "not found" in fallback_message.lower():
+                    logger.info(
+                        "Alpaca reports no option chain for %s even on default endpoint; skipping.",
+                        symbol.upper(),
+                    )
+                    return []
+                raise
+        else:
             logger.info(
                 "Alpaca reports no option chain for %s; skipping contract fetch.",
                 symbol.upper(),
             )
             return []
-        raise
 
     try:
         payload = response.json()
