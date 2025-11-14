@@ -348,7 +348,22 @@ def fetch_option_contracts(
     if option_type:
         params["type"] = option_type.lower()
 
-    url = f"{ALPACA_OPTIONS_BASE_URL}/options/{symbol.upper()}/chains"
+    primary_base = ALPACA_OPTIONS_BASE_URL.rstrip("/")
+    default_base = _DEFAULT_ALPACA_OPTIONS_BASE_URL.rstrip("/")
+
+    candidate_urls: List[str] = []
+    bases_to_try: List[str] = [primary_base]
+    if primary_base.lower() != default_base.lower():
+        bases_to_try.append(default_base)
+
+    for base in bases_to_try:
+        # Alpaca's documentation currently lists the endpoint as `/chain`, but
+        # some historical blog posts referenced `/chains`. Try both so the app
+        # works regardless of which variant the account exposes.
+        candidate_urls.append(f"{base}/options/{symbol.upper()}/chain")
+        candidate_urls.append(f"{base}/options/{symbol.upper()}/chains")
+
+    response: requests.Response | None = None
 
     def _request_chain(chain_url: str) -> requests.Response:
         return _alpaca_request(
@@ -359,39 +374,33 @@ def fetch_option_contracts(
             resource=f"{symbol} option chain",
         )
 
-    try:
-        response = _request_chain(url)
-    except PriceDataError as exc:
-        message = str(exc)
-        if "404" not in message and "not found" not in message.lower():
+    for candidate_url in candidate_urls:
+        try:
+            response = _request_chain(candidate_url)
+            break
+        except PriceDataError as exc:
+            message = str(exc)
+            if "404" in message or "not found" in message.lower():
+                logger.info(
+                    "Alpaca option chain endpoint %s returned 404 for %s; trying next candidate.",
+                    candidate_url,
+                    symbol.upper(),
+                )
+                continue
             raise
+    else:  # pragma: no branch - executed only when loop fails to break
+        logger.info(
+            "Alpaca reports no option chain for %s after trying all endpoints; skipping contract fetch.",
+            symbol.upper(),
+        )
+        return []
 
-        base_used = ALPACA_OPTIONS_BASE_URL.rstrip("/")
-        default_base = _DEFAULT_ALPACA_OPTIONS_BASE_URL.rstrip("/")
-        if base_used.lower() != default_base.lower():
-            fallback_url = f"{default_base}/options/{symbol.upper()}/chains"
-            logger.info(
-                "Retrying %s option chain against default Alpaca endpoint %s",
-                symbol.upper(),
-                default_base,
-            )
-            try:
-                response = _request_chain(fallback_url)
-            except PriceDataError as fallback_exc:
-                fallback_message = str(fallback_exc)
-                if "404" in fallback_message or "not found" in fallback_message.lower():
-                    logger.info(
-                        "Alpaca reports no option chain for %s even on default endpoint; skipping.",
-                        symbol.upper(),
-                    )
-                    return []
-                raise
-        else:
-            logger.info(
-                "Alpaca reports no option chain for %s; skipping contract fetch.",
-                symbol.upper(),
-            )
-            return []
+    if response is None:  # pragma: no cover - safety net
+        logger.info(
+            "Alpaca reports no option chain for %s; skipping contract fetch.",
+            symbol.upper(),
+        )
+        return []
 
     try:
         payload = response.json()
