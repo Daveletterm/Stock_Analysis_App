@@ -8,8 +8,7 @@ from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from io import StringIO
-
-import requests
+from typing import Dict, Tuple
 
 import requests
 
@@ -21,6 +20,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
 from paper_trading import AlpacaPaperBroker
+
+try:  # pragma: no cover - optional import varies by yfinance version
+    from yfinance.shared.exceptions import YFRateLimitError  # type: ignore
+except Exception:  # pragma: no cover - fallback when module layout changes
+    YFRateLimitError = ()  # type: ignore
 
 load_dotenv()
 
@@ -63,6 +67,8 @@ PAPER_DEFAULT_TAKE_PROFIT_PCT = float(os.getenv("PAPER_TAKE_PROFIT_PCT", "0.1"))
 # -----------------------------
 _lock = threading.Lock()
 _sp500 = {"tickers": [], "updated": datetime.min}
+_price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = {}
+PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations = []
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 
@@ -154,12 +160,94 @@ def to_plain(obj):
     return obj
 
 
+class PriceDataError(RuntimeError):
+    """Raised when price history cannot be retrieved from upstream providers."""
+
+
+def _cache_key(ticker: str, period: str, interval: str | None, auto_adjust: bool) -> Tuple[str, str, str, bool]:
+    return (ticker.upper(), period, interval or "1d", auto_adjust)
+
+
+def get_price_history(
+    ticker: str,
+    period: str,
+    *,
+    interval: str | None = None,
+    auto_adjust: bool = True,
+    max_age: timedelta = PRICE_CACHE_TTL,
+) -> pd.DataFrame:
+    """Download historical data with simple in-memory caching and rate-limit handling."""
+
+    key = _cache_key(ticker, period, interval, auto_adjust)
+    cached_df = None
+    cached_ts: datetime | None = None
+    now = datetime.now()
+    with _lock:
+        if key in _price_cache:
+            cached_ts, cached_df = _price_cache[key]
+            if cached_ts and now - cached_ts <= max_age:
+                return cached_df.copy()
+
+    rate_limited = False
+    download_error: Exception | None = None
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=auto_adjust,
+            progress=False,
+        )
+    except Exception as exc:
+        download_error = exc
+        message = str(exc)
+        rate_limited = "rate limit" in message.lower() or isinstance(exc, YFRateLimitError)
+        df = pd.DataFrame()
+
+    if (df is None or df.empty) and not rate_limited:
+        try:
+            df = yf.Ticker(ticker).history(
+                period=period,
+                interval=interval or "1d",
+                auto_adjust=auto_adjust,
+            )
+        except Exception as exc:
+            download_error = exc
+            rate_limited = "rate limit" in str(exc).lower() or isinstance(exc, YFRateLimitError)
+            df = pd.DataFrame()
+
+    if df is None or df.empty:
+        if cached_df is not None:
+            logger.warning(
+                "Using cached %s data after download failure%s",
+                ticker,
+                ": rate limited" if rate_limited else "",
+            )
+            return cached_df.copy()
+        if rate_limited:
+            raise PriceDataError(
+                f"Yahoo Finance rate limit reached for {ticker}. Please wait a minute and try again."
+            )
+        error_text = str(download_error) if download_error else "No price data returned"
+        raise PriceDataError(f"Unable to download data for {ticker}: {error_text}")
+
+    df = df.dropna(how="all").copy()
+    if df.empty:
+        if cached_df is not None:
+            logger.warning("Using cached %s data after cleaning removed all rows", ticker)
+            return cached_df.copy()
+        raise PriceDataError(f"No price data for {ticker}")
+
+    with _lock:
+        _price_cache[key] = (now, df.copy())
+
+    return df
+
+
 @lru_cache(maxsize=256)
 def fetch_latest_price(ticker: str) -> float:
     """Fetch the most recent closing price for guardrail calculations."""
-    hist = yf.Ticker(ticker).history(period="5d")
-    if hist is None or hist.empty:
-        hist = yf.download(ticker, period="1d", auto_adjust=True, progress=False)
+    hist = get_price_history(ticker, "5d")
     if hist is None or hist.empty:
         raise ValueError(f"No recent price data for {ticker}")
     price = hist["Close"].iloc[-1]
@@ -409,18 +497,11 @@ def update_sp500() -> None:
 def analyze_stock(ticker: str) -> dict:
     """Compute metrics and chart data for a single ticker (flattening any MultiIndex)."""
     logger.info("Analyze %s", ticker)
-    # Download – retry once if Yahoo is flaky
-    hist = None
-    for _ in range(2):
-        try:
-            hist = yf.download(ticker, period="2y", auto_adjust=True, progress=False)
-            if hist is not None and not hist.empty:
-                break
-        except Exception:
-            pass
-    if hist is None or hist.empty:
-        logger.warning("No price data for %s", ticker)
-        raise ValueError(f"No price data for {ticker}")
+    try:
+        hist = get_price_history(ticker, "2y")
+    except PriceDataError as exc:
+        logger.warning("Analyze %s failed: %s", ticker, exc)
+        raise ValueError(str(exc))
 
     # Build a simple, single-index DataFrame for techs/plotting
     close = _col_series(hist, "Close", ticker)
@@ -527,7 +608,11 @@ def seek_recommendations() -> None:
                 except Exception:
                     df = None
             if df is None or df.empty:
-                df = yf.download(sym, period="1y", auto_adjust=True, progress=False)
+                try:
+                    df = get_price_history(sym, "1y")
+                except PriceDataError as exc:
+                    logger.warning("Skipping %s: %s", sym, exc)
+                    return None
             if df is None or df.empty:
                 logger.warning("Skipping %s: no historical data", sym)
                 return None
@@ -682,7 +767,10 @@ def home():
             try:
                 result = analyze_stock(t)
             except Exception as e:
-                logger.exception("Analyze error for %s", t)
+                if isinstance(e, ValueError):
+                    logger.warning("Analyze error for %s: %s", t, e)
+                else:
+                    logger.exception("Analyze error for %s", t)
                 flash(f"Analyze error for {t}: {e}")
     with _lock:
         recs = _recommendations[:]
