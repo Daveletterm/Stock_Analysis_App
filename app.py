@@ -1,20 +1,29 @@
+import math
 import os
 import re
 import json
 import random
 import threading
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from io import StringIO
+from typing import Dict, Tuple
+
+import requests
 
 import pandas as pd
 import numpy as np
-import yfinance as yf
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
 
 from paper_trading import AlpacaPaperBroker
+from market_data import PriceDataError
+from market_data import get_price_history as load_price_history
+
+load_dotenv()
 
 # -----------------------------
 # App setup
@@ -32,6 +41,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("stockapp")
 
+try:  # Optional dependency used for some advanced indicators
+    import pandas_ta as _pandas_ta  # type: ignore
+
+    HAS_PANDAS_TA = True
+except ImportError:
+    HAS_PANDAS_TA = False
+    _pandas_ta = None
+    logger.info(
+        "pandas-ta not installed; advanced technical indicators will be skipped."
+    )
+
 # Paper trading configuration
 paper_broker = AlpacaPaperBroker()
 PAPER_MAX_POSITION_PCT = float(os.getenv("PAPER_MAX_POSITION_PCT", "0.1"))
@@ -46,6 +66,85 @@ _lock = threading.Lock()
 _sp500 = {"tickers": [], "updated": datetime.min}
 _recommendations = []
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
+
+
+# -----------------------------
+# Autopilot configuration
+# -----------------------------
+
+AUTOPILOT_STRATEGIES = {
+    "conservative": {
+        "label": "Conservative Growth",
+        "description": "Focus on highest scoring names with tight risk controls and limited exposure.",
+        "min_score": 3.6,
+        "exit_score": 2.2,
+        "max_positions": 4,
+        "max_position_pct": 0.08,
+        "max_total_allocation": 0.55,
+        "min_entry_notional": 300.0,
+        "stop_loss_pct": 0.03,
+        "take_profit_pct": 0.06,
+        "lookback": "1y",
+    },
+    "balanced": {
+        "label": "Balanced Momentum",
+        "description": "Blend of momentum and trend with moderate diversification and bracket exits.",
+        "min_score": 3.2,
+        "exit_score": 2.0,
+        "max_positions": 6,
+        "max_position_pct": 0.12,
+        "max_total_allocation": 0.8,
+        "min_entry_notional": 200.0,
+        "stop_loss_pct": 0.045,
+        "take_profit_pct": 0.12,
+        "lookback": "1y",
+    },
+    "aggressive": {
+        "label": "Aggressive Breakouts",
+        "description": "Targets early breakouts with wider stops and more simultaneous bets.",
+        "min_score": 2.8,
+        "exit_score": 1.6,
+        "max_positions": 9,
+        "max_position_pct": 0.16,
+        "max_total_allocation": 1.05,
+        "min_entry_notional": 150.0,
+        "stop_loss_pct": 0.065,
+        "take_profit_pct": 0.2,
+        "lookback": "9mo",
+    },
+}
+
+AUTOPILOT_RISK_LEVELS = {
+    "low": {
+        "label": "Low",
+        "position_multiplier": 0.65,
+        "stop_loss_multiplier": 0.75,
+        "take_profit_multiplier": 0.85,
+    },
+    "medium": {
+        "label": "Medium",
+        "position_multiplier": 1.0,
+        "stop_loss_multiplier": 1.0,
+        "take_profit_multiplier": 1.0,
+    },
+    "high": {
+        "label": "High",
+        "position_multiplier": 1.3,
+        "stop_loss_multiplier": 1.35,
+        "take_profit_multiplier": 1.2,
+    },
+}
+
+_autopilot_state = {
+    "enabled": False,
+    "strategy": "balanced",
+    "risk": "medium",
+    "last_run": None,
+    "last_actions": [],
+    "last_error": None,
+}
+_autopilot_lock = threading.Lock()
+_autopilot_runtime_lock = threading.Lock()
 
 # -----------------------------
 # Sentiment stubs (no external calls for now)
@@ -135,12 +234,76 @@ def to_plain(obj):
     return obj
 
 
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str) and value.strip() == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+_PERIOD_RE = re.compile(r"^(\d+)([a-zA-Z]+)$")
+
+
+def _period_to_range(period: str, *, interval: str | None = None) -> tuple[datetime, datetime, str]:
+    """Translate shorthand period strings into UTC start/end datetimes."""
+
+    interval_out = interval or "1d"
+    end = datetime.now(timezone.utc)
+
+    match = _PERIOD_RE.match(period.lower().strip())
+    if not match:
+        raise ValueError(f"Unsupported period string: {period}")
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+
+    if unit in {"d", "day", "days"}:
+        start = end - timedelta(days=amount)
+    elif unit in {"w", "wk", "week", "weeks"}:
+        start = end - timedelta(weeks=amount)
+    elif unit in {"mo", "mon", "month", "months"}:
+        start = (pd.Timestamp(end) - pd.DateOffset(months=amount)).to_pydatetime()
+    elif unit in {"y", "yr", "year", "years"}:
+        start = (pd.Timestamp(end) - pd.DateOffset(years=amount)).to_pydatetime()
+    else:
+        raise ValueError(f"Unsupported period unit: {unit}")
+
+    # Alpaca expects timezone-aware timestamps in UTC.
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    else:
+        start = start.astimezone(timezone.utc)
+
+    return start, end, interval_out
+
+
+def get_price_history(
+    ticker: str,
+    period: str,
+    *,
+    interval: str | None = None,
+    auto_adjust: bool = True,
+    max_age: timedelta | None = None,
+) -> pd.DataFrame:
+    """Load price history using the shared market data helper."""
+
+    _ = auto_adjust  # retained for backward compatibility; handled upstream
+    _ = max_age
+
+    start, end, resolved_interval = _period_to_range(period, interval=interval)
+    return load_price_history(ticker, start, end, interval=resolved_interval)
+
+
 @lru_cache(maxsize=256)
 def fetch_latest_price(ticker: str) -> float:
     """Fetch the most recent closing price for guardrail calculations."""
-    hist = yf.Ticker(ticker).history(period="5d")
-    if hist is None or hist.empty:
-        hist = yf.download(ticker, period="1d", auto_adjust=True, progress=False)
+    hist = get_price_history(ticker, "5d")
     if hist is None or hist.empty:
         raise ValueError(f"No recent price data for {ticker}")
     price = hist["Close"].iloc[-1]
@@ -173,6 +336,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["LL_20"] = df["Low"].rolling(20, min_periods=1).min().astype(float)
     df["HH_252"] = df["High"].rolling(252, min_periods=1).max().astype(float)
     df["pct_from_52w_high"] = (df["Close"] / df["HH_252"] - 1.0).replace([np.inf, -np.inf], np.nan)
+    if HAS_PANDAS_TA:
+        try:
+            df["EMA_21"] = _pandas_ta.ema(df["Close"], length=21)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("pandas-ta EMA calculation failed: %s", exc)
+            df["EMA_21"] = pd.NA
+    else:
+        df["EMA_21"] = pd.NA
     return df
 
 
@@ -300,17 +471,330 @@ def place_guarded_paper_order(
 
 
 # -----------------------------
+# Autopilot routines
+# -----------------------------
+
+
+def get_autopilot_status() -> dict:
+    with _autopilot_lock:
+        snapshot = dict(_autopilot_state)
+    last_run = snapshot.get("last_run")
+    if isinstance(last_run, datetime):
+        snapshot["last_run"] = last_run.isoformat(timespec="seconds")
+    snapshot.setdefault("strategy", "balanced")
+    snapshot.setdefault("risk", "medium")
+    actions = snapshot.get("last_actions")
+    if isinstance(actions, list):
+        snapshot["last_actions"] = actions
+    elif actions:
+        snapshot["last_actions"] = [str(actions)]
+    else:
+        snapshot["last_actions"] = []
+    return snapshot
+
+
+def update_autopilot_config(*, enabled: bool | None = None, strategy: str | None = None, risk: str | None = None) -> dict:
+    with _autopilot_lock:
+        if enabled is not None:
+            _autopilot_state["enabled"] = bool(enabled)
+        if strategy and strategy in AUTOPILOT_STRATEGIES:
+            _autopilot_state["strategy"] = strategy
+        if risk and risk in AUTOPILOT_RISK_LEVELS:
+            _autopilot_state["risk"] = risk
+    return get_autopilot_status()
+
+
+def _autopilot_order_blocked(symbol: str, open_orders: list[dict]) -> bool:
+    for order in open_orders:
+        try:
+            if str(order.get("symbol", "")).upper() != symbol.upper():
+                continue
+            status = str(order.get("status", "")).lower()
+            if status in {"new", "accepted", "open", "pending_new", "partially_filled"}:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | None:
+    try:
+        hist = get_price_history(symbol, period)
+    except PriceDataError as exc:
+        logger.warning("Autopilot skip %s: %s", symbol, exc)
+        return None
+    if hist is None or hist.empty:
+        return None
+    df = pd.DataFrame(index=hist.index.copy())
+    try:
+        df["Close"] = _col_series(hist, "Close", symbol)
+        df["High"] = _col_series(hist, "High", symbol)
+        df["Low"] = _col_series(hist, "Low", symbol)
+    except Exception as exc:
+        logger.debug("Autopilot failed to shape history for %s: %s", symbol, exc)
+        return None
+    df = df.dropna()
+    if df.empty:
+        return None
+    df = compute_indicators(df)
+    return df
+
+
+def run_autopilot_cycle() -> None:
+    if not paper_broker.enabled:
+        return
+
+    with _autopilot_lock:
+        config = dict(_autopilot_state)
+
+    if not config.get("enabled"):
+        return
+
+    if not _autopilot_runtime_lock.acquire(blocking=False):
+        logger.debug("Autopilot cycle skipped; previous cycle still running")
+        return
+
+    summary_lines: list[str] = []
+    errors: list[str] = []
+    try:
+        strategy_key = config.get("strategy", "balanced")
+        risk_key = config.get("risk", "medium")
+        strategy = AUTOPILOT_STRATEGIES.get(strategy_key, AUTOPILOT_STRATEGIES["balanced"])
+        risk_cfg = AUTOPILOT_RISK_LEVELS.get(risk_key, AUTOPILOT_RISK_LEVELS["medium"])
+
+        account = paper_broker.get_account()
+        equity = safe_float(account.get("equity"), safe_float(account.get("cash")))
+        if equity <= 0:
+            summary_lines.append("Account equity unavailable; skipping cycle.")
+            return
+
+        try:
+            positions = list(paper_broker.get_positions())
+        except Exception as exc:
+            errors.append(f"positions error: {exc}")
+            positions = []
+
+        try:
+            open_orders = list(paper_broker.list_orders(status="open", limit=200))
+        except Exception as exc:
+            errors.append(f"orders error: {exc}")
+            open_orders = []
+
+        held_symbols: dict[str, dict] = {}
+        gross_notional = 0.0
+        for pos in positions:
+            symbol = str(pos.get("symbol", "")).upper()
+            qty = safe_float(pos.get("qty"), safe_float(pos.get("quantity")))
+            if not symbol or qty <= 0:
+                continue
+            held_symbols[symbol] = pos
+            gross_notional += abs(safe_float(pos.get("market_value")))
+
+        with _lock:
+            recs_snapshot = [dict(r) for r in _recommendations]
+
+        if not recs_snapshot:
+            seek_recommendations()
+            with _lock:
+                recs_snapshot = [dict(r) for r in _recommendations]
+
+        position_multiplier = max(risk_cfg.get("position_multiplier", 1.0), 0.25)
+        stop_loss_multiplier = max(risk_cfg.get("stop_loss_multiplier", 1.0), 0.25)
+        take_profit_multiplier = max(risk_cfg.get("take_profit_multiplier", 1.0), 0.25)
+
+        max_position_pct = min(strategy.get("max_position_pct", 0.1) * position_multiplier, 0.95)
+        max_total_allocation = max(0.1, strategy.get("max_total_allocation", 1.0) * position_multiplier)
+        min_entry_notional = max(50.0, strategy.get("min_entry_notional", 200.0))
+
+        # Exit review
+        exit_threshold = strategy.get("exit_score", 2.0)
+        lookback = strategy.get("lookback", "1y")
+        for symbol, pos in held_symbols.items():
+            qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
+            if qty < 1:
+                continue
+            df = _autopilot_prepare_dataframe(symbol, lookback)
+            if df is None:
+                errors.append(f"no data for {symbol}; exit review skipped")
+                continue
+            score, reasons = score_stock(df)
+            if score < exit_threshold:
+                if _autopilot_order_blocked(symbol, open_orders):
+                    summary_lines.append(f"Exit pending for {symbol}; open order detected.")
+                    continue
+                qty_int = int(math.floor(qty))
+                if qty_int <= 0:
+                    continue
+                try:
+                    place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                    summary_lines.append(
+                        f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
+                    )
+                except Exception as exc:
+                    errors.append(f"sell {symbol} failed: {exc}")
+
+        # Entry candidates
+        held_and_pending = set(held_symbols.keys())
+        for order in open_orders:
+            try:
+                if str(order.get("side", "")).lower() == "buy":
+                    held_and_pending.add(str(order.get("symbol", "")).upper())
+            except Exception:
+                continue
+
+        buy_candidates: list[tuple[str, float]] = []
+        for rec in recs_snapshot:
+            symbol = str(rec.get("Symbol", "")).upper()
+            if not symbol or symbol in held_and_pending:
+                continue
+            score = safe_float(rec.get("Score"))
+            if score < strategy.get("min_score", 3.0):
+                continue
+            buy_candidates.append((symbol, score))
+
+        if not buy_candidates:
+            summary_lines.append("No new symbols met entry criteria.")
+
+        buy_candidates.sort(key=lambda item: item[1], reverse=True)
+        max_positions = max(1, int(strategy.get("max_positions", 5)))
+        available_slots = max(0, max_positions - len(held_symbols))
+
+        for symbol, score in buy_candidates:
+            if available_slots <= 0:
+                break
+            if _autopilot_order_blocked(symbol, open_orders):
+                continue
+            try:
+                price = fetch_latest_price(symbol)
+            except Exception as exc:
+                errors.append(f"price {symbol} failed: {exc}")
+                continue
+
+            notional_cap_pct = min(max_position_pct, max_total_allocation)
+            target_notional = max(min_entry_notional, equity * notional_cap_pct)
+            if PAPER_MAX_POSITION_NOTIONAL:
+                target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
+            if gross_notional + target_notional > equity * max_total_allocation:
+                summary_lines.append("Max portfolio allocation reached; skipping new entries.")
+                break
+
+            qty = int(target_notional // price)
+            if qty <= 0:
+                continue
+
+            stop_loss_pct = max(0.01, strategy.get("stop_loss_pct", 0.04) * stop_loss_multiplier)
+            take_profit_pct = max(0.02, strategy.get("take_profit_pct", 0.1) * take_profit_multiplier)
+
+            try:
+                place_guarded_paper_order(
+                    symbol,
+                    qty,
+                    "buy",
+                    stop_loss_pct=stop_loss_pct,
+                    take_profit_pct=take_profit_pct,
+                    time_in_force="gtc",
+                )
+                gross_notional += qty * price
+                available_slots -= 1
+                summary_lines.append(
+                    f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
+                )
+            except Exception as exc:
+                errors.append(f"buy {symbol} failed: {exc}")
+
+        if not summary_lines:
+            summary_lines.append("Cycle complete with no trades.")
+
+    except Exception as exc:
+        logger.exception("Autopilot cycle failed")
+        errors.append(str(exc))
+    finally:
+        with _autopilot_lock:
+            _autopilot_state["last_run"] = datetime.now()
+            _autopilot_state["last_actions"] = summary_lines
+            _autopilot_state["last_error"] = "; ".join(errors) if errors else None
+        _autopilot_runtime_lock.release()
+
+    if errors:
+        logger.warning("Autopilot cycle completed with errors: %s", "; ".join(errors))
+    else:
+        logger.info("Autopilot cycle completed: %s", " | ".join(summary_lines))
+
+
+# -----------------------------
 # Data sources
 # -----------------------------
 
 def update_sp500() -> None:
     logger.info("Updating S&P 500 list if stale…")
-    if datetime.now() - _sp500["updated"] > timedelta(hours=24):
-        tbl = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        with _lock:
-            _sp500["tickers"] = tbl["Symbol"].tolist()
-            _sp500["updated"] = datetime.now()
-        logger.info("Cached %d tickers", len(_sp500["tickers"]))
+    if datetime.now() - _sp500["updated"] <= timedelta(hours=24):
+        return
+
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning("Failed to fetch S&P 500 constituents: %s", exc)
+        return
+
+    try:
+        tables = pd.read_html(StringIO(response.text))
+    except Exception as exc:
+        logger.warning("Failed to parse S&P 500 table: %s", exc)
+        return
+
+    if not tables:
+        logger.warning("No tables found when parsing S&P 500 page")
+        return
+
+    table = None
+    symbol_col = None
+    for candidate in tables:
+        df = candidate.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                " ".join(str(part).strip() for part in col if str(part) != "nan").strip()
+                for col in df.columns
+            ]
+        else:
+            df.columns = [str(col).strip() for col in df.columns]
+
+        for col in df.columns:
+            normalized = col.lower()
+            if normalized in {"symbol", "ticker symbol", "ticker"}:
+                table = df
+                symbol_col = col
+                break
+        if table is not None:
+            break
+
+    if table is None or symbol_col is None:
+        logger.warning("S&P 500 table missing 'Symbol' column")
+        return
+
+    tickers = [
+        str(t).strip().upper()
+        for t in table[symbol_col].dropna()
+        if isinstance(t, (str, int, float)) and str(t).strip()
+    ]
+    if not tickers:
+        logger.warning("Parsed S&P 500 table but found no tickers")
+        return
+
+    with _lock:
+        _sp500["tickers"] = tickers
+        _sp500["updated"] = datetime.now()
+    logger.info("Cached %d S&P 500 tickers", len(tickers))
 
 
 # -----------------------------
@@ -320,18 +804,11 @@ def update_sp500() -> None:
 def analyze_stock(ticker: str) -> dict:
     """Compute metrics and chart data for a single ticker (flattening any MultiIndex)."""
     logger.info("Analyze %s", ticker)
-    # Download – retry once if Yahoo is flaky
-    hist = None
-    for _ in range(2):
-        try:
-            hist = yf.download(ticker, period="2y", auto_adjust=True, progress=False)
-            if hist is not None and not hist.empty:
-                break
-        except Exception:
-            pass
-    if hist is None or hist.empty:
-        logger.warning("No price data for %s", ticker)
-        raise ValueError(f"No price data for {ticker}")
+    try:
+        hist = get_price_history(ticker, "2y")
+    except PriceDataError as exc:
+        logger.warning("Analyze %s failed: %s", ticker, exc)
+        raise ValueError(str(exc))
 
     # Build a simple, single-index DataFrame for techs/plotting
     close = _col_series(hist, "Close", ticker)
@@ -381,10 +858,13 @@ def analyze_stock(ticker: str) -> dict:
 
 def fast_filter_ticker(ticker: str) -> bool:
     try:
-        info = yf.Ticker(ticker).info
-        return (info or {}).get("averageVolume", 0) > 1_000_000
-    except Exception:
+        hist = get_price_history(ticker, "90d")
+    except PriceDataError:
         return False
+    if hist is None or hist.empty or "Volume" not in hist.columns:
+        return False
+    avg_vol = float(hist["Volume"].tail(30).mean()) if not hist["Volume"].empty else 0.0
+    return avg_vol > 1_000_000
 
 
 def seek_recommendations() -> None:
@@ -392,6 +872,10 @@ def seek_recommendations() -> None:
     update_sp500()
     with _lock:
         tickers = _sp500["tickers"][:]
+
+    if not tickers:
+        logger.warning("S&P 500 cache is empty; skipping recommendation refresh")
+        return
 
     # deterministic daily shuffle to avoid A* bias
     rng = random.Random(date.today().toordinal())
@@ -408,36 +892,34 @@ def seek_recommendations() -> None:
         except Exception:
             continue
 
-    hist_all = yf.download(
-        filtered,
-        period="1y",
-        group_by="ticker",
-        auto_adjust=True,
-        threads=True,
-        progress=False,
-    )
+    if not filtered:
+        logger.warning("No tickers passed the liquidity filter; keeping existing recommendations")
+        return
 
     def worker(sym: str) -> dict:
         try:
-            df = None
-            if isinstance(hist_all.columns, pd.MultiIndex):
-                try:
-                    df = hist_all[sym]
-                except Exception:
-                    df = None
+            df = get_price_history(sym, "1y")
+        except PriceDataError as exc:
+            logger.warning("Skipping %s: %s", sym, exc)
+            return None
+        except Exception as exc:
+            logger.warning("Unexpected error loading %s: %s", sym, exc)
+            return None
+        try:
             if df is None or df.empty:
-                df = yf.download(sym, period="1y", auto_adjust=True, progress=False)
-            if df is None or df.empty:
-                logger.warning("No hist for %s in batch", sym)
-                return {"Symbol": sym, "Recommendation": "HOLD", "Score": 0.0, "Why": ["no data"]}
+                logger.warning("Skipping %s: no historical data", sym)
+                return None
 
             # Ensure we have needed cols
-            if isinstance(df["Close"], pd.DataFrame):
-                if sym in df["Close"].columns:
-                    df["Close"] = df["Close"][sym]
-                else:
-                    df["Close"] = df["Close"].iloc[:, 0]
+            missing = [col for col in ("High", "Low", "Close") if col not in df.columns]
+            if missing:
+                logger.warning("Skipping %s: missing columns %s", sym, ", ".join(missing))
+                return None
+
             df = df[["High", "Low", "Close"]].dropna().copy()
+            if df.empty:
+                logger.warning("Skipping %s: insufficient price data after cleaning", sym)
+                return None
             df = compute_indicators(df)
             score, reasons = score_stock(df)
             rec = "BUY" if score >= 3.5 else "HOLD"
@@ -447,7 +929,7 @@ def seek_recommendations() -> None:
             return {"Symbol": sym, "Recommendation": "HOLD", "Score": 0.0, "Why": [f"error: {e}"]}
 
     with ThreadPoolExecutor(max_workers=5) as ex:
-        results = list(ex.map(worker, filtered))
+        results = [res for res in ex.map(worker, filtered) if res]
 
     # rank by score desc, then symbol
     results.sort(key=lambda x: (-x.get("Score", 0.0), x.get("Symbol", "")))
@@ -467,7 +949,7 @@ def backtest_ticker(ticker: str, years: int = 3, cost_bps: float = 5.0) -> dict:
     cost_bps: round-trip cost in basis points per trade leg (5 = 0.05%).
     """
     logger.info("Backtest %s", ticker)
-    hist = yf.download(ticker, period=f"{years}y", auto_adjust=True, progress=False)
+    hist = get_price_history(ticker, f"{years}y")
     if hist is None or hist.empty:
         raise ValueError("No price data")
 
@@ -542,22 +1024,6 @@ def backtest_ticker(ticker: str, years: int = 3, cost_bps: float = 5.0) -> dict:
         },
         "equity_curve": curve.to_dict(orient="records"),
     }
-
-
-# -----------------------------
-# Data sources
-# -----------------------------
-
-def update_sp500() -> None:
-    logger.info("Updating S&P 500 list if stale…")
-    if datetime.now() - _sp500["updated"] > timedelta(hours=24):
-        tbl = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        with _lock:
-            _sp500["tickers"] = tbl["Symbol"].tolist()
-            _sp500["updated"] = datetime.now()
-        logger.info("Cached %d tickers", len(_sp500["tickers"]))
-
-
 # -----------------------------
 # Scheduler (avoid double-start)
 # -----------------------------
@@ -569,6 +1035,7 @@ def start_background_jobs():
     threading.Thread(target=seek_recommendations, daemon=True).start()
     sched = BackgroundScheduler()
     sched.add_job(seek_recommendations, "interval", hours=1, next_run_time=datetime.now())
+    sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now() + timedelta(seconds=30))
     sched.start()
     logger.info("Background jobs started")
 
@@ -588,7 +1055,10 @@ def home():
             try:
                 result = analyze_stock(t)
             except Exception as e:
-                logger.exception("Analyze error for %s", t)
+                if isinstance(e, ValueError):
+                    logger.warning("Analyze error for %s: %s", t, e)
+                else:
+                    logger.exception("Analyze error for %s", t)
                 flash(f"Analyze error for {t}: {e}")
     with _lock:
         recs = _recommendations[:]
@@ -603,7 +1073,10 @@ def home():
 @app.route("/seek")
 def seek_and_redirect():
     # Keep legacy redirect endpoint (still works if user hits it)
-    seek_recommendations()
+    try:
+        seek_recommendations()
+    except Exception:
+        logger.exception("Recommendation refresh failed")
     return redirect(url_for("home"))
 
 
@@ -643,6 +1116,7 @@ def paper_dashboard():
     orders = []
     broker_error = None
     todays_pl = None
+    autopilot_status = get_autopilot_status()
     if not paper_broker.enabled:
         broker_error = "Set ALPACA_PAPER_KEY_ID and ALPACA_PAPER_SECRET_KEY to enable paper trading."
     else:
@@ -672,6 +1146,9 @@ def paper_dashboard():
         PAPER_MAX_POSITION_NOTIONAL=PAPER_MAX_POSITION_NOTIONAL,
         PAPER_DEFAULT_STOP_LOSS_PCT=PAPER_DEFAULT_STOP_LOSS_PCT,
         PAPER_DEFAULT_TAKE_PROFIT_PCT=PAPER_DEFAULT_TAKE_PROFIT_PCT,
+        autopilot=autopilot_status,
+        autopilot_strategies=AUTOPILOT_STRATEGIES,
+        autopilot_risks=AUTOPILOT_RISK_LEVELS,
     )
 
 
@@ -700,6 +1177,31 @@ def paper_order_submit():
         flash(f"Order submitted: {order.get('id', 'n/a')}")
     except Exception as exc:
         flash(f"Order failed: {exc}")
+    return redirect(url_for("paper_dashboard"))
+
+
+@app.route("/paper/autopilot", methods=["POST"])
+def paper_autopilot_update():
+    if not paper_broker.enabled:
+        flash("Enable paper trading to use the autopilot.")
+        return redirect(url_for("paper_dashboard"))
+
+    enabled = request.form.get("autopilot_enabled") == "on"
+    strategy = request.form.get("autopilot_strategy", "balanced")
+    risk = request.form.get("autopilot_risk", "medium")
+    status = update_autopilot_config(enabled=enabled, strategy=strategy, risk=risk)
+    strategy_cfg = AUTOPILOT_STRATEGIES.get(status.get("strategy", "balanced"), {})
+    risk_cfg = AUTOPILOT_RISK_LEVELS.get(status.get("risk", "medium"), {})
+    state_text = "enabled" if status.get("enabled") else "paused"
+    flash(
+        "Autopilot %s – %s (%s risk)" % (
+            state_text,
+            strategy_cfg.get("label", status.get("strategy", "balanced")).strip(),
+            risk_cfg.get("label", status.get("risk", "medium")),
+        )
+    )
+    if status.get("enabled"):
+        threading.Thread(target=run_autopilot_cycle, daemon=True).start()
     return redirect(url_for("paper_dashboard"))
 
 
@@ -736,6 +1238,31 @@ def api_paper_orders():
     except Exception as exc:
         logger.exception("Orders fetch failed")
         return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.route("/api/paper/autopilot", methods=["GET", "POST"])
+def api_paper_autopilot():
+    if request.method == "GET":
+        return jsonify({"ok": True, "data": get_autopilot_status()})
+
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"invalid payload: {exc}"}), 400
+
+    enabled = payload.get("enabled")
+    if isinstance(enabled, str):
+        enabled = enabled.lower() in {"true", "1", "yes", "on"}
+    elif enabled is not None:
+        enabled = bool(enabled)
+
+    strategy = payload.get("strategy")
+    risk = payload.get("risk")
+
+    status = update_autopilot_config(enabled=enabled, strategy=strategy, risk=risk)
+    if status.get("enabled") and paper_broker.enabled:
+        threading.Thread(target=run_autopilot_cycle, daemon=True).start()
+    return jsonify({"ok": True, "data": status})
 
 
 @app.route("/api/paper/order", methods=["POST"])
