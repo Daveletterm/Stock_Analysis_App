@@ -16,25 +16,70 @@ recommendations so that the UI can load quickly.
   performance metrics and an equity curve suitable for visualization.
 - **Paper trading desk** – submit bracketed orders against Alpaca's paper API with position sizing
   guardrails and review account balances, open positions, and recent orders.
+- **Autopilot trader** – schedule fully automated entries/exits using pre-built strategies that obey
+  your risk preferences and Alpaca guardrails.
 - **JSON APIs** – `/api/analyze/<ticker>`, `/api/recommendations`, and `/api/backtest/<ticker>`
   make it simple to integrate the service with other tools.
 
-## Running Locally
+## Local Setup (Python 3.10)
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export FLASK_APP=app.py
-# Configure Alpaca paper credentials
-export ALPACA_PAPER_KEY_ID="..."
-export ALPACA_PAPER_SECRET_KEY="..."
-flask run --debug
-```
+1. **Create and activate the virtual environment**
 
-The application starts on `http://127.0.0.1:5000/` by default.  When running in debug mode the
-background jobs that refresh recommendations also start automatically.  Visit `/paper` to access the
-paper-trading desk once Alpaca credentials are configured.
+   ```bash
+   python3.10 -m venv venv
+   source venv/bin/activate  # "./venv/Scripts/activate" on Windows PowerShell
+   ```
+
+2. **Install dependencies**
+
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+
+   The requirements pin `pandas==2.1.4`, which is the latest release that offers
+   pre-built wheels for macOS + Python 3.10 without compilation errors. If you
+   see a build failure referencing `pandas`, confirm the virtual environment is
+   active and rerun `pip install pandas==2.1.4` manually before retrying the
+   requirements install.
+
+3. **Configure Alpaca paper credentials** – either export environment variables or create a
+   `.env` file (loaded automatically via [python-dotenv](https://pypi.org/project/python-dotenv/))
+   alongside `app.py`:
+
+   ```bash
+   export ALPACA_PAPER_KEY_ID="your-key-id"
+   export ALPACA_PAPER_SECRET_KEY="your-secret-key"
+   export ALPACA_PAPER_BASE_URL="https://paper-api.alpaca.markets/v2"  # optional
+   export FLASK_APP=app.py
+   ```
+
+   or create `.env` with:
+
+   ```dotenv
+   ALPACA_PAPER_KEY_ID=your-key-id
+   ALPACA_PAPER_SECRET_KEY=your-secret-key
+   # ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets/v2
+   FLASK_APP=app.py
+   ```
+
+4. **Run the application**
+
+   ```bash
+   flask run --debug
+   ```
+
+The app serves `http://127.0.0.1:5000/` with the main analysis dashboard, `/paper` for the
+paper-trading console, and `/api/...` routes for JSON integrations. Background jobs that refresh
+recommendations start automatically when the Flask app boots.
+
+> **Optional**: Additional technical indicators are enabled when
+> [`pandas-ta`](https://github.com/twopirllc/pandas-ta) is installed. Install directly from GitHub if
+> desired:
+>
+> ```bash
+> pip install "pandas-ta @ git+https://github.com/twopirllc/pandas-ta@main"
+> ```
 
 ### Paper trading guardrails
 
@@ -45,18 +90,39 @@ paper-trading desk once Alpaca credentials are configured.
 - API endpoints under `/api/paper/*` expose account, positions, orders, and allow programmatic order
   submission.
 
+### Autopilot strategies & risk controls
+
+The paper trading desk now includes an optional **Autopilot** that keeps scanning the market,
+allocates capital, and places bracketed orders without manual intervention.
+
+1. Visit `/paper`, choose a strategy (Conservative Growth, Balanced Momentum, or Aggressive
+   Breakouts), pick a risk level (Low/Medium/High), and toggle **Enable Autopilot**.
+2. The background worker wakes up every five minutes to refresh recommendations, trim positions that
+   fall below the strategy score threshold, and open new ones while respecting the guardrails above.
+3. Each cycle's actions and warnings surface directly in the Autopilot panel and through the
+   `/api/paper/autopilot` endpoint so other tools can subscribe to the activity feed.
+
+Programmatic control:
+
+```bash
+curl -X POST http://localhost:5000/api/paper/autopilot \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled": true, "strategy": "balanced", "risk": "medium"}'
+```
+
+The response contains the persisted configuration along with the latest cycle summary. Autopilot
+currently places equity trades; options support can be layered on once Alpaca's options API access is
+available in the paper account.
+
 ## Recommendations for Next Steps
 
-1. **Add paper trading support**
-   - Integrate with a brokerage that offers a paper-trading API (e.g., Alpaca, Interactive Brokers
-     TWS demo, or Tradier Sandbox).
-   - Create credentials configuration separate from production secrets.
-   - Build a trade-execution module that can place simulated orders, track fills, and reconcile
-     open positions.
-   - Expose a UI page and corresponding APIs to submit orders from analyzed tickers and to review
-     the simulated portfolio and its P&L.
-   - Add guardrails (position sizing rules, stop-loss, take-profit) so the strategy can be exercised
-     safely before touching real capital.
+1. **Extend the autopilot to multi-asset & options support**
+   - Add option-chain scanning and premium/greeks filters so the strategies can trade covered calls,
+     debit spreads, or protective puts alongside equities.
+   - Incorporate per-strategy drawdown tracking plus time-of-day controls to avoid trading during
+     illiquid sessions.
+   - Persist executed trades and performance metrics so the autopilot's edge can be audited over
+     time.
 
 2. **Persist analytics results**
    - Store analysis snapshots, backtest results, and recommendation history in a lightweight
