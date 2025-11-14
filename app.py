@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import json
@@ -71,6 +72,85 @@ _price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = 
 PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations = []
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
+
+
+# -----------------------------
+# Autopilot configuration
+# -----------------------------
+
+AUTOPILOT_STRATEGIES = {
+    "conservative": {
+        "label": "Conservative Growth",
+        "description": "Focus on highest scoring names with tight risk controls and limited exposure.",
+        "min_score": 3.6,
+        "exit_score": 2.2,
+        "max_positions": 4,
+        "max_position_pct": 0.08,
+        "max_total_allocation": 0.55,
+        "min_entry_notional": 300.0,
+        "stop_loss_pct": 0.03,
+        "take_profit_pct": 0.06,
+        "lookback": "1y",
+    },
+    "balanced": {
+        "label": "Balanced Momentum",
+        "description": "Blend of momentum and trend with moderate diversification and bracket exits.",
+        "min_score": 3.2,
+        "exit_score": 2.0,
+        "max_positions": 6,
+        "max_position_pct": 0.12,
+        "max_total_allocation": 0.8,
+        "min_entry_notional": 200.0,
+        "stop_loss_pct": 0.045,
+        "take_profit_pct": 0.12,
+        "lookback": "1y",
+    },
+    "aggressive": {
+        "label": "Aggressive Breakouts",
+        "description": "Targets early breakouts with wider stops and more simultaneous bets.",
+        "min_score": 2.8,
+        "exit_score": 1.6,
+        "max_positions": 9,
+        "max_position_pct": 0.16,
+        "max_total_allocation": 1.05,
+        "min_entry_notional": 150.0,
+        "stop_loss_pct": 0.065,
+        "take_profit_pct": 0.2,
+        "lookback": "9mo",
+    },
+}
+
+AUTOPILOT_RISK_LEVELS = {
+    "low": {
+        "label": "Low",
+        "position_multiplier": 0.65,
+        "stop_loss_multiplier": 0.75,
+        "take_profit_multiplier": 0.85,
+    },
+    "medium": {
+        "label": "Medium",
+        "position_multiplier": 1.0,
+        "stop_loss_multiplier": 1.0,
+        "take_profit_multiplier": 1.0,
+    },
+    "high": {
+        "label": "High",
+        "position_multiplier": 1.3,
+        "stop_loss_multiplier": 1.35,
+        "take_profit_multiplier": 1.2,
+    },
+}
+
+_autopilot_state = {
+    "enabled": False,
+    "strategy": "balanced",
+    "risk": "medium",
+    "last_run": None,
+    "last_actions": [],
+    "last_error": None,
+}
+_autopilot_lock = threading.Lock()
+_autopilot_runtime_lock = threading.Lock()
 
 # -----------------------------
 # Sentiment stubs (no external calls for now)
@@ -162,6 +242,19 @@ def to_plain(obj):
 
 class PriceDataError(RuntimeError):
     """Raised when price history cannot be retrieved from upstream providers."""
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str) and value.strip() == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
 def _cache_key(ticker: str, period: str, interval: str | None, auto_adjust: bool) -> Tuple[str, str, str, bool]:
@@ -412,6 +505,256 @@ def place_guarded_paper_order(
                 }
 
     return paper_broker.submit_order(payload)
+
+
+# -----------------------------
+# Autopilot routines
+# -----------------------------
+
+
+def get_autopilot_status() -> dict:
+    with _autopilot_lock:
+        snapshot = dict(_autopilot_state)
+    last_run = snapshot.get("last_run")
+    if isinstance(last_run, datetime):
+        snapshot["last_run"] = last_run.isoformat(timespec="seconds")
+    snapshot.setdefault("strategy", "balanced")
+    snapshot.setdefault("risk", "medium")
+    actions = snapshot.get("last_actions")
+    if isinstance(actions, list):
+        snapshot["last_actions"] = actions
+    elif actions:
+        snapshot["last_actions"] = [str(actions)]
+    else:
+        snapshot["last_actions"] = []
+    return snapshot
+
+
+def update_autopilot_config(*, enabled: bool | None = None, strategy: str | None = None, risk: str | None = None) -> dict:
+    with _autopilot_lock:
+        if enabled is not None:
+            _autopilot_state["enabled"] = bool(enabled)
+        if strategy and strategy in AUTOPILOT_STRATEGIES:
+            _autopilot_state["strategy"] = strategy
+        if risk and risk in AUTOPILOT_RISK_LEVELS:
+            _autopilot_state["risk"] = risk
+    return get_autopilot_status()
+
+
+def _autopilot_order_blocked(symbol: str, open_orders: list[dict]) -> bool:
+    for order in open_orders:
+        try:
+            if str(order.get("symbol", "")).upper() != symbol.upper():
+                continue
+            status = str(order.get("status", "")).lower()
+            if status in {"new", "accepted", "open", "pending_new", "partially_filled"}:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | None:
+    try:
+        hist = get_price_history(symbol, period)
+    except PriceDataError as exc:
+        logger.warning("Autopilot skip %s: %s", symbol, exc)
+        return None
+    if hist is None or hist.empty:
+        return None
+    df = pd.DataFrame(index=hist.index.copy())
+    try:
+        df["Close"] = _col_series(hist, "Close", symbol)
+        df["High"] = _col_series(hist, "High", symbol)
+        df["Low"] = _col_series(hist, "Low", symbol)
+    except Exception as exc:
+        logger.debug("Autopilot failed to shape history for %s: %s", symbol, exc)
+        return None
+    df = df.dropna()
+    if df.empty:
+        return None
+    df = compute_indicators(df)
+    return df
+
+
+def run_autopilot_cycle() -> None:
+    if not paper_broker.enabled:
+        return
+
+    with _autopilot_lock:
+        config = dict(_autopilot_state)
+
+    if not config.get("enabled"):
+        return
+
+    if not _autopilot_runtime_lock.acquire(blocking=False):
+        logger.debug("Autopilot cycle skipped; previous cycle still running")
+        return
+
+    summary_lines: list[str] = []
+    errors: list[str] = []
+    try:
+        strategy_key = config.get("strategy", "balanced")
+        risk_key = config.get("risk", "medium")
+        strategy = AUTOPILOT_STRATEGIES.get(strategy_key, AUTOPILOT_STRATEGIES["balanced"])
+        risk_cfg = AUTOPILOT_RISK_LEVELS.get(risk_key, AUTOPILOT_RISK_LEVELS["medium"])
+
+        account = paper_broker.get_account()
+        equity = safe_float(account.get("equity"), safe_float(account.get("cash")))
+        if equity <= 0:
+            summary_lines.append("Account equity unavailable; skipping cycle.")
+            return
+
+        try:
+            positions = list(paper_broker.get_positions())
+        except Exception as exc:
+            errors.append(f"positions error: {exc}")
+            positions = []
+
+        try:
+            open_orders = list(paper_broker.list_orders(status="open", limit=200))
+        except Exception as exc:
+            errors.append(f"orders error: {exc}")
+            open_orders = []
+
+        held_symbols: dict[str, dict] = {}
+        gross_notional = 0.0
+        for pos in positions:
+            symbol = str(pos.get("symbol", "")).upper()
+            qty = safe_float(pos.get("qty"), safe_float(pos.get("quantity")))
+            if not symbol or qty <= 0:
+                continue
+            held_symbols[symbol] = pos
+            gross_notional += abs(safe_float(pos.get("market_value")))
+
+        with _lock:
+            recs_snapshot = [dict(r) for r in _recommendations]
+
+        if not recs_snapshot:
+            seek_recommendations()
+            with _lock:
+                recs_snapshot = [dict(r) for r in _recommendations]
+
+        position_multiplier = max(risk_cfg.get("position_multiplier", 1.0), 0.25)
+        stop_loss_multiplier = max(risk_cfg.get("stop_loss_multiplier", 1.0), 0.25)
+        take_profit_multiplier = max(risk_cfg.get("take_profit_multiplier", 1.0), 0.25)
+
+        max_position_pct = min(strategy.get("max_position_pct", 0.1) * position_multiplier, 0.95)
+        max_total_allocation = max(0.1, strategy.get("max_total_allocation", 1.0) * position_multiplier)
+        min_entry_notional = max(50.0, strategy.get("min_entry_notional", 200.0))
+
+        # Exit review
+        exit_threshold = strategy.get("exit_score", 2.0)
+        lookback = strategy.get("lookback", "1y")
+        for symbol, pos in held_symbols.items():
+            qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
+            if qty < 1:
+                continue
+            df = _autopilot_prepare_dataframe(symbol, lookback)
+            if df is None:
+                continue
+            score, reasons = score_stock(df)
+            if score < exit_threshold:
+                if _autopilot_order_blocked(symbol, open_orders):
+                    summary_lines.append(f"Exit pending for {symbol}; open order detected.")
+                    continue
+                qty_int = int(math.floor(qty))
+                if qty_int <= 0:
+                    continue
+                try:
+                    place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                    summary_lines.append(
+                        f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
+                    )
+                except Exception as exc:
+                    errors.append(f"sell {symbol} failed: {exc}")
+
+        # Entry candidates
+        held_and_pending = set(held_symbols.keys())
+        for order in open_orders:
+            try:
+                if str(order.get("side", "")).lower() == "buy":
+                    held_and_pending.add(str(order.get("symbol", "")).upper())
+            except Exception:
+                continue
+
+        buy_candidates: list[tuple[str, float]] = []
+        for rec in recs_snapshot:
+            symbol = str(rec.get("Symbol", "")).upper()
+            if not symbol or symbol in held_and_pending:
+                continue
+            score = safe_float(rec.get("Score"))
+            if score < strategy.get("min_score", 3.0):
+                continue
+            buy_candidates.append((symbol, score))
+
+        if not buy_candidates:
+            summary_lines.append("No new symbols met entry criteria.")
+
+        buy_candidates.sort(key=lambda item: item[1], reverse=True)
+        max_positions = max(1, int(strategy.get("max_positions", 5)))
+        available_slots = max(0, max_positions - len(held_symbols))
+
+        for symbol, score in buy_candidates:
+            if available_slots <= 0:
+                break
+            if _autopilot_order_blocked(symbol, open_orders):
+                continue
+            try:
+                price = fetch_latest_price(symbol)
+            except Exception as exc:
+                errors.append(f"price {symbol} failed: {exc}")
+                continue
+
+            notional_cap_pct = min(max_position_pct, max_total_allocation)
+            target_notional = max(min_entry_notional, equity * notional_cap_pct)
+            if PAPER_MAX_POSITION_NOTIONAL:
+                target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
+            if gross_notional + target_notional > equity * max_total_allocation:
+                summary_lines.append("Max portfolio allocation reached; skipping new entries.")
+                break
+
+            qty = int(target_notional // price)
+            if qty <= 0:
+                continue
+
+            stop_loss_pct = max(0.01, strategy.get("stop_loss_pct", 0.04) * stop_loss_multiplier)
+            take_profit_pct = max(0.02, strategy.get("take_profit_pct", 0.1) * take_profit_multiplier)
+
+            try:
+                place_guarded_paper_order(
+                    symbol,
+                    qty,
+                    "buy",
+                    stop_loss_pct=stop_loss_pct,
+                    take_profit_pct=take_profit_pct,
+                    time_in_force="gtc",
+                )
+                gross_notional += qty * price
+                available_slots -= 1
+                summary_lines.append(
+                    f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
+                )
+            except Exception as exc:
+                errors.append(f"buy {symbol} failed: {exc}")
+
+        if not summary_lines:
+            summary_lines.append("Cycle complete with no trades.")
+
+    except Exception as exc:
+        logger.exception("Autopilot cycle failed")
+        errors.append(str(exc))
+    finally:
+        with _autopilot_lock:
+            _autopilot_state["last_run"] = datetime.now()
+            _autopilot_state["last_actions"] = summary_lines
+            _autopilot_state["last_error"] = "; ".join(errors) if errors else None
+        _autopilot_runtime_lock.release()
+
+    if errors:
+        logger.warning("Autopilot cycle completed with errors: %s", "; ".join(errors))
+    else:
+        logger.info("Autopilot cycle completed: %s", " | ".join(summary_lines))
 
 
 # -----------------------------
@@ -748,6 +1091,7 @@ def start_background_jobs():
     threading.Thread(target=seek_recommendations, daemon=True).start()
     sched = BackgroundScheduler()
     sched.add_job(seek_recommendations, "interval", hours=1, next_run_time=datetime.now())
+    sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now() + timedelta(seconds=30))
     sched.start()
     logger.info("Background jobs started")
 
@@ -828,6 +1172,7 @@ def paper_dashboard():
     orders = []
     broker_error = None
     todays_pl = None
+    autopilot_status = get_autopilot_status()
     if not paper_broker.enabled:
         broker_error = "Set ALPACA_PAPER_KEY_ID and ALPACA_PAPER_SECRET_KEY to enable paper trading."
     else:
@@ -857,6 +1202,9 @@ def paper_dashboard():
         PAPER_MAX_POSITION_NOTIONAL=PAPER_MAX_POSITION_NOTIONAL,
         PAPER_DEFAULT_STOP_LOSS_PCT=PAPER_DEFAULT_STOP_LOSS_PCT,
         PAPER_DEFAULT_TAKE_PROFIT_PCT=PAPER_DEFAULT_TAKE_PROFIT_PCT,
+        autopilot=autopilot_status,
+        autopilot_strategies=AUTOPILOT_STRATEGIES,
+        autopilot_risks=AUTOPILOT_RISK_LEVELS,
     )
 
 
@@ -885,6 +1233,31 @@ def paper_order_submit():
         flash(f"Order submitted: {order.get('id', 'n/a')}")
     except Exception as exc:
         flash(f"Order failed: {exc}")
+    return redirect(url_for("paper_dashboard"))
+
+
+@app.route("/paper/autopilot", methods=["POST"])
+def paper_autopilot_update():
+    if not paper_broker.enabled:
+        flash("Enable paper trading to use the autopilot.")
+        return redirect(url_for("paper_dashboard"))
+
+    enabled = request.form.get("autopilot_enabled") == "on"
+    strategy = request.form.get("autopilot_strategy", "balanced")
+    risk = request.form.get("autopilot_risk", "medium")
+    status = update_autopilot_config(enabled=enabled, strategy=strategy, risk=risk)
+    strategy_cfg = AUTOPILOT_STRATEGIES.get(status.get("strategy", "balanced"), {})
+    risk_cfg = AUTOPILOT_RISK_LEVELS.get(status.get("risk", "medium"), {})
+    state_text = "enabled" if status.get("enabled") else "paused"
+    flash(
+        "Autopilot %s – %s (%s risk)" % (
+            state_text,
+            strategy_cfg.get("label", status.get("strategy", "balanced")).strip(),
+            risk_cfg.get("label", status.get("risk", "medium")),
+        )
+    )
+    if status.get("enabled"):
+        threading.Thread(target=run_autopilot_cycle, daemon=True).start()
     return redirect(url_for("paper_dashboard"))
 
 
@@ -921,6 +1294,31 @@ def api_paper_orders():
     except Exception as exc:
         logger.exception("Orders fetch failed")
         return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.route("/api/paper/autopilot", methods=["GET", "POST"])
+def api_paper_autopilot():
+    if request.method == "GET":
+        return jsonify({"ok": True, "data": get_autopilot_status()})
+
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"invalid payload: {exc}"}), 400
+
+    enabled = payload.get("enabled")
+    if isinstance(enabled, str):
+        enabled = enabled.lower() in {"true", "1", "yes", "on"}
+    elif enabled is not None:
+        enabled = bool(enabled)
+
+    strategy = payload.get("strategy")
+    risk = payload.get("risk")
+
+    status = update_autopilot_config(enabled=enabled, strategy=strategy, risk=risk)
+    if status.get("enabled") and paper_broker.enabled:
+        threading.Thread(target=run_autopilot_cycle, daemon=True).start()
+    return jsonify({"ok": True, "data": status})
 
 
 @app.route("/api/paper/order", methods=["POST"])
