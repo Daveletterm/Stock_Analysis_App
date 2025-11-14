@@ -348,7 +348,7 @@ def fetch_option_contracts(
     if option_type:
         params["type"] = option_type.lower()
 
-    url = f"{ALPACA_OPTIONS_BASE_URL}/options/chain/{symbol.upper()}"
+    url = f"{ALPACA_OPTIONS_BASE_URL}/options/{symbol.upper()}/chains"
 
     def _request_chain(chain_url: str) -> requests.Response:
         return _alpaca_request(
@@ -369,7 +369,7 @@ def fetch_option_contracts(
         base_used = ALPACA_OPTIONS_BASE_URL.rstrip("/")
         default_base = _DEFAULT_ALPACA_OPTIONS_BASE_URL.rstrip("/")
         if base_used.lower() != default_base.lower():
-            fallback_url = f"{default_base}/options/chain/{symbol.upper()}"
+            fallback_url = f"{default_base}/options/{symbol.upper()}/chains"
             logger.info(
                 "Retrying %s option chain against default Alpaca endpoint %s",
                 symbol.upper(),
