@@ -7,14 +7,26 @@ import logging
 from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from io import StringIO
+from typing import Dict, Tuple
+
+import requests
 
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
 
 from paper_trading import AlpacaPaperBroker
+
+try:  # pragma: no cover - optional import varies by yfinance version
+    from yfinance.shared.exceptions import YFRateLimitError  # type: ignore
+except Exception:  # pragma: no cover - fallback when module layout changes
+    YFRateLimitError = ()  # type: ignore
+
+load_dotenv()
 
 # -----------------------------
 # App setup
@@ -32,6 +44,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("stockapp")
 
+try:  # Optional dependency used for some advanced indicators
+    import pandas_ta as _pandas_ta  # type: ignore
+
+    HAS_PANDAS_TA = True
+except ImportError:
+    HAS_PANDAS_TA = False
+    _pandas_ta = None
+    logger.info(
+        "pandas-ta not installed; advanced technical indicators will be skipped."
+    )
+
 # Paper trading configuration
 paper_broker = AlpacaPaperBroker()
 PAPER_MAX_POSITION_PCT = float(os.getenv("PAPER_MAX_POSITION_PCT", "0.1"))
@@ -44,6 +67,8 @@ PAPER_DEFAULT_TAKE_PROFIT_PCT = float(os.getenv("PAPER_TAKE_PROFIT_PCT", "0.1"))
 # -----------------------------
 _lock = threading.Lock()
 _sp500 = {"tickers": [], "updated": datetime.min}
+_price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = {}
+PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations = []
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 
@@ -135,12 +160,94 @@ def to_plain(obj):
     return obj
 
 
+class PriceDataError(RuntimeError):
+    """Raised when price history cannot be retrieved from upstream providers."""
+
+
+def _cache_key(ticker: str, period: str, interval: str | None, auto_adjust: bool) -> Tuple[str, str, str, bool]:
+    return (ticker.upper(), period, interval or "1d", auto_adjust)
+
+
+def get_price_history(
+    ticker: str,
+    period: str,
+    *,
+    interval: str | None = None,
+    auto_adjust: bool = True,
+    max_age: timedelta = PRICE_CACHE_TTL,
+) -> pd.DataFrame:
+    """Download historical data with simple in-memory caching and rate-limit handling."""
+
+    key = _cache_key(ticker, period, interval, auto_adjust)
+    cached_df = None
+    cached_ts: datetime | None = None
+    now = datetime.now()
+    with _lock:
+        if key in _price_cache:
+            cached_ts, cached_df = _price_cache[key]
+            if cached_ts and now - cached_ts <= max_age:
+                return cached_df.copy()
+
+    rate_limited = False
+    download_error: Exception | None = None
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=auto_adjust,
+            progress=False,
+        )
+    except Exception as exc:
+        download_error = exc
+        message = str(exc)
+        rate_limited = "rate limit" in message.lower() or isinstance(exc, YFRateLimitError)
+        df = pd.DataFrame()
+
+    if (df is None or df.empty) and not rate_limited:
+        try:
+            df = yf.Ticker(ticker).history(
+                period=period,
+                interval=interval or "1d",
+                auto_adjust=auto_adjust,
+            )
+        except Exception as exc:
+            download_error = exc
+            rate_limited = "rate limit" in str(exc).lower() or isinstance(exc, YFRateLimitError)
+            df = pd.DataFrame()
+
+    if df is None or df.empty:
+        if cached_df is not None:
+            logger.warning(
+                "Using cached %s data after download failure%s",
+                ticker,
+                ": rate limited" if rate_limited else "",
+            )
+            return cached_df.copy()
+        if rate_limited:
+            raise PriceDataError(
+                f"Yahoo Finance rate limit reached for {ticker}. Please wait a minute and try again."
+            )
+        error_text = str(download_error) if download_error else "No price data returned"
+        raise PriceDataError(f"Unable to download data for {ticker}: {error_text}")
+
+    df = df.dropna(how="all").copy()
+    if df.empty:
+        if cached_df is not None:
+            logger.warning("Using cached %s data after cleaning removed all rows", ticker)
+            return cached_df.copy()
+        raise PriceDataError(f"No price data for {ticker}")
+
+    with _lock:
+        _price_cache[key] = (now, df.copy())
+
+    return df
+
+
 @lru_cache(maxsize=256)
 def fetch_latest_price(ticker: str) -> float:
     """Fetch the most recent closing price for guardrail calculations."""
-    hist = yf.Ticker(ticker).history(period="5d")
-    if hist is None or hist.empty:
-        hist = yf.download(ticker, period="1d", auto_adjust=True, progress=False)
+    hist = get_price_history(ticker, "5d")
     if hist is None or hist.empty:
         raise ValueError(f"No recent price data for {ticker}")
     price = hist["Close"].iloc[-1]
@@ -173,6 +280,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["LL_20"] = df["Low"].rolling(20, min_periods=1).min().astype(float)
     df["HH_252"] = df["High"].rolling(252, min_periods=1).max().astype(float)
     df["pct_from_52w_high"] = (df["Close"] / df["HH_252"] - 1.0).replace([np.inf, -np.inf], np.nan)
+    if HAS_PANDAS_TA:
+        try:
+            df["EMA_21"] = _pandas_ta.ema(df["Close"], length=21)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("pandas-ta EMA calculation failed: %s", exc)
+            df["EMA_21"] = pd.NA
+    else:
+        df["EMA_21"] = pd.NA
     return df
 
 
@@ -305,12 +420,74 @@ def place_guarded_paper_order(
 
 def update_sp500() -> None:
     logger.info("Updating S&P 500 list if stale…")
-    if datetime.now() - _sp500["updated"] > timedelta(hours=24):
-        tbl = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        with _lock:
-            _sp500["tickers"] = tbl["Symbol"].tolist()
-            _sp500["updated"] = datetime.now()
-        logger.info("Cached %d tickers", len(_sp500["tickers"]))
+    if datetime.now() - _sp500["updated"] <= timedelta(hours=24):
+        return
+
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning("Failed to fetch S&P 500 constituents: %s", exc)
+        return
+
+    try:
+        tables = pd.read_html(StringIO(response.text))
+    except Exception as exc:
+        logger.warning("Failed to parse S&P 500 table: %s", exc)
+        return
+
+    if not tables:
+        logger.warning("No tables found when parsing S&P 500 page")
+        return
+
+    table = None
+    symbol_col = None
+    for candidate in tables:
+        df = candidate.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                " ".join(str(part).strip() for part in col if str(part) != "nan").strip()
+                for col in df.columns
+            ]
+        else:
+            df.columns = [str(col).strip() for col in df.columns]
+
+        for col in df.columns:
+            normalized = col.lower()
+            if normalized in {"symbol", "ticker symbol", "ticker"}:
+                table = df
+                symbol_col = col
+                break
+        if table is not None:
+            break
+
+    if table is None or symbol_col is None:
+        logger.warning("S&P 500 table missing 'Symbol' column")
+        return
+
+    tickers = [
+        str(t).strip().upper()
+        for t in table[symbol_col].dropna()
+        if isinstance(t, (str, int, float)) and str(t).strip()
+    ]
+    if not tickers:
+        logger.warning("Parsed S&P 500 table but found no tickers")
+        return
+
+    with _lock:
+        _sp500["tickers"] = tickers
+        _sp500["updated"] = datetime.now()
+    logger.info("Cached %d S&P 500 tickers", len(tickers))
 
 
 # -----------------------------
@@ -320,18 +497,11 @@ def update_sp500() -> None:
 def analyze_stock(ticker: str) -> dict:
     """Compute metrics and chart data for a single ticker (flattening any MultiIndex)."""
     logger.info("Analyze %s", ticker)
-    # Download – retry once if Yahoo is flaky
-    hist = None
-    for _ in range(2):
-        try:
-            hist = yf.download(ticker, period="2y", auto_adjust=True, progress=False)
-            if hist is not None and not hist.empty:
-                break
-        except Exception:
-            pass
-    if hist is None or hist.empty:
-        logger.warning("No price data for %s", ticker)
-        raise ValueError(f"No price data for {ticker}")
+    try:
+        hist = get_price_history(ticker, "2y")
+    except PriceDataError as exc:
+        logger.warning("Analyze %s failed: %s", ticker, exc)
+        raise ValueError(str(exc))
 
     # Build a simple, single-index DataFrame for techs/plotting
     close = _col_series(hist, "Close", ticker)
@@ -393,6 +563,10 @@ def seek_recommendations() -> None:
     with _lock:
         tickers = _sp500["tickers"][:]
 
+    if not tickers:
+        logger.warning("S&P 500 cache is empty; skipping recommendation refresh")
+        return
+
     # deterministic daily shuffle to avoid A* bias
     rng = random.Random(date.today().toordinal())
     rng.shuffle(tickers)
@@ -408,14 +582,22 @@ def seek_recommendations() -> None:
         except Exception:
             continue
 
-    hist_all = yf.download(
-        filtered,
-        period="1y",
-        group_by="ticker",
-        auto_adjust=True,
-        threads=True,
-        progress=False,
-    )
+    if not filtered:
+        logger.warning("No tickers passed the liquidity filter; keeping existing recommendations")
+        return
+
+    try:
+        hist_all = yf.download(
+            filtered,
+            period="1y",
+            group_by="ticker",
+            auto_adjust=True,
+            threads=True,
+            progress=False,
+        )
+    except Exception as exc:
+        logger.warning("Batch history download failed: %s", exc)
+        hist_all = pd.DataFrame()
 
     def worker(sym: str) -> dict:
         try:
@@ -426,10 +608,14 @@ def seek_recommendations() -> None:
                 except Exception:
                     df = None
             if df is None or df.empty:
-                df = yf.download(sym, period="1y", auto_adjust=True, progress=False)
+                try:
+                    df = get_price_history(sym, "1y")
+                except PriceDataError as exc:
+                    logger.warning("Skipping %s: %s", sym, exc)
+                    return None
             if df is None or df.empty:
-                logger.warning("No hist for %s in batch", sym)
-                return {"Symbol": sym, "Recommendation": "HOLD", "Score": 0.0, "Why": ["no data"]}
+                logger.warning("Skipping %s: no historical data", sym)
+                return None
 
             # Ensure we have needed cols
             if isinstance(df["Close"], pd.DataFrame):
@@ -437,7 +623,16 @@ def seek_recommendations() -> None:
                     df["Close"] = df["Close"][sym]
                 else:
                     df["Close"] = df["Close"].iloc[:, 0]
+
+            missing = [col for col in ("High", "Low", "Close") if col not in df.columns]
+            if missing:
+                logger.warning("Skipping %s: missing columns %s", sym, ", ".join(missing))
+                return None
+
             df = df[["High", "Low", "Close"]].dropna().copy()
+            if df.empty:
+                logger.warning("Skipping %s: insufficient price data after cleaning", sym)
+                return None
             df = compute_indicators(df)
             score, reasons = score_stock(df)
             rec = "BUY" if score >= 3.5 else "HOLD"
@@ -447,7 +642,7 @@ def seek_recommendations() -> None:
             return {"Symbol": sym, "Recommendation": "HOLD", "Score": 0.0, "Why": [f"error: {e}"]}
 
     with ThreadPoolExecutor(max_workers=5) as ex:
-        results = list(ex.map(worker, filtered))
+        results = [res for res in ex.map(worker, filtered) if res]
 
     # rank by score desc, then symbol
     results.sort(key=lambda x: (-x.get("Score", 0.0), x.get("Symbol", "")))
@@ -542,22 +737,6 @@ def backtest_ticker(ticker: str, years: int = 3, cost_bps: float = 5.0) -> dict:
         },
         "equity_curve": curve.to_dict(orient="records"),
     }
-
-
-# -----------------------------
-# Data sources
-# -----------------------------
-
-def update_sp500() -> None:
-    logger.info("Updating S&P 500 list if stale…")
-    if datetime.now() - _sp500["updated"] > timedelta(hours=24):
-        tbl = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        with _lock:
-            _sp500["tickers"] = tbl["Symbol"].tolist()
-            _sp500["updated"] = datetime.now()
-        logger.info("Cached %d tickers", len(_sp500["tickers"]))
-
-
 # -----------------------------
 # Scheduler (avoid double-start)
 # -----------------------------
@@ -588,7 +767,10 @@ def home():
             try:
                 result = analyze_stock(t)
             except Exception as e:
-                logger.exception("Analyze error for %s", t)
+                if isinstance(e, ValueError):
+                    logger.warning("Analyze error for %s: %s", t, e)
+                else:
+                    logger.exception("Analyze error for %s", t)
                 flash(f"Analyze error for {t}: {e}")
     with _lock:
         recs = _recommendations[:]
@@ -603,7 +785,10 @@ def home():
 @app.route("/seek")
 def seek_and_redirect():
     # Keep legacy redirect endpoint (still works if user hits it)
-    seek_recommendations()
+    try:
+        seek_recommendations()
+    except Exception:
+        logger.exception("Recommendation refresh failed")
     return redirect(url_for("home"))
 
 

@@ -19,22 +19,65 @@ recommendations so that the UI can load quickly.
 - **JSON APIs** – `/api/analyze/<ticker>`, `/api/recommendations`, and `/api/backtest/<ticker>`
   make it simple to integrate the service with other tools.
 
-## Running Locally
+## Local Setup (Python 3.10)
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export FLASK_APP=app.py
-# Configure Alpaca paper credentials
-export ALPACA_PAPER_KEY_ID="..."
-export ALPACA_PAPER_SECRET_KEY="..."
-flask run --debug
-```
+1. **Create and activate the virtual environment**
 
-The application starts on `http://127.0.0.1:5000/` by default.  When running in debug mode the
-background jobs that refresh recommendations also start automatically.  Visit `/paper` to access the
-paper-trading desk once Alpaca credentials are configured.
+   ```bash
+   python3.10 -m venv venv
+   source venv/bin/activate  # "./venv/Scripts/activate" on Windows PowerShell
+   ```
+
+2. **Install dependencies**
+
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+
+   The requirements pin `pandas==2.1.4`, which is the latest release that offers
+   pre-built wheels for macOS + Python 3.10 without compilation errors. If you
+   see a build failure referencing `pandas`, confirm the virtual environment is
+   active and rerun `pip install pandas==2.1.4` manually before retrying the
+   requirements install.
+
+3. **Configure Alpaca paper credentials** – either export environment variables or create a
+   `.env` file (loaded automatically via [python-dotenv](https://pypi.org/project/python-dotenv/))
+   alongside `app.py`:
+
+   ```bash
+   export ALPACA_PAPER_KEY_ID="your-key-id"
+   export ALPACA_PAPER_SECRET_KEY="your-secret-key"
+   export ALPACA_PAPER_BASE_URL="https://paper-api.alpaca.markets/v2"  # optional
+   export FLASK_APP=app.py
+   ```
+
+   or create `.env` with:
+
+   ```dotenv
+   ALPACA_PAPER_KEY_ID=your-key-id
+   ALPACA_PAPER_SECRET_KEY=your-secret-key
+   # ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets/v2
+   FLASK_APP=app.py
+   ```
+
+4. **Run the application**
+
+   ```bash
+   flask run --debug
+   ```
+
+The app serves `http://127.0.0.1:5000/` with the main analysis dashboard, `/paper` for the
+paper-trading console, and `/api/...` routes for JSON integrations. Background jobs that refresh
+recommendations start automatically when the Flask app boots.
+
+> **Optional**: Additional technical indicators are enabled when
+> [`pandas-ta`](https://github.com/twopirllc/pandas-ta) is installed. Install directly from GitHub if
+> desired:
+>
+> ```bash
+> pip install "pandas-ta @ git+https://github.com/twopirllc/pandas-ta@main"
+> ```
 
 ### Paper trading guardrails
 
