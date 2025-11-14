@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, date, timezone
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from io import StringIO
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
 
@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from paper_trading import AlpacaPaperBroker
 from market_data import PriceDataError
+from market_data import fetch_option_contracts
 from market_data import get_price_history as load_price_history
 
 load_dotenv()
@@ -68,6 +69,8 @@ _price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = 
 PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations = []
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
+OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
+OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
 
 
 # -----------------------------
@@ -113,6 +116,27 @@ AUTOPILOT_STRATEGIES = {
         "stop_loss_pct": 0.065,
         "take_profit_pct": 0.2,
         "lookback": "9mo",
+    },
+    "options_momentum": {
+        "label": "Momentum Calls (Options)",
+        "description": "Buy liquid near-dated calls on top scoring momentum names.",
+        "asset_class": "option",
+        "min_score": 3.4,
+        "exit_score": 2.4,
+        "max_positions": 4,
+        "max_position_pct": 0.06,
+        "max_total_allocation": 0.4,
+        "min_entry_notional": 150.0,
+        "options_take_profit_pct": 0.85,
+        "options_stop_loss_pct": 0.45,
+        "options_expiry_buffer": 5,
+        "options_expiry_window": (21, 45),
+        "min_open_interest": 75,
+        "min_volume": 10,
+        "target_delta": 0.4,
+        "contract_type": "call",
+        "max_contracts_per_trade": 5,
+        "lookback": "6mo",
     },
 }
 
@@ -247,6 +271,89 @@ def safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def parse_option_symbol(contract_symbol: str) -> dict[str, Any] | None:
+    """Return metadata about an OCC option symbol (underlying, expiry, strike)."""
+
+    if not contract_symbol:
+        return None
+    cleaned = contract_symbol.replace(" ", "").upper()
+    match = OPTION_SYMBOL_RE.match(cleaned)
+    if not match:
+        return None
+    underlying, yymmdd, cp_flag, strike_str = match.groups()
+    try:
+        expiration = datetime.strptime(yymmdd, "%y%m%d").date()
+    except ValueError:
+        return None
+    strike_val = safe_float(int(strike_str) / 1000.0, 0.0)
+    if strike_val is None:
+        strike_val = 0.0
+    return {
+        "symbol": cleaned,
+        "underlying": underlying,
+        "expiration": expiration,
+        "type": "call" if cp_flag == "C" else "put",
+        "strike": float(strike_val),
+    }
+
+
+def option_days_to_expiration(meta: dict[str, Any] | None) -> int | None:
+    if not meta or "expiration" not in meta:
+        return None
+    expiration = meta["expiration"]
+    if isinstance(expiration, str):
+        try:
+            expiration = datetime.strptime(expiration, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    if isinstance(expiration, datetime):
+        expiration = expiration.date()
+    if not isinstance(expiration, date):
+        return None
+    return (expiration - date.today()).days
+
+
+def option_contract_delta(contract: dict[str, Any]) -> float | None:
+    if not isinstance(contract, dict):
+        return None
+    delta = contract.get("delta")
+    if delta is None and isinstance(contract.get("greeks"), dict):
+        delta = contract["greeks"].get("delta")
+    return safe_float(delta, None)
+
+
+def option_mid_price(contract: dict[str, Any]) -> float | None:
+    if not isinstance(contract, dict):
+        return None
+    quote = None
+    for key in ("last_quote", "quote", "latest_quote"):
+        value = contract.get(key)
+        if isinstance(value, dict):
+            quote = value
+            break
+    bid = safe_float(quote.get("bid_price")) if quote else None
+    ask = safe_float(quote.get("ask_price")) if quote else None
+    if bid and ask:
+        return (bid + ask) / 2.0
+    if ask:
+        return ask
+    if bid:
+        return bid
+    trade = None
+    for key in ("last_trade", "trade", "latest_trade"):
+        value = contract.get(key)
+        if isinstance(value, dict):
+            trade = value
+            break
+    if trade:
+        for price_key in ("price", "last_price", "p"):
+            price_val = trade.get(price_key)
+            price = safe_float(price_val, None)
+            if price is not None:
+                return price
+    return None
 
 
 _PERIOD_RE = re.compile(r"^(\d+)([a-zA-Z]+)$")
@@ -430,10 +537,15 @@ def place_guarded_paper_order(
     stop_loss_pct: float | None = None,
     take_profit_pct: float | None = None,
     time_in_force: str = "day",
+    *,
+    asset_class: str | None = None,
+    price_hint: float | None = None,
+    support_brackets: bool = True,
 ):
     if not paper_broker.enabled:
         raise RuntimeError("Paper trading credentials are not configured")
-    if not TICKER_RE.match(symbol):
+    symbol = symbol.strip()
+    if not str(asset_class or "").lower().startswith("option") and not TICKER_RE.match(symbol.upper()):
         raise ValueError("Enter a valid ticker symbol")
     if qty <= 0:
         raise ValueError("Quantity must be positive")
@@ -443,14 +555,22 @@ def place_guarded_paper_order(
         raise ValueError("Order type must be market or limit")
 
     symbol = symbol.upper()
+    is_option = str(asset_class or "").lower() == "option"
+    multiplier = OPTION_CONTRACT_MULTIPLIER if is_option else 1
+
     entry_price = None
-    if order_type == "limit":
+    if price_hint is not None and price_hint > 0:
+        entry_price = float(price_hint)
+    elif order_type == "limit":
         if limit_price is None or limit_price <= 0:
             raise ValueError("Provide a positive limit price")
         entry_price = float(limit_price)
-    if entry_price is None:
+    elif not is_option:
         entry_price = fetch_latest_price(symbol)
-    notional = float(entry_price) * qty
+    else:
+        entry_price = 0.0
+
+    notional = float(entry_price) * qty * multiplier
 
     account = paper_broker.get_account()
     equity = float(account.get("equity") or account.get("cash") or 0.0)
@@ -477,8 +597,10 @@ def place_guarded_paper_order(
     }
     if order_type == "limit":
         payload["limit_price"] = round(float(limit_price), 2)
+    if asset_class:
+        payload["asset_class"] = asset_class
 
-    if side == "buy":
+    if side == "buy" and support_brackets and not is_option:
         stop_loss_pct = PAPER_DEFAULT_STOP_LOSS_PCT if stop_loss_pct is None else max(stop_loss_pct, 0.0)
         take_profit_pct = (
             PAPER_DEFAULT_TAKE_PROFIT_PCT if take_profit_pct is None else max(take_profit_pct, 0.0)
@@ -531,6 +653,13 @@ def update_autopilot_config(*, enabled: bool | None = None, strategy: str | None
     return get_autopilot_status()
 
 
+def _strategy_asset_class(strategy: dict[str, Any]) -> str:
+    asset_class = str(strategy.get("asset_class", "equity")).lower().strip()
+    if asset_class in {"option", "options"}:
+        return "option"
+    return "equity"
+
+
 def _autopilot_order_blocked(symbol: str, open_orders: list[dict]) -> bool:
     for order in open_orders:
         try:
@@ -542,6 +671,92 @@ def _autopilot_order_blocked(symbol: str, open_orders: list[dict]) -> bool:
         except Exception:
             continue
     return False
+
+
+def _autopilot_select_option_contract(
+    symbol: str,
+    strategy: dict[str, Any],
+    *,
+    underlying_price: float,
+) -> tuple[dict[str, Any], float, dict[str, Any]] | None:
+    """Pick an option contract that matches the strategy's risk profile."""
+
+    window = strategy.get("options_expiry_window", (21, 45))
+    if (
+        not isinstance(window, (list, tuple))
+        or len(window) != 2
+        or any(v is None for v in window)
+    ):
+        window = (21, 45)
+    try:
+        min_days = max(7, int(window[0]))
+    except Exception:
+        min_days = 21
+    try:
+        max_days = max(min_days + 1, int(window[1]))
+    except Exception:
+        max_days = max(min_days + 1, 45)
+
+    expiration_from = date.today() + timedelta(days=min_days)
+    expiration_to = date.today() + timedelta(days=max_days)
+
+    option_type = str(strategy.get("contract_type", "call")).lower() or "call"
+    target_delta = abs(safe_float(strategy.get("target_delta"), 0.35)) or 0.35
+    min_open_interest = max(0, int(safe_float(strategy.get("min_open_interest"), 0)))
+    min_volume = max(0, int(safe_float(strategy.get("min_volume"), 0)))
+
+    contracts = fetch_option_contracts(
+        symbol,
+        expiration_date_from=expiration_from,
+        expiration_date_to=expiration_to,
+        option_type=option_type,
+        limit=800,
+    )
+    if not contracts:
+        return None
+
+    best_choice: tuple[dict[str, Any], float, dict[str, Any]] | None = None
+    best_score: tuple[float, float, float, float] | None = None
+    target_mid = (min_days + max_days) / 2.0
+
+    for contract in contracts:
+        contract_symbol = str(contract.get("symbol", "")).strip()
+        if not contract_symbol:
+            continue
+        parsed = parse_option_symbol(contract_symbol)
+        if not parsed:
+            continue
+        days_out = option_days_to_expiration(parsed)
+        if days_out is None or days_out < min_days or days_out > max_days:
+            continue
+        oi = safe_float(contract.get("open_interest"), None)
+        if min_open_interest and (oi is None or oi < min_open_interest):
+            continue
+        volume = safe_float(contract.get("volume"), None)
+        if min_volume and (volume is None or volume < min_volume):
+            continue
+        price = option_mid_price(contract)
+        if price is None or price <= 0:
+            continue
+        delta = option_contract_delta(contract)
+        if delta is not None:
+            delta_gap = abs(abs(delta) - target_delta)
+        else:
+            strike = safe_float(contract.get("strike_price"), parsed.get("strike"))
+            if strike and underlying_price:
+                delta_gap = abs(strike - underlying_price) / underlying_price
+            else:
+                delta_gap = 5.0
+        expiry_gap = abs(days_out - target_mid)
+        liquidity_penalty = 0.0
+        if oi and oi > 0:
+            liquidity_penalty = 1.0 / (oi + 1.0)
+        score = (delta_gap, expiry_gap, liquidity_penalty, price)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_choice = (contract, price, parsed)
+
+    return best_choice
 
 
 def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | None:
@@ -592,6 +807,7 @@ def run_autopilot_cycle() -> None:
         risk_key = config.get("risk", "medium")
         strategy = AUTOPILOT_STRATEGIES.get(strategy_key, AUTOPILOT_STRATEGIES["balanced"])
         risk_cfg = AUTOPILOT_RISK_LEVELS.get(risk_key, AUTOPILOT_RISK_LEVELS["medium"])
+        asset_class = _strategy_asset_class(strategy)
 
         account = paper_broker.get_account()
         equity = safe_float(account.get("equity"), safe_float(account.get("cash")))
@@ -611,15 +827,38 @@ def run_autopilot_cycle() -> None:
             errors.append(f"orders error: {exc}")
             open_orders = []
 
-        held_symbols: dict[str, dict] = {}
-        gross_notional = 0.0
+        held_positions: dict[str, dict[str, dict[str, Any]]] = {"equity": {}, "option": {}}
+        gross_equity_notional = 0.0
+        gross_option_notional = 0.0
+        held_option_underlyings: set[str] = set()
+
         for pos in positions:
-            symbol = str(pos.get("symbol", "")).upper()
+            symbol_raw = str(pos.get("symbol", ""))
+            symbol = symbol_raw.replace(" ", "").upper()
             qty = safe_float(pos.get("qty"), safe_float(pos.get("quantity")))
             if not symbol or qty <= 0:
                 continue
-            held_symbols[symbol] = pos
-            gross_notional += abs(safe_float(pos.get("market_value")))
+            market_value = abs(
+                safe_float(
+                    pos.get("market_value"),
+                    qty * safe_float(pos.get("avg_entry_price"), 0.0),
+                )
+            )
+            asset = str(pos.get("asset_class", "")).lower()
+            is_option_pos = "option" in asset
+            entry: dict[str, Any] = {"position": pos, "qty": qty, "market_value": market_value}
+            if is_option_pos:
+                parsed = parse_option_symbol(symbol)
+                if parsed:
+                    entry["meta"] = parsed
+                    underlying = parsed.get("underlying")
+                    if underlying:
+                        held_option_underlyings.add(underlying)
+                held_positions["option"][symbol] = entry
+                gross_option_notional += market_value
+            else:
+                held_positions["equity"][symbol] = entry
+                gross_equity_notional += market_value
 
         with _lock:
             recs_snapshot = [dict(r) for r in _recommendations]
@@ -637,50 +876,136 @@ def run_autopilot_cycle() -> None:
         max_total_allocation = max(0.1, strategy.get("max_total_allocation", 1.0) * position_multiplier)
         min_entry_notional = max(50.0, strategy.get("min_entry_notional", 200.0))
 
-        # Exit review
         exit_threshold = strategy.get("exit_score", 2.0)
         lookback = strategy.get("lookback", "1y")
-        for symbol, pos in held_symbols.items():
-            qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
-            if qty < 1:
-                continue
-            df = _autopilot_prepare_dataframe(symbol, lookback)
-            if df is None:
-                errors.append(f"no data for {symbol}; exit review skipped")
-                continue
-            score, reasons = score_stock(df)
-            if score < exit_threshold:
-                if _autopilot_order_blocked(symbol, open_orders):
-                    summary_lines.append(f"Exit pending for {symbol}; open order detected.")
+
+        current_positions = (
+            held_positions["option"] if asset_class == "option" else held_positions["equity"]
+        )
+
+        if asset_class == "option":
+            option_profit = safe_float(strategy.get("options_take_profit_pct"), 0.8)
+            option_stop = abs(safe_float(strategy.get("options_stop_loss_pct"), 0.45))
+            expiry_buffer = max(0, int(safe_float(strategy.get("options_expiry_buffer"), 5)))
+
+            for contract_symbol, entry in current_positions.items():
+                pos = entry["position"]
+                qty = int(abs(entry.get("qty", 0)))
+                if qty < 1:
                     continue
-                qty_int = int(math.floor(qty))
-                if qty_int <= 0:
+                parsed = entry.get("meta") or parse_option_symbol(contract_symbol)
+                underlying = parsed.get("underlying") if parsed else None
+                reasons: list[str] = []
+                plpc = safe_float(pos.get("unrealized_plpc"), None)
+                if plpc is None:
+                    percent = safe_float(pos.get("unrealized_pl_percent"), None)
+                    if percent is not None:
+                        plpc = percent / 100.0
+                if plpc is not None and option_profit and plpc >= option_profit:
+                    reasons.append(f"profit {plpc*100:.0f}% >= target")
+                if plpc is not None and option_stop and plpc <= -option_stop:
+                    reasons.append(f"loss {plpc*100:.0f}% beyond stop")
+                days_out = option_days_to_expiration(parsed)
+                if days_out is not None and days_out <= expiry_buffer:
+                    reasons.append(f"{days_out}d to expiry")
+                if underlying:
+                    df = _autopilot_prepare_dataframe(underlying, lookback)
+                    if df is None:
+                        errors.append(f"no data for {underlying}; option exit skipped")
+                    else:
+                        underlying_score, _ = score_stock(df)
+                        if underlying_score < exit_threshold:
+                            reasons.append(f"score {underlying_score:.2f} < {exit_threshold}")
+                if not reasons:
                     continue
-                try:
-                    place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                if _autopilot_order_blocked(contract_symbol, open_orders):
                     summary_lines.append(
-                        f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
+                        f"Exit pending for {contract_symbol}; open order detected."
+                    )
+                    continue
+                market_price = safe_float(
+                    pos.get("current_price"), safe_float(pos.get("market_price"), None)
+                )
+                try:
+                    place_guarded_paper_order(
+                        contract_symbol,
+                        qty,
+                        "sell",
+                        order_type="market",
+                        stop_loss_pct=None,
+                        take_profit_pct=None,
+                        time_in_force="day",
+                        asset_class="option",
+                        price_hint=market_price,
+                        support_brackets=False,
+                    )
+                    summary_lines.append(
+                        f"Exit {qty} {contract_symbol} ({'; '.join(reasons)})"
                     )
                 except Exception as exc:
-                    errors.append(f"sell {symbol} failed: {exc}")
+                    errors.append(f"sell {contract_symbol} failed: {exc}")
+        else:
+            for symbol, entry in current_positions.items():
+                pos = entry["position"]
+                qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
+                if qty < 1:
+                    continue
+                df = _autopilot_prepare_dataframe(symbol, lookback)
+                if df is None:
+                    errors.append(f"no data for {symbol}; exit review skipped")
+                    continue
+                score, _ = score_stock(df)
+                if score < exit_threshold:
+                    if _autopilot_order_blocked(symbol, open_orders):
+                        summary_lines.append(
+                            f"Exit pending for {symbol}; open order detected."
+                        )
+                        continue
+                    qty_int = int(math.floor(qty))
+                    if qty_int <= 0:
+                        continue
+                    try:
+                        place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                        summary_lines.append(
+                            f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
+                        )
+                    except Exception as exc:
+                        errors.append(f"sell {symbol} failed: {exc}")
 
-        # Entry candidates
-        held_and_pending = set(held_symbols.keys())
+        held_and_pending = set(current_positions.keys())
+        pending_underlyings = set(held_option_underlyings) if asset_class == "option" else set()
         for order in open_orders:
             try:
-                if str(order.get("side", "")).lower() == "buy":
-                    held_and_pending.add(str(order.get("symbol", "")).upper())
+                if str(order.get("side", "")).lower() != "buy":
+                    continue
+                order_symbol = str(order.get("symbol", "")).replace(" ", "").upper()
+                asset = str(order.get("asset_class", "")).lower()
+                if asset_class == "option":
+                    if "option" in asset:
+                        held_and_pending.add(order_symbol)
+                        parsed = parse_option_symbol(order_symbol)
+                        if parsed and parsed.get("underlying"):
+                            pending_underlyings.add(parsed["underlying"])
+                else:
+                    if asset != "option":
+                        held_and_pending.add(order_symbol)
             except Exception:
                 continue
 
         buy_candidates: list[tuple[str, float]] = []
         for rec in recs_snapshot:
             symbol = str(rec.get("Symbol", "")).upper()
-            if not symbol or symbol in held_and_pending:
+            if not symbol:
                 continue
             score = safe_float(rec.get("Score"))
             if score < strategy.get("min_score", 3.0):
                 continue
+            if asset_class == "option":
+                if symbol in pending_underlyings:
+                    continue
+            else:
+                if symbol in held_and_pending:
+                    continue
             buy_candidates.append((symbol, score))
 
         if not buy_candidates:
@@ -688,50 +1013,123 @@ def run_autopilot_cycle() -> None:
 
         buy_candidates.sort(key=lambda item: item[1], reverse=True)
         max_positions = max(1, int(strategy.get("max_positions", 5)))
-        available_slots = max(0, max_positions - len(held_symbols))
+        available_slots = max(0, max_positions - len(current_positions))
+        gross_notional = gross_option_notional if asset_class == "option" else gross_equity_notional
+
+        allocation_warning_logged = False
 
         for symbol, score in buy_candidates:
             if available_slots <= 0:
                 break
-            if _autopilot_order_blocked(symbol, open_orders):
-                continue
-            try:
-                price = fetch_latest_price(symbol)
-            except Exception as exc:
-                errors.append(f"price {symbol} failed: {exc}")
-                continue
 
-            notional_cap_pct = min(max_position_pct, max_total_allocation)
-            target_notional = max(min_entry_notional, equity * notional_cap_pct)
-            if PAPER_MAX_POSITION_NOTIONAL:
-                target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
-            if gross_notional + target_notional > equity * max_total_allocation:
-                summary_lines.append("Max portfolio allocation reached; skipping new entries.")
-                break
-
-            qty = int(target_notional // price)
-            if qty <= 0:
-                continue
-
-            stop_loss_pct = max(0.01, strategy.get("stop_loss_pct", 0.04) * stop_loss_multiplier)
-            take_profit_pct = max(0.02, strategy.get("take_profit_pct", 0.1) * take_profit_multiplier)
-
-            try:
-                place_guarded_paper_order(
-                    symbol,
-                    qty,
-                    "buy",
-                    stop_loss_pct=stop_loss_pct,
-                    take_profit_pct=take_profit_pct,
-                    time_in_force="gtc",
-                )
-                gross_notional += qty * price
-                available_slots -= 1
-                summary_lines.append(
-                    f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
-                )
-            except Exception as exc:
-                errors.append(f"buy {symbol} failed: {exc}")
+            if asset_class == "option":
+                try:
+                    spot_price = fetch_latest_price(symbol)
+                except Exception as exc:
+                    errors.append(f"price {symbol} failed: {exc}")
+                    continue
+                try:
+                    selection = _autopilot_select_option_contract(
+                        symbol,
+                        strategy,
+                        underlying_price=spot_price,
+                    )
+                except PriceDataError as exc:
+                    errors.append(f"options {symbol} chain failed: {exc}")
+                    continue
+                if not selection:
+                    summary_lines.append(f"No option contracts matched filters for {symbol}.")
+                    continue
+                contract, premium, parsed = selection
+                contract_symbol = str(contract.get("symbol", "")).replace(" ", "").upper()
+                if not contract_symbol or contract_symbol in held_and_pending:
+                    continue
+                unit_cost = premium * OPTION_CONTRACT_MULTIPLIER
+                notional_cap_pct = min(max_position_pct, max_total_allocation)
+                target_notional = max(min_entry_notional, equity * notional_cap_pct)
+                max_debit = safe_float(strategy.get("max_position_debit"), None)
+                if max_debit:
+                    target_notional = min(target_notional, max_debit)
+                if PAPER_MAX_POSITION_NOTIONAL:
+                    target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
+                if gross_notional + target_notional > equity * max_total_allocation:
+                    if not allocation_warning_logged:
+                        summary_lines.append(
+                            "Max portfolio allocation reached; skipping new entries."
+                        )
+                        allocation_warning_logged = True
+                    break
+                qty = max(1, int(target_notional // max(unit_cost, 1e-6)))
+                max_contracts = int(safe_float(strategy.get("max_contracts_per_trade"), 0))
+                if max_contracts:
+                    qty = min(qty, max_contracts)
+                if qty <= 0:
+                    continue
+                try:
+                    place_guarded_paper_order(
+                        contract_symbol,
+                        qty,
+                        "buy",
+                        order_type="limit",
+                        limit_price=round(premium, 2),
+                        stop_loss_pct=None,
+                        take_profit_pct=None,
+                        time_in_force="day",
+                        asset_class="option",
+                        price_hint=premium,
+                        support_brackets=False,
+                    )
+                    gross_notional += qty * unit_cost
+                    available_slots -= 1
+                    held_and_pending.add(contract_symbol)
+                    if parsed and parsed.get("underlying"):
+                        pending_underlyings.add(parsed["underlying"])
+                    summary_lines.append(
+                        f"Buy {qty} {contract_symbol} ({symbol} {parsed.get('type', 'call')} {parsed.get('strike', 0):.2f} exp {parsed.get('expiration')}, premium ${premium:.2f})"
+                    )
+                except Exception as exc:
+                    errors.append(f"buy {contract_symbol} failed: {exc}")
+            else:
+                if _autopilot_order_blocked(symbol, open_orders):
+                    continue
+                try:
+                    price = fetch_latest_price(symbol)
+                except Exception as exc:
+                    errors.append(f"price {symbol} failed: {exc}")
+                    continue
+                notional_cap_pct = min(max_position_pct, max_total_allocation)
+                target_notional = max(min_entry_notional, equity * notional_cap_pct)
+                if PAPER_MAX_POSITION_NOTIONAL:
+                    target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
+                if gross_notional + target_notional > equity * max_total_allocation:
+                    if not allocation_warning_logged:
+                        summary_lines.append(
+                            "Max portfolio allocation reached; skipping new entries."
+                        )
+                        allocation_warning_logged = True
+                    break
+                qty = int(target_notional // price)
+                if qty <= 0:
+                    continue
+                stop_loss_pct = max(0.01, strategy.get("stop_loss_pct", 0.04) * stop_loss_multiplier)
+                take_profit_pct = max(0.02, strategy.get("take_profit_pct", 0.1) * take_profit_multiplier)
+                try:
+                    place_guarded_paper_order(
+                        symbol,
+                        qty,
+                        "buy",
+                        stop_loss_pct=stop_loss_pct,
+                        take_profit_pct=take_profit_pct,
+                        time_in_force="gtc",
+                    )
+                    gross_notional += qty * price
+                    available_slots -= 1
+                    held_and_pending.add(symbol)
+                    summary_lines.append(
+                        f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
+                    )
+                except Exception as exc:
+                    errors.append(f"buy {symbol} failed: {exc}")
 
         if not summary_lines:
             summary_lines.append("Cycle complete with no trades.")
