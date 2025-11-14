@@ -349,13 +349,23 @@ def fetch_option_contracts(
 
     url = f"{ALPACA_OPTIONS_BASE_URL}/options/chain/{symbol.upper()}"
 
-    response = _alpaca_request(
-        url,
-        headers=headers,
-        params=params,
-        timeout=20,
-        resource=f"{symbol} option chain",
-    )
+    try:
+        response = _alpaca_request(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+            resource=f"{symbol} option chain",
+        )
+    except PriceDataError as exc:
+        message = str(exc)
+        if "404" in message or "not found" in message.lower():
+            logger.info(
+                "Alpaca reports no option chain for %s; skipping contract fetch.",
+                symbol.upper(),
+            )
+            return []
+        raise
 
     try:
         payload = response.json()
