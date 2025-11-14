@@ -5,7 +5,7 @@ import json
 import random
 import threading
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from io import StringIO
@@ -15,12 +15,15 @@ import requests
 
 import pandas as pd
 import numpy as np
-import yfinance as yf
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
 from paper_trading import AlpacaPaperBroker
+from market_data import PriceDataError
+from market_data import get_price_history as load_price_history
+
+load_dotenv()
 
 try:  # pragma: no cover - optional import varies by yfinance version
     from yfinance.shared.exceptions import YFRateLimitError  # type: ignore
@@ -240,10 +243,6 @@ def to_plain(obj):
     return obj
 
 
-class PriceDataError(RuntimeError):
-    """Raised when price history cannot be retrieved from upstream providers."""
-
-
 def safe_float(value, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -257,8 +256,40 @@ def safe_float(value, default: float = 0.0) -> float:
         return default
 
 
-def _cache_key(ticker: str, period: str, interval: str | None, auto_adjust: bool) -> Tuple[str, str, str, bool]:
-    return (ticker.upper(), period, interval or "1d", auto_adjust)
+_PERIOD_RE = re.compile(r"^(\d+)([a-zA-Z]+)$")
+
+
+def _period_to_range(period: str, *, interval: str | None = None) -> tuple[datetime, datetime, str]:
+    """Translate shorthand period strings into UTC start/end datetimes."""
+
+    interval_out = interval or "1d"
+    end = datetime.now(timezone.utc)
+
+    match = _PERIOD_RE.match(period.lower().strip())
+    if not match:
+        raise ValueError(f"Unsupported period string: {period}")
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+
+    if unit in {"d", "day", "days"}:
+        start = end - timedelta(days=amount)
+    elif unit in {"w", "wk", "week", "weeks"}:
+        start = end - timedelta(weeks=amount)
+    elif unit in {"mo", "mon", "month", "months"}:
+        start = (pd.Timestamp(end) - pd.DateOffset(months=amount)).to_pydatetime()
+    elif unit in {"y", "yr", "year", "years"}:
+        start = (pd.Timestamp(end) - pd.DateOffset(years=amount)).to_pydatetime()
+    else:
+        raise ValueError(f"Unsupported period unit: {unit}")
+
+    # Alpaca expects timezone-aware timestamps in UTC.
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    else:
+        start = start.astimezone(timezone.utc)
+
+    return start, end, interval_out
 
 
 def get_price_history(
@@ -267,74 +298,15 @@ def get_price_history(
     *,
     interval: str | None = None,
     auto_adjust: bool = True,
-    max_age: timedelta = PRICE_CACHE_TTL,
+    max_age: timedelta | None = None,
 ) -> pd.DataFrame:
-    """Download historical data with simple in-memory caching and rate-limit handling."""
+    """Load price history using the shared market data helper."""
 
-    key = _cache_key(ticker, period, interval, auto_adjust)
-    cached_df = None
-    cached_ts: datetime | None = None
-    now = datetime.now()
-    with _lock:
-        if key in _price_cache:
-            cached_ts, cached_df = _price_cache[key]
-            if cached_ts and now - cached_ts <= max_age:
-                return cached_df.copy()
+    _ = auto_adjust  # retained for backward compatibility; handled upstream
+    _ = max_age
 
-    rate_limited = False
-    download_error: Exception | None = None
-    try:
-        df = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            auto_adjust=auto_adjust,
-            progress=False,
-        )
-    except Exception as exc:
-        download_error = exc
-        message = str(exc)
-        rate_limited = "rate limit" in message.lower() or isinstance(exc, YFRateLimitError)
-        df = pd.DataFrame()
-
-    if (df is None or df.empty) and not rate_limited:
-        try:
-            df = yf.Ticker(ticker).history(
-                period=period,
-                interval=interval or "1d",
-                auto_adjust=auto_adjust,
-            )
-        except Exception as exc:
-            download_error = exc
-            rate_limited = "rate limit" in str(exc).lower() or isinstance(exc, YFRateLimitError)
-            df = pd.DataFrame()
-
-    if df is None or df.empty:
-        if cached_df is not None:
-            logger.warning(
-                "Using cached %s data after download failure%s",
-                ticker,
-                ": rate limited" if rate_limited else "",
-            )
-            return cached_df.copy()
-        if rate_limited:
-            raise PriceDataError(
-                f"Yahoo Finance rate limit reached for {ticker}. Please wait a minute and try again."
-            )
-        error_text = str(download_error) if download_error else "No price data returned"
-        raise PriceDataError(f"Unable to download data for {ticker}: {error_text}")
-
-    df = df.dropna(how="all").copy()
-    if df.empty:
-        if cached_df is not None:
-            logger.warning("Using cached %s data after cleaning removed all rows", ticker)
-            return cached_df.copy()
-        raise PriceDataError(f"No price data for {ticker}")
-
-    with _lock:
-        _price_cache[key] = (now, df.copy())
-
-    return df
+    start, end, resolved_interval = _period_to_range(period, interval=interval)
+    return load_price_history(ticker, start, end, interval=resolved_interval)
 
 
 @lru_cache(maxsize=256)
@@ -652,6 +624,7 @@ def run_autopilot_cycle() -> None:
                 continue
             df = _autopilot_prepare_dataframe(symbol, lookback)
             if df is None:
+                errors.append(f"no data for {symbol}; exit review skipped")
                 continue
             score, reasons = score_stock(df)
             if score < exit_threshold:
@@ -894,10 +867,13 @@ def analyze_stock(ticker: str) -> dict:
 
 def fast_filter_ticker(ticker: str) -> bool:
     try:
-        info = yf.Ticker(ticker).info
-        return (info or {}).get("averageVolume", 0) > 1_000_000
-    except Exception:
+        hist = get_price_history(ticker, "90d")
+    except PriceDataError:
         return False
+    if hist is None or hist.empty or "Volume" not in hist.columns:
+        return False
+    avg_vol = float(hist["Volume"].tail(30).mean()) if not hist["Volume"].empty else 0.0
+    return avg_vol > 1_000_000
 
 
 def seek_recommendations() -> None:
@@ -929,44 +905,21 @@ def seek_recommendations() -> None:
         logger.warning("No tickers passed the liquidity filter; keeping existing recommendations")
         return
 
-    try:
-        hist_all = yf.download(
-            filtered,
-            period="1y",
-            group_by="ticker",
-            auto_adjust=True,
-            threads=True,
-            progress=False,
-        )
-    except Exception as exc:
-        logger.warning("Batch history download failed: %s", exc)
-        hist_all = pd.DataFrame()
-
     def worker(sym: str) -> dict:
         try:
-            df = None
-            if isinstance(hist_all.columns, pd.MultiIndex):
-                try:
-                    df = hist_all[sym]
-                except Exception:
-                    df = None
-            if df is None or df.empty:
-                try:
-                    df = get_price_history(sym, "1y")
-                except PriceDataError as exc:
-                    logger.warning("Skipping %s: %s", sym, exc)
-                    return None
+            df = get_price_history(sym, "1y")
+        except PriceDataError as exc:
+            logger.warning("Skipping %s: %s", sym, exc)
+            return None
+        except Exception as exc:
+            logger.warning("Unexpected error loading %s: %s", sym, exc)
+            return None
+        try:
             if df is None or df.empty:
                 logger.warning("Skipping %s: no historical data", sym)
                 return None
 
             # Ensure we have needed cols
-            if isinstance(df["Close"], pd.DataFrame):
-                if sym in df["Close"].columns:
-                    df["Close"] = df["Close"][sym]
-                else:
-                    df["Close"] = df["Close"].iloc[:, 0]
-
             missing = [col for col in ("High", "Low", "Close") if col not in df.columns]
             if missing:
                 logger.warning("Skipping %s: missing columns %s", sym, ", ".join(missing))
@@ -1005,7 +958,7 @@ def backtest_ticker(ticker: str, years: int = 3, cost_bps: float = 5.0) -> dict:
     cost_bps: round-trip cost in basis points per trade leg (5 = 0.05%).
     """
     logger.info("Backtest %s", ticker)
-    hist = yf.download(ticker, period=f"{years}y", auto_adjust=True, progress=False)
+    hist = get_price_history(ticker, f"{years}y")
     if hist is None or hist.empty:
         raise ValueError("No price data")
 
