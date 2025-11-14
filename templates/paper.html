@@ -27,6 +27,56 @@
       <div class="alert alert-warning">{{ broker_error }}</div>
     {% endif %}
 
+    <section class="mb-4">
+      <h2 class="h4">Autopilot</h2>
+      <p class="text-muted small mb-3">Let the assistant pick high-probability trades based on the scoring engine, apply bracket orders, and scale position sizes to match your preferred risk.</p>
+      <form action="/paper/autopilot" method="post" class="row gy-2 gx-3 align-items-center">
+        <div class="col-auto">
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="autopilot_enabled" name="autopilot_enabled" {% if autopilot.enabled %}checked{% endif %}>
+            <label class="form-check-label" for="autopilot_enabled">Enable Autopilot</label>
+          </div>
+        </div>
+        <div class="col-sm-4">
+          <label for="autopilot_strategy" class="form-label">Strategy</label>
+          <select id="autopilot_strategy" name="autopilot_strategy" class="form-select">
+            {% for key, strat in autopilot_strategies|dictsort %}
+              <option value="{{ key }}" {% if autopilot.strategy == key %}selected{% endif %}>{{ strat.label }}</option>
+            {% endfor %}
+          </select>
+          <div class="form-text">{{ autopilot_strategies.get(autopilot.strategy, {}).get('description', '') }}</div>
+        </div>
+        <div class="col-sm-3">
+          <label for="autopilot_risk" class="form-label">Risk</label>
+          <select id="autopilot_risk" name="autopilot_risk" class="form-select">
+            {% for key, cfg in autopilot_risks|dictsort %}
+              <option value="{{ key }}" {% if autopilot.risk == key %}selected{% endif %}>{{ cfg.label }}</option>
+            {% endfor %}
+          </select>
+          <div class="form-text">Multiplier for position sizing and brackets.</div>
+        </div>
+        <div class="col-auto align-self-end">
+          <button type="submit" class="btn btn-primary">Save Settings</button>
+        </div>
+      </form>
+      <div class="mt-3 small">
+        <div><strong>Status:</strong> {% if autopilot.enabled %}<span class="text-success">Enabled{% else %}<span class="text-muted">Paused{% endif %}</span></div>
+        <div><strong>Last Run:</strong> {{ autopilot.last_run or 'not yet' }}</div>
+        {% if autopilot.last_actions %}
+          <div><strong>Last Actions:</strong>
+            <ul class="mb-0">
+              {% for action in autopilot.last_actions %}
+                <li>{{ action }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        {% endif %}
+        {% if autopilot.last_error %}
+          <div class="text-danger"><strong>Warnings:</strong> {{ autopilot.last_error }}</div>
+        {% endif %}
+      </div>
+    </section>
+
     {% if not broker_enabled %}
       <p class="text-muted">Configure <code>ALPACA_PAPER_KEY_ID</code> and <code>ALPACA_PAPER_SECRET_KEY</code> environment variables, then restart the server.</p>
     {% else %}
