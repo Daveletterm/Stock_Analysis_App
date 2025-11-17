@@ -73,6 +73,18 @@ _recommendations = []
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
+FALLBACK_TICKERS = [
+    "AAPL",
+    "MSFT",
+    "GOOGL",
+    "NVDA",
+    "AMZN",
+    "META",
+    "TSLA",
+    "JPM",
+    "UNH",
+    "V",
+]
 
 
 @dataclass
@@ -1317,6 +1329,17 @@ def run_autopilot_cycle() -> None:
                         rejection_counts.update(Counter(final_rejects))
                     except Exception:
                         rejection_counts = Counter()
+                    chain_errors = (
+                        diag.get("chain_errors")
+                        if isinstance(diag.get("chain_errors"), dict)
+                        else {}
+                    )
+                    for chain_type, message in chain_errors.items():
+                        if not message:
+                            continue
+                        reason_bits.append(
+                            f"{chain_type}_chain:{str(message).strip()[:80]}"
+                        )
                     if rejection_counts:
                         for reason, count in rejection_counts.most_common(3):
                             reason_bits.append(f"{reason}:{count}")
@@ -1552,11 +1575,45 @@ def analyze_stock(ticker: str) -> dict:
     latest_sma200 = last_value(df["SMA_200"])
 
     sentiment = fetch_news_sentiment(ticker) + fetch_reddit_sentiment(ticker)
-    rec = (
-        "BUY"
-        if (latest_close is not None and latest_sma50 is not None and latest_close > latest_sma50)
-        else "HOLD"
+    above_sma50 = (
+        latest_close is not None
+        and latest_sma50 is not None
+        and latest_close > latest_sma50
     )
+    above_sma200 = (
+        latest_close is not None
+        and latest_sma200 is not None
+        and latest_close > latest_sma200
+    )
+    rec = "BUY" if above_sma50 else "HOLD"
+
+    summary_bits: list[str] = []
+    if above_sma50:
+        summary_bits.append(
+            "Price is above the 50-day moving average, indicating positive momentum."
+        )
+    elif latest_close is not None and latest_sma50 is not None:
+        summary_bits.append(
+            "Price is below the 50-day moving average, so momentum looks soft."
+        )
+    if above_sma200:
+        summary_bits.append(
+            "Price is also above the 200-day moving average, supporting an uptrend view."
+        )
+    elif latest_close is not None and latest_sma200 is not None:
+        summary_bits.append(
+            "Price is under the 200-day moving average, so the long-term trend is weaker."
+        )
+    if latest_rsi is not None:
+        if latest_rsi >= 70:
+            summary_bits.append("RSI is elevated, suggesting overbought conditions.")
+        elif latest_rsi <= 30:
+            summary_bits.append("RSI is low, suggesting the stock may be oversold.")
+        else:
+            summary_bits.append("RSI is neutral, so momentum is balanced.")
+    if not summary_bits:
+        summary_bits.append("Insufficient indicator data to form an opinion.")
+    analysis_summary = " ".join(summary_bits)
 
     out = {
         "Symbol": ticker,
@@ -1565,6 +1622,7 @@ def analyze_stock(ticker: str) -> dict:
         "50-day MA": round(latest_sma50, 2) if latest_sma50 is not None else None,
         "200-day MA": round(latest_sma200, 2) if latest_sma200 is not None else None,
         "Recommendation": rec,
+        "Analysis Summary": analysis_summary,
         "Chart Data": chart_data,
     }
     logger.info("Analyze %s done: rows=%d chart_rows=%d", ticker, len(df), len(chart_data))
@@ -1597,8 +1655,17 @@ def seek_recommendations() -> None:
         tickers = _sp500["tickers"][:]
 
     if not tickers:
-        logger.warning("S&P 500 cache is empty; skipping recommendation refresh")
-        return
+        fallback_env = os.getenv("FALLBACK_TICKERS", "")
+        fallback_cfg = [t.strip().upper() for t in fallback_env.split(",") if t.strip()]
+        fallback = fallback_cfg or FALLBACK_TICKERS
+        tickers = fallback[:]
+        logger.warning(
+            "S&P 500 cache is empty; using %d fallback tickers for recommendations",
+            len(tickers),
+        )
+        if not tickers:
+            logger.warning("No fallback tickers configured; skipping recommendation refresh")
+            return
 
     # deterministic daily shuffle to avoid A* bias
     rng = random.Random(date.today().toordinal())
@@ -1755,10 +1822,13 @@ def start_background_jobs():
     should_start = not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if not should_start:
         return
+    # Run both routines immediately so the UI has fresh data without waiting
+    # for the first scheduler interval.
     threading.Thread(target=seek_recommendations, daemon=True).start()
+    threading.Thread(target=run_autopilot_cycle, daemon=True).start()
     sched = BackgroundScheduler()
     sched.add_job(seek_recommendations, "interval", hours=1, next_run_time=datetime.now())
-    sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now() + timedelta(seconds=30))
+    sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now())
     sched.start()
     logger.info("Background jobs started")
 
