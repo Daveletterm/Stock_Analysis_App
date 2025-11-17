@@ -340,7 +340,13 @@ def fetch_option_contracts(
         raise PriceDataError("Alpaca credentials are not configured")
 
     headers = _broker._headers()  # type: ignore[attr-defined]
-    params: Dict[str, object] = {"limit": max(1, min(limit, 1000))}
+    params: Dict[str, object] = {
+        "limit": max(1, min(limit, 1000)),
+        # Alpaca's documented contract lookup uses query parameters instead of
+        # a symbol path segment, so include both to maximize compatibility.
+        "underlying_symbol": symbol.upper(),
+        "symbol": symbol.upper(),
+    }
     if expiration_date_from:
         params["expiration_date_gte"] = expiration_date_from.isoformat()
     if expiration_date_to:
@@ -357,11 +363,12 @@ def fetch_option_contracts(
         bases_to_try.append(default_base)
 
     for base in bases_to_try:
-        # Alpaca's documentation currently lists the endpoint as `/chain`, but
-        # some historical blog posts referenced `/chains`. Try both so the app
-        # works regardless of which variant the account exposes.
+        # Modern Alpaca contracts endpoint (documented): query string based
+        candidate_urls.append(f"{base}/options/chain")
+        # Legacy path-based variants observed in historical documentation
         candidate_urls.append(f"{base}/options/{symbol.upper()}/chain")
         candidate_urls.append(f"{base}/options/{symbol.upper()}/chains")
+        candidate_urls.append(f"{base}/options/chains")
 
     response: requests.Response | None = None
 
@@ -429,6 +436,10 @@ def fetch_option_contracts(
     for contract in options:
         if isinstance(contract, dict):
             normalized.append(contract)
+    logger.info(
+        "Fetched %d option contracts for %s via %s", len(normalized), symbol.upper(), response.url
+    )
+
     return normalized
 
 

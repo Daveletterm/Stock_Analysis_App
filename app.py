@@ -73,6 +73,18 @@ _recommendations = []
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
+FALLBACK_TICKERS = [
+    "AAPL",
+    "MSFT",
+    "GOOGL",
+    "NVDA",
+    "AMZN",
+    "META",
+    "TSLA",
+    "JPM",
+    "UNH",
+    "V",
+]
 
 
 @dataclass
@@ -1597,8 +1609,17 @@ def seek_recommendations() -> None:
         tickers = _sp500["tickers"][:]
 
     if not tickers:
-        logger.warning("S&P 500 cache is empty; skipping recommendation refresh")
-        return
+        fallback_env = os.getenv("FALLBACK_TICKERS", "")
+        fallback_cfg = [t.strip().upper() for t in fallback_env.split(",") if t.strip()]
+        fallback = fallback_cfg or FALLBACK_TICKERS
+        tickers = fallback[:]
+        logger.warning(
+            "S&P 500 cache is empty; using %d fallback tickers for recommendations",
+            len(tickers),
+        )
+        if not tickers:
+            logger.warning("No fallback tickers configured; skipping recommendation refresh")
+            return
 
     # deterministic daily shuffle to avoid A* bias
     rng = random.Random(date.today().toordinal())
