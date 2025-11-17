@@ -1329,6 +1329,17 @@ def run_autopilot_cycle() -> None:
                         rejection_counts.update(Counter(final_rejects))
                     except Exception:
                         rejection_counts = Counter()
+                    chain_errors = (
+                        diag.get("chain_errors")
+                        if isinstance(diag.get("chain_errors"), dict)
+                        else {}
+                    )
+                    for chain_type, message in chain_errors.items():
+                        if not message:
+                            continue
+                        reason_bits.append(
+                            f"{chain_type}_chain:{str(message).strip()[:80]}"
+                        )
                     if rejection_counts:
                         for reason, count in rejection_counts.most_common(3):
                             reason_bits.append(f"{reason}:{count}")

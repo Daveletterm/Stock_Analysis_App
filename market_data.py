@@ -27,7 +27,7 @@ ALPACA_DATA_BASE_URL = (
     or "https://data.alpaca.markets/v2"
 ).rstrip("/")
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
-_DEFAULT_ALPACA_OPTIONS_BASE_URL = "https://data.alpaca.markets/v1beta1"
+_DEFAULT_ALPACA_OPTIONS_BASE_URL = "https://data.alpaca.markets/v2beta1"
 ALPACA_OPTIONS_BASE_URL = (
     os.getenv("ALPACA_OPTIONS_DATA_URL")
     or os.getenv("ALPACA_MARKET_DATA_URL")
@@ -343,8 +343,10 @@ def fetch_option_contracts(
     params: Dict[str, object] = {
         "limit": max(1, min(limit, 1000)),
         # Alpaca's documented contract lookup uses query parameters instead of
-        # a symbol path segment, so include both to maximize compatibility.
+        # a symbol path segment, so include both singular/plural variants to
+        # maximize compatibility across API versions.
         "underlying_symbol": symbol.upper(),
+        "underlying_symbols": symbol.upper(),
         "symbol": symbol.upper(),
     }
     if expiration_date_from:
@@ -362,6 +364,20 @@ def fetch_option_contracts(
     if primary_base.lower() != default_base.lower():
         bases_to_try.append(default_base)
 
+    # If the configured base URL uses a different API version, also try the
+    # opposite "v1beta1"/"v2beta1" variant since Alpaca occasionally changes
+    # option endpoints between releases without redirecting.
+    swapped_bases: List[str] = []
+    for base in list(bases_to_try):
+        lower = base.lower()
+        if "/v2beta1" in lower:
+            swapped_bases.append(base.replace("/v2beta1", "/v1beta1"))
+        elif "/v1beta1" in lower:
+            swapped_bases.append(base.replace("/v1beta1", "/v2beta1"))
+    for alt in swapped_bases:
+        if alt not in bases_to_try:
+            bases_to_try.append(alt)
+
     for base in bases_to_try:
         # Modern Alpaca contracts endpoint (documented): query string based
         candidate_urls.append(f"{base}/options/chain")
@@ -369,6 +385,8 @@ def fetch_option_contracts(
         candidate_urls.append(f"{base}/options/{symbol.upper()}/chain")
         candidate_urls.append(f"{base}/options/{symbol.upper()}/chains")
         candidate_urls.append(f"{base}/options/chains")
+        # Some beta versions exposed the contract chain at this path
+        candidate_urls.append(f"{base}/options/chain/{symbol.upper()}")
 
     response: requests.Response | None = None
 
@@ -380,6 +398,11 @@ def fetch_option_contracts(
             timeout=20,
             resource=f"{symbol} option chain",
         )
+
+    seen_urls: set[str] = set()
+    candidate_urls = [
+        url for url in candidate_urls if not (url in seen_urls or seen_urls.add(url))
+    ]
 
     for candidate_url in candidate_urls:
         try:
@@ -396,18 +419,18 @@ def fetch_option_contracts(
                 continue
             raise
     else:  # pragma: no branch - executed only when loop fails to break
-        logger.info(
-            "Alpaca reports no option chain for %s after trying all endpoints; skipping contract fetch.",
-            symbol.upper(),
+        attempted = ", ".join(candidate_urls)
+        message = (
+            "No Alpaca option chain endpoint responded for "
+            f"{symbol.upper()} (tried: {attempted})"
         )
-        return []
+        logger.info(message)
+        raise PriceDataError(message)
 
     if response is None:  # pragma: no cover - safety net
-        logger.info(
-            "Alpaca reports no option chain for %s; skipping contract fetch.",
-            symbol.upper(),
-        )
-        return []
+        message = f"Alpaca reports no option chain for {symbol.upper()}"
+        logger.info(message)
+        raise PriceDataError(message)
 
     try:
         payload = response.json()
