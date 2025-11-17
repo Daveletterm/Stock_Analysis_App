@@ -1575,11 +1575,45 @@ def analyze_stock(ticker: str) -> dict:
     latest_sma200 = last_value(df["SMA_200"])
 
     sentiment = fetch_news_sentiment(ticker) + fetch_reddit_sentiment(ticker)
-    rec = (
-        "BUY"
-        if (latest_close is not None and latest_sma50 is not None and latest_close > latest_sma50)
-        else "HOLD"
+    above_sma50 = (
+        latest_close is not None
+        and latest_sma50 is not None
+        and latest_close > latest_sma50
     )
+    above_sma200 = (
+        latest_close is not None
+        and latest_sma200 is not None
+        and latest_close > latest_sma200
+    )
+    rec = "BUY" if above_sma50 else "HOLD"
+
+    summary_bits: list[str] = []
+    if above_sma50:
+        summary_bits.append(
+            "Price is above the 50-day moving average, indicating positive momentum."
+        )
+    elif latest_close is not None and latest_sma50 is not None:
+        summary_bits.append(
+            "Price is below the 50-day moving average, so momentum looks soft."
+        )
+    if above_sma200:
+        summary_bits.append(
+            "Price is also above the 200-day moving average, supporting an uptrend view."
+        )
+    elif latest_close is not None and latest_sma200 is not None:
+        summary_bits.append(
+            "Price is under the 200-day moving average, so the long-term trend is weaker."
+        )
+    if latest_rsi is not None:
+        if latest_rsi >= 70:
+            summary_bits.append("RSI is elevated, suggesting overbought conditions.")
+        elif latest_rsi <= 30:
+            summary_bits.append("RSI is low, suggesting the stock may be oversold.")
+        else:
+            summary_bits.append("RSI is neutral, so momentum is balanced.")
+    if not summary_bits:
+        summary_bits.append("Insufficient indicator data to form an opinion.")
+    analysis_summary = " ".join(summary_bits)
 
     out = {
         "Symbol": ticker,
@@ -1588,6 +1622,7 @@ def analyze_stock(ticker: str) -> dict:
         "50-day MA": round(latest_sma50, 2) if latest_sma50 is not None else None,
         "200-day MA": round(latest_sma200, 2) if latest_sma200 is not None else None,
         "Recommendation": rec,
+        "Analysis Summary": analysis_summary,
         "Chart Data": chart_data,
     }
     logger.info("Analyze %s done: rows=%d chart_rows=%d", ticker, len(df), len(chart_data))
@@ -1787,10 +1822,13 @@ def start_background_jobs():
     should_start = not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if not should_start:
         return
+    # Run both routines immediately so the UI has fresh data without waiting
+    # for the first scheduler interval.
     threading.Thread(target=seek_recommendations, daemon=True).start()
+    threading.Thread(target=run_autopilot_cycle, daemon=True).start()
     sched = BackgroundScheduler()
     sched.add_job(seek_recommendations, "interval", hours=1, next_run_time=datetime.now())
-    sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now() + timedelta(seconds=30))
+    sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now())
     sched.start()
     logger.info("Background jobs started")
 

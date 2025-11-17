@@ -261,7 +261,7 @@ let refreshCharts = () => {};
   // Render metrics
   const metricsDiv = document.getElementById('metrics');
   if (r && Object.keys(r).length) {
-    const keys = ['Symbol','Close','RSI','50-day MA','200-day MA','Recommendation'];
+    const keys = ['Symbol','Close','RSI','50-day MA','200-day MA','Recommendation','Analysis Summary'];
     const html = keys.filter(k => r[k] !== undefined)
       .map(k => `<div><strong>${k}:</strong> ${r[k]}</div>`)
       .join('');
