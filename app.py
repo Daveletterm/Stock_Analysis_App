@@ -1070,7 +1070,7 @@ def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | Non
     return df
 
 
-def run_autopilot_cycle() -> None:
+def run_autopilot_cycle(force: bool = False) -> None:
     if not paper_broker.enabled:
         return
 
@@ -1080,7 +1080,7 @@ def run_autopilot_cycle() -> None:
     if not config.get("enabled"):
         return
 
-    if not _autopilot_runtime_lock.acquire(blocking=False):
+    if not _autopilot_runtime_lock.acquire(blocking=force):
         logger.debug("Autopilot cycle skipped; previous cycle still running")
         return
 
@@ -1483,6 +1483,11 @@ def run_autopilot_cycle() -> None:
         logger.info("Autopilot cycle completed: %s", " | ".join(summary_lines))
 
 
+# Helper to trigger an autopilot cycle without blocking the caller
+def trigger_autopilot_run(*, force: bool = False) -> None:
+    threading.Thread(target=run_autopilot_cycle, args=(force,), daemon=True).start()
+
+
 # -----------------------------
 # Data sources
 # -----------------------------
@@ -1850,7 +1855,7 @@ def start_background_jobs():
     # Run both routines immediately so the UI has fresh data without waiting
     # for the first scheduler interval.
     threading.Thread(target=seek_recommendations, daemon=True).start()
-    threading.Thread(target=run_autopilot_cycle, daemon=True).start()
+    trigger_autopilot_run()
     sched = BackgroundScheduler()
     sched.add_job(seek_recommendations, "interval", hours=1, next_run_time=datetime.now())
     sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now())
@@ -1907,6 +1912,18 @@ def seek_and_redirect():
 def api_recommendations():
     with _lock:
         return jsonify({"ok": True, "data": _recommendations})
+
+
+@app.route("/api/recommendations/refresh", methods=["POST"])
+def api_refresh_recommendations():
+    try:
+        seek_recommendations()
+        with _lock:
+            data = [dict(r) for r in _recommendations]
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        logger.exception("Recommendation refresh failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/api/backtest/<ticker>")
@@ -2024,7 +2041,7 @@ def paper_autopilot_update():
         )
     )
     if status.get("enabled"):
-        threading.Thread(target=run_autopilot_cycle, daemon=True).start()
+        trigger_autopilot_run(force=True)
     return redirect(url_for("paper_dashboard"))
 
 
@@ -2084,7 +2101,7 @@ def api_paper_autopilot():
 
     status = update_autopilot_config(enabled=enabled, strategy=strategy, risk=risk)
     if status.get("enabled") and paper_broker.enabled:
-        threading.Thread(target=run_autopilot_cycle, daemon=True).start()
+        trigger_autopilot_run(force=True)
     return jsonify({"ok": True, "data": status})
 
 
