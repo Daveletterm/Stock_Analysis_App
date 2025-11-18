@@ -438,6 +438,40 @@ def option_mid_price(contract: dict[str, Any]) -> float | None:
 _PERIOD_RE = re.compile(r"^(\d+)([a-zA-Z]+)$")
 
 
+def enrich_option_mark_prices(contracts: list[dict[str, Any]]) -> None:
+    """
+    For each contract, ensure there is a usable mark_price.
+    If contract["mark_price"] is missing or null, try in order:
+      1) mark_price = (bid + ask) / 2 if both bid and ask exist
+      2) mark_price = last_price or last_trade_price if available
+    Only leave mark_price as None if no price information exists at all.
+    This function mutates the contracts list in place.
+    """
+
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
+
+        mark_price = safe_float(contract.get("mark_price", contract.get("mark")), None)
+        if mark_price is not None:
+            continue
+
+        bid, ask = option_bid_ask(contract)
+        last_price = _option_last_price(contract)
+
+        if bid is not None and ask is not None:
+            mark_price = (bid + ask) / 2.0
+        elif bid is not None:
+            mark_price = bid
+        elif ask is not None:
+            mark_price = ask
+        elif last_price is not None:
+            mark_price = last_price
+
+        if mark_price is not None:
+            contract["mark_price"] = mark_price
+
+
 def _period_to_range(period: str, *, interval: str | None = None) -> tuple[datetime, datetime, str]:
     """Translate shorthand period strings into UTC start/end datetimes."""
 
@@ -864,6 +898,7 @@ def _autopilot_select_option_contract(
         except PriceDataError as exc:
             chain = []
             chain_errors[option_type] = str(exc)
+        enrich_option_mark_prices(chain)
         chains[option_type] = chain
         chain_sizes[option_type] = len(chain)
     diagnostics["chain_sizes"] = chain_sizes
@@ -895,11 +930,26 @@ def _autopilot_select_option_contract(
             if days_out < min_days or days_out > max_days:
                 base_rejections["expiry_window"] += 1
                 continue
-            price = option_mid_price(contract)
-            if price is None or price <= 0:
-                base_rejections["no_mark_price"] += 1
-                continue
             bid, ask = option_bid_ask(contract)
+            last_price = _option_last_price(contract)
+            price = option_mid_price(contract)
+            price_sources = [
+                safe_float(contract.get("mark_price"), None),
+                bid,
+                ask,
+                last_price,
+            ]
+            has_price_info = any(
+                val is not None and val > 0 for val in price_sources
+            )
+            if price is None or price <= 0:
+                if not has_price_info:
+                    base_rejections["no_mark_price"] += 1
+                    continue
+                price = next((val for val in price_sources if val is not None and val > 0), None)
+                if price is None:
+                    base_rejections["no_mark_price"] += 1
+                    continue
             if ask is None or ask <= 0:
                 base_rejections["no_ask_price"] += 1
                 continue
