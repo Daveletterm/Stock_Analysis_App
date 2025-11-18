@@ -334,119 +334,69 @@ def fetch_option_contracts(
     option_type: str | None = None,
     limit: int = 500,
 ) -> List[dict]:
-    """Retrieve a slice of the Alpaca option chain for *symbol*."""
+    """Retrieve a slice of the Alpaca option chain for *symbol* using /v2/options/contracts."""
 
     if not _broker.enabled:
         raise PriceDataError("Alpaca credentials are not configured")
 
     headers = _broker._headers()  # type: ignore[attr-defined]
+
+    # Build query parameters for the contracts endpoint
     params: Dict[str, object] = {
+        # Alpaca's /v2/options/contracts limit is capped; clamp for safety
         "limit": max(1, min(limit, 1000)),
-        # Alpaca's documented contract lookup uses query parameters instead of
-        # a symbol path segment, so include both singular/plural variants to
-        # maximize compatibility across API versions.
-        "underlying_symbol": symbol.upper(),
+        # Primary, documented parameter for underlying
         "underlying_symbols": symbol.upper(),
-        "symbol": symbol.upper(),
     }
+
+    # Optional filters
     if expiration_date_from:
         params["expiration_date_gte"] = expiration_date_from.isoformat()
     if expiration_date_to:
         params["expiration_date_lte"] = expiration_date_to.isoformat()
     if option_type:
+        # "call" or "put"
         params["type"] = option_type.lower()
 
-    primary_base = ALPACA_OPTIONS_BASE_URL.rstrip("/")
-    default_base = _DEFAULT_ALPACA_OPTIONS_BASE_URL.rstrip("/")
+    # ALPACA_OPTIONS_BASE_URL should normally be:
+    #   https://paper-api.alpaca.markets/v2/options/contracts
+    # Use it as-is and do NOT append any /options/chain style paths.
+    base_url = ALPACA_OPTIONS_BASE_URL.rstrip("/")
 
-    candidate_urls: List[str] = []
-    bases_to_try: List[str] = [primary_base]
-    if primary_base.lower() != default_base.lower():
-        bases_to_try.append(default_base)
-
-    # If the configured base URL uses a different API version, also try the
-    # opposite "v1beta1"/"v2beta1" variant since Alpaca occasionally changes
-    # option endpoints between releases without redirecting.
-    swapped_bases: List[str] = []
-    for base in list(bases_to_try):
-        lower = base.lower()
-        if "/v2beta1" in lower:
-            swapped_bases.append(base.replace("/v2beta1", "/v1beta1"))
-        elif "/v1beta1" in lower:
-            swapped_bases.append(base.replace("/v1beta1", "/v2beta1"))
-    for alt in swapped_bases:
-        if alt not in bases_to_try:
-            bases_to_try.append(alt)
-
-    for base in bases_to_try:
-        # Modern Alpaca contracts endpoint (documented): query string based
-        candidate_urls.append(f"{base}/options/chain")
-        # Legacy path-based variants observed in historical documentation
-        candidate_urls.append(f"{base}/options/{symbol.upper()}/chain")
-        candidate_urls.append(f"{base}/options/{symbol.upper()}/chains")
-        candidate_urls.append(f"{base}/options/chains")
-        # Some beta versions exposed the contract chain at this path
-        candidate_urls.append(f"{base}/options/chain/{symbol.upper()}")
-
-    response: requests.Response | None = None
-
-    def _request_chain(chain_url: str) -> requests.Response:
-        return _alpaca_request(
-            chain_url,
+    try:
+        response = _alpaca_request(
+            base_url,
             headers=headers,
             params=params,
             timeout=20,
-            resource=f"{symbol} option chain",
+            resource=f"{symbol.upper()} option contracts",
         )
-
-    seen_urls: set[str] = set()
-    candidate_urls = [
-        url for url in candidate_urls if not (url in seen_urls or seen_urls.add(url))
-    ]
-
-    for candidate_url in candidate_urls:
-        try:
-            response = _request_chain(candidate_url)
-            break
-        except PriceDataError as exc:
-            message = str(exc)
-            if "404" in message or "not found" in message.lower():
-                logger.info(
-                    "Alpaca option chain endpoint %s returned 404 for %s; trying next candidate.",
-                    candidate_url,
-                    symbol.upper(),
-                )
-                continue
-            raise
-    else:  # pragma: no branch - executed only when loop fails to break
-        attempted = ", ".join(candidate_urls)
-        message = (
-            "No Alpaca option chain endpoint responded for "
-            f"{symbol.upper()} (tried: {attempted})"
-        )
-        logger.info(message)
-        raise PriceDataError(message)
-
-    if response is None:  # pragma: no cover - safety net
-        message = f"Alpaca reports no option chain for {symbol.upper()}"
-        logger.info(message)
-        raise PriceDataError(message)
+    except PriceDataError as exc:
+        # Surface a clear error if the contracts endpoint itself fails
+        message = f"Alpaca option contracts endpoint failed for {symbol.upper()}: {exc}"
+        logger.warning(message)
+        raise PriceDataError(message) from exc
 
     try:
         payload = response.json()
     except ValueError as exc:  # pragma: no cover - unexpected response
-        raise PriceDataError("Alpaca returned invalid JSON for option chain") from exc
+        raise PriceDataError("Alpaca returned invalid JSON for option contracts") from exc
 
     options: List[dict] = []
+
     if isinstance(payload, dict):
-        if isinstance(payload.get("options"), list):
+        # New, documented key
+        if isinstance(payload.get("option_contracts"), list):
+            options = payload["option_contracts"]
+        # Backwards-compatibility fallbacks, just in case
+        elif isinstance(payload.get("options"), list):
             options = payload["options"]
         elif isinstance(payload.get("result"), list):
             options = payload["result"]
         elif isinstance(payload.get("data"), dict):
             data_obj = payload.get("data", {})
             if isinstance(data_obj, dict):
-                for key in ("options", "result", "contracts"):
+                for key in ("option_contracts", "options", "result", "contracts"):
                     candidate = data_obj.get(key)
                     if isinstance(candidate, list):
                         options = candidate
@@ -459,12 +409,15 @@ def fetch_option_contracts(
     for contract in options:
         if isinstance(contract, dict):
             normalized.append(contract)
+
     logger.info(
-        "Fetched %d option contracts for %s via %s", len(normalized), symbol.upper(), response.url
+        "Fetched %d option contracts for %s via %s",
+        len(normalized),
+        symbol.upper(),
+        response.url,
     )
 
     return normalized
-
 
 def _fetch_yfinance_history(symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame:
     """Retrieve bars from yfinance as a fallback."""
