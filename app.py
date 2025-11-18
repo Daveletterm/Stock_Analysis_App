@@ -438,6 +438,40 @@ def option_mid_price(contract: dict[str, Any]) -> float | None:
 _PERIOD_RE = re.compile(r"^(\d+)([a-zA-Z]+)$")
 
 
+def enrich_option_mark_prices(contracts: list[dict[str, Any]]) -> None:
+    """
+    For each contract, ensure there is a usable mark_price.
+    If contract["mark_price"] is missing or null, try in order:
+      1) mark_price = (bid + ask) / 2 if both bid and ask exist
+      2) mark_price = last_price or last_trade_price if available
+    Only leave mark_price as None if no price information exists at all.
+    This function mutates the contracts list in place.
+    """
+
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
+
+        mark_price = safe_float(contract.get("mark_price", contract.get("mark")), None)
+        if mark_price is not None:
+            continue
+
+        bid, ask = option_bid_ask(contract)
+        last_price = _option_last_price(contract)
+
+        if bid is not None and ask is not None:
+            mark_price = (bid + ask) / 2.0
+        elif bid is not None:
+            mark_price = bid
+        elif ask is not None:
+            mark_price = ask
+        elif last_price is not None:
+            mark_price = last_price
+
+        if mark_price is not None:
+            contract["mark_price"] = mark_price
+
+
 def _period_to_range(period: str, *, interval: str | None = None) -> tuple[datetime, datetime, str]:
     """Translate shorthand period strings into UTC start/end datetimes."""
 
@@ -864,6 +898,7 @@ def _autopilot_select_option_contract(
         except PriceDataError as exc:
             chain = []
             chain_errors[option_type] = str(exc)
+        enrich_option_mark_prices(chain)
         chains[option_type] = chain
         chain_sizes[option_type] = len(chain)
     diagnostics["chain_sizes"] = chain_sizes
@@ -895,11 +930,26 @@ def _autopilot_select_option_contract(
             if days_out < min_days or days_out > max_days:
                 base_rejections["expiry_window"] += 1
                 continue
-            price = option_mid_price(contract)
-            if price is None or price <= 0:
-                base_rejections["no_mark_price"] += 1
-                continue
             bid, ask = option_bid_ask(contract)
+            last_price = _option_last_price(contract)
+            price = option_mid_price(contract)
+            price_sources = [
+                safe_float(contract.get("mark_price"), None),
+                bid,
+                ask,
+                last_price,
+            ]
+            has_price_info = any(
+                val is not None and val > 0 for val in price_sources
+            )
+            if price is None or price <= 0:
+                if not has_price_info:
+                    base_rejections["no_mark_price"] += 1
+                    continue
+                price = next((val for val in price_sources if val is not None and val > 0), None)
+                if price is None:
+                    base_rejections["no_mark_price"] += 1
+                    continue
             if ask is None or ask <= 0:
                 base_rejections["no_ask_price"] += 1
                 continue
@@ -1070,7 +1120,7 @@ def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | Non
     return df
 
 
-def run_autopilot_cycle() -> None:
+def run_autopilot_cycle(force: bool = False) -> None:
     if not paper_broker.enabled:
         return
 
@@ -1080,7 +1130,7 @@ def run_autopilot_cycle() -> None:
     if not config.get("enabled"):
         return
 
-    if not _autopilot_runtime_lock.acquire(blocking=False):
+    if not _autopilot_runtime_lock.acquire(blocking=force):
         logger.debug("Autopilot cycle skipped; previous cycle still running")
         return
 
@@ -1483,6 +1533,11 @@ def run_autopilot_cycle() -> None:
         logger.info("Autopilot cycle completed: %s", " | ".join(summary_lines))
 
 
+# Helper to trigger an autopilot cycle without blocking the caller
+def trigger_autopilot_run(*, force: bool = False) -> None:
+    threading.Thread(target=run_autopilot_cycle, args=(force,), daemon=True).start()
+
+
 # -----------------------------
 # Data sources
 # -----------------------------
@@ -1850,7 +1905,7 @@ def start_background_jobs():
     # Run both routines immediately so the UI has fresh data without waiting
     # for the first scheduler interval.
     threading.Thread(target=seek_recommendations, daemon=True).start()
-    threading.Thread(target=run_autopilot_cycle, daemon=True).start()
+    trigger_autopilot_run()
     sched = BackgroundScheduler()
     sched.add_job(seek_recommendations, "interval", hours=1, next_run_time=datetime.now())
     sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now())
@@ -1907,6 +1962,18 @@ def seek_and_redirect():
 def api_recommendations():
     with _lock:
         return jsonify({"ok": True, "data": _recommendations})
+
+
+@app.route("/api/recommendations/refresh", methods=["POST"])
+def api_refresh_recommendations():
+    try:
+        seek_recommendations()
+        with _lock:
+            data = [dict(r) for r in _recommendations]
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        logger.exception("Recommendation refresh failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/api/backtest/<ticker>")
@@ -2024,7 +2091,7 @@ def paper_autopilot_update():
         )
     )
     if status.get("enabled"):
-        threading.Thread(target=run_autopilot_cycle, daemon=True).start()
+        trigger_autopilot_run(force=True)
     return redirect(url_for("paper_dashboard"))
 
 
@@ -2084,7 +2151,7 @@ def api_paper_autopilot():
 
     status = update_autopilot_config(enabled=enabled, strategy=strategy, risk=risk)
     if status.get("enabled") and paper_broker.enabled:
-        threading.Thread(target=run_autopilot_cycle, daemon=True).start()
+        trigger_autopilot_run(force=True)
     return jsonify({"ok": True, "data": status})
 
 

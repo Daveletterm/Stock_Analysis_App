@@ -325,17 +325,26 @@ let refreshCharts = () => {};
 
   // ----- Refresh picks: recompute on server, then fetch fresh -----
   const recsForm = document.getElementById('refresh-recs');
+  const recsBtn = recsForm ? recsForm.querySelector('button[type="submit"]') : null;
   if (recsForm) {
     recsForm.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (recsBtn) {
+        recsBtn.disabled = true;
+        recsBtn.textContent = 'Refreshing…';
+      }
       try {
-        await fetch('/seek', { method: 'GET', cache: 'no-store' }); // trigger recompute
-        const res  = await fetch('/api/recommendations', { cache: 'no-store' });
+        const res  = await fetch('/api/recommendations/refresh', { method: 'POST', cache: 'no-store' });
         const json = await res.json();
         const list = (json && json.ok && Array.isArray(json.data)) ? json.data : [];
         renderRecs(list);
       } catch (err) {
         console.error('Failed to refresh recommendations', err);
+      } finally {
+        if (recsBtn) {
+          recsBtn.disabled = false;
+          recsBtn.textContent = 'Refresh Top 5 Picks';
+        }
       }
     });
   }
