@@ -70,6 +70,8 @@ _sp500 = {"tickers": [], "updated": datetime.min}
 _price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = {}
 PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations = []
+_background_jobs_started = False
+_background_jobs_lock = threading.Lock()
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
@@ -380,26 +382,11 @@ def option_bid_ask(contract: dict[str, Any]) -> tuple[Optional[float], Optional[
     return bid, ask
 
 
-def option_implied_volatility(contract: dict[str, Any]) -> float | None:
-    if not isinstance(contract, dict):
-        return None
-    iv = contract.get("implied_volatility")
-    if iv is None and isinstance(contract.get("greeks"), dict):
-        greeks = contract["greeks"]
-        iv = greeks.get("iv") or greeks.get("implied_volatility")
-    return safe_float(iv, None)
+def _option_last_price(contract: dict[str, Any]) -> float | None:
+    last_price = safe_float(contract.get("last_price"), None)
+    if last_price is not None:
+        return last_price
 
-
-def option_mid_price(contract: dict[str, Any]) -> float | None:
-    if not isinstance(contract, dict):
-        return None
-    bid, ask = option_bid_ask(contract)
-    if bid and ask:
-        return (bid + ask) / 2.0
-    if ask:
-        return ask
-    if bid:
-        return bid
     trade = None
     for key in ("last_trade", "trade", "latest_trade"):
         value = contract.get(key)
@@ -413,6 +400,39 @@ def option_mid_price(contract: dict[str, Any]) -> float | None:
             if price is not None:
                 return price
     return None
+
+
+def option_implied_volatility(contract: dict[str, Any]) -> float | None:
+    if not isinstance(contract, dict):
+        return None
+    iv = contract.get("implied_volatility")
+    if iv is None and isinstance(contract.get("greeks"), dict):
+        greeks = contract["greeks"]
+        iv = greeks.get("iv") or greeks.get("implied_volatility")
+    return safe_float(iv, None)
+
+
+def option_mid_price(contract: dict[str, Any]) -> float | None:
+    if not isinstance(contract, dict):
+        return None
+    mark_price = safe_float(contract.get("mark_price", contract.get("mark")), None)
+    bid, ask = option_bid_ask(contract)
+    last_price = _option_last_price(contract)
+
+    if mark_price is None:
+        if bid is not None and ask is not None:
+            mark_price = (bid + ask) / 2.0
+        elif bid is not None:
+            mark_price = bid
+        elif ask is not None:
+            mark_price = ask
+        else:
+            mark_price = last_price
+
+    if mark_price is None:
+        mark_price = last_price
+
+    return mark_price
 
 
 _PERIOD_RE = re.compile(r"^(\d+)([a-zA-Z]+)$")
@@ -1819,9 +1839,14 @@ def backtest_ticker(ticker: str, years: int = 3, cost_bps: float = 5.0) -> dict:
 # -----------------------------
 
 def start_background_jobs():
+    global _background_jobs_started
     should_start = not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if not should_start:
         return
+    with _background_jobs_lock:
+        if _background_jobs_started:
+            return
+        _background_jobs_started = True
     # Run both routines immediately so the UI has fresh data without waiting
     # for the first scheduler interval.
     threading.Thread(target=seek_recommendations, daemon=True).start()
@@ -1831,6 +1856,11 @@ def start_background_jobs():
     sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now())
     sched.start()
     logger.info("Background jobs started")
+
+
+@app.before_first_request
+def _start_background_jobs_once() -> None:
+    start_background_jobs()
 
 
 # -----------------------------
