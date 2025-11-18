@@ -27,7 +27,7 @@ ALPACA_DATA_BASE_URL = (
     or "https://data.alpaca.markets/v2"
 ).rstrip("/")
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
-_DEFAULT_ALPACA_OPTIONS_BASE_URL = "https://data.alpaca.markets/v2beta1"
+_DEFAULT_ALPACA_OPTIONS_BASE_URL = "https://paper-api.alpaca.markets/v2/options/contracts"
 ALPACA_OPTIONS_BASE_URL = (
     os.getenv("ALPACA_OPTIONS_DATA_URL")
     or os.getenv("ALPACA_MARKET_DATA_URL")
