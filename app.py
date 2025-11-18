@@ -70,6 +70,8 @@ _sp500 = {"tickers": [], "updated": datetime.min}
 _price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = {}
 PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations = []
+_background_jobs_started = False
+_background_jobs_lock = threading.Lock()
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
@@ -1837,9 +1839,14 @@ def backtest_ticker(ticker: str, years: int = 3, cost_bps: float = 5.0) -> dict:
 # -----------------------------
 
 def start_background_jobs():
+    global _background_jobs_started
     should_start = not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if not should_start:
         return
+    with _background_jobs_lock:
+        if _background_jobs_started:
+            return
+        _background_jobs_started = True
     # Run both routines immediately so the UI has fresh data without waiting
     # for the first scheduler interval.
     threading.Thread(target=seek_recommendations, daemon=True).start()
@@ -1849,6 +1856,11 @@ def start_background_jobs():
     sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now())
     sched.start()
     logger.info("Background jobs started")
+
+
+@app.before_first_request
+def _start_background_jobs_once() -> None:
+    start_background_jobs()
 
 
 # -----------------------------
