@@ -1248,6 +1248,7 @@ def _autopilot_select_option_contract(
         return OptionSelection(None, None, None, diagnostics)
 
     base_rejections: Counter[str] = Counter()
+    price_fallbacks: Counter[str] = Counter()
     candidates: list[dict[str, Any]] = []
     for option_type, chain in chains.items():
         for contract in chain:
@@ -1277,11 +1278,17 @@ def _autopilot_select_option_contract(
                     base_rejections["invalid_price"] += 1
                 continue
             if ask is None or ask <= 0:
-                base_rejections["no_ask_price"] += 1
-                continue
+                # Alpaca's options endpoint frequently omits real-time quotes for
+                # thin contracts. When we have a reliable last/mark price,
+                # synthesize a conservative ask instead of discarding the
+                # contract outright so the strategy can still evaluate it.
+                ask = price * 1.01
+                price_fallbacks["synthetic_ask_used"] += 1
             if bid is None or bid <= 0:
-                base_rejections["no_bid_price"] += 1
-                continue
+                # Likewise synthesize a bid slightly below the derived price so
+                # spreads remain small and risk filters still apply.
+                bid = price * 0.99
+                price_fallbacks["synthetic_bid_used"] += 1
             spread_pct = max(0.0, (ask - bid) / ask) if ask else None
             if spread_pct is None:
                 base_rejections["invalid_spread"] += 1
@@ -1309,6 +1316,8 @@ def _autopilot_select_option_contract(
                 }
             )
     diagnostics["base_rejections"] = dict(base_rejections)
+    if price_fallbacks:
+        diagnostics["price_fallbacks"] = dict(price_fallbacks)
     diagnostics["candidates_considered"] = len(candidates)
 
     if not candidates:
