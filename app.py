@@ -73,7 +73,12 @@ _lock = threading.Lock()
 _sp500 = {"tickers": [], "updated": datetime.min}
 _price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = {}
 PRICE_CACHE_TTL = timedelta(minutes=15)
-_recommendations = []
+_recommendations: dict[str, Any] = {
+    "timestamp": None,
+    "bullish": [],
+    "bearish": [],
+    "top": [],
+}
 _rec_state = {"refreshing": False, "last_completed": None, "last_error": None}
 _background_jobs_started = False
 _background_jobs_lock = threading.Lock()
@@ -247,6 +252,26 @@ def _init_db() -> None:
         logger.exception("Failed to initialize local sqlite cache")
 
 
+def _normalize_recommendations_payload(payload: Any) -> dict[str, Any]:
+    """Ensure recommendation payloads are stored with bullish/bearish buckets."""
+
+    bullish: list[dict[str, Any]] = []
+    bearish: list[dict[str, Any]] = []
+    timestamp = None
+
+    if isinstance(payload, dict):
+        bullish = [dict(r) for r in payload.get("bullish", []) if isinstance(r, dict)]
+        bearish = [dict(r) for r in payload.get("bearish", []) if isinstance(r, dict)]
+        timestamp = payload.get("timestamp")
+        if not bullish and isinstance(payload.get("top"), list):
+            bullish = [dict(r) for r in payload.get("top", []) if isinstance(r, dict)]
+    elif isinstance(payload, list):
+        bullish = [dict(r) for r in payload if isinstance(r, dict)]
+
+    top = bullish[:]
+    return {"timestamp": timestamp, "bullish": bullish, "bearish": bearish, "top": top}
+
+
 def _load_latest_recommendations_from_db() -> None:
     try:
         conn = _get_db_connection()
@@ -256,12 +281,11 @@ def _load_latest_recommendations_from_db() -> None:
         row = cur.fetchone()
         if not row:
             return
-        payload = json.loads(row["payload"])
+        payload = _normalize_recommendations_payload(json.loads(row["payload"]))
         created_at = row["created_at"]
         with _lock:
-            if isinstance(payload, list):
-                _recommendations.clear()
-                _recommendations.extend(payload)
+            _recommendations.clear()
+            _recommendations.update(payload)
             _rec_state["last_completed"] = datetime.fromisoformat(created_at)
             _rec_state["last_error"] = None
         logger.info("Loaded cached recommendations snapshot from %s", created_at)
@@ -269,7 +293,7 @@ def _load_latest_recommendations_from_db() -> None:
         logger.exception("Failed to load cached recommendations from sqlite")
 
 
-def _record_recommendations_snapshot(recs: list[dict[str, Any]]) -> None:
+def _record_recommendations_snapshot(recs: dict[str, Any]) -> None:
     try:
         conn = _get_db_connection()
         with conn:
@@ -391,19 +415,27 @@ def fetch_reddit_sentiment(_ticker: str) -> float:
 # -----------------------------
 
 
-def _fallback_recommendations(reason: str | None = None) -> list[dict[str, Any]]:
+def _fallback_recommendations(reason: str | None = None) -> dict[str, Any]:
     """Return placeholder picks so the UI isn't empty when data is unreachable."""
 
     why_text = reason or "Data unavailable; using placeholder symbols."
-    return [
+    bullish = [
         {
             "Symbol": sym,
             "Recommendation": "HOLD",
             "Score": 0.0,
+            "BearishScore": 0.0,
             "Why": [why_text],
+            "WhyBearish": [why_text],
         }
         for sym in FALLBACK_TICKERS[:5]
     ]
+    return {
+        "timestamp": None,
+        "bullish": bullish,
+        "bearish": [],
+        "top": bullish,
+    }
 
 
 def _format_recommendation_status(recs: list[dict[str, Any]], state: dict[str, Any]) -> dict[str, Any]:
@@ -1703,14 +1735,32 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     gross_equity_notional += market_value
 
             with _lock:
-                recs_snapshot = [dict(r) for r in _recommendations]
+                recs_payload = _normalize_recommendations_payload(_recommendations)
 
-            if not recs_snapshot:
+            if not recs_payload.get("bullish"):
                 seek_recommendations()
                 with _lock:
-                    recs_snapshot = [dict(r) for r in _recommendations]
-            candidate_count = len(recs_snapshot)
-            logger.info("Autopilot evaluating %d recommendation candidates", candidate_count)
+                    recs_payload = _normalize_recommendations_payload(_recommendations)
+            if not recs_payload.get("bullish"):
+                recs_payload = _fallback_recommendations(
+                    "No recommendations yet; using placeholders for autopilot"
+                )
+
+            bullish_recs = [dict(r) for r in recs_payload.get("bullish", [])]
+            bearish_recs = [dict(r) for r in recs_payload.get("bearish", [])]
+            bullish_pool = bullish_recs
+            bearish_pool = bearish_recs if asset_class == "option" else []
+            bullish_slice = bullish_pool[:5] if asset_class == "option" else bullish_pool
+            bearish_slice = bearish_pool[:5] if asset_class == "option" else []
+            recs_snapshot = bullish_slice + bearish_slice
+            bearish_symbols = {str(rec.get("Symbol", "")).upper() for rec in bearish_slice}
+            candidate_count = len(bullish_slice) + len(bearish_slice)
+            logger.info(
+                "Autopilot evaluating %d recommendation candidates (bullish=%d bearish=%d)",
+                candidate_count,
+                len(bullish_slice),
+                len(bearish_slice),
+            )
 
             position_multiplier = max(risk_cfg.get("position_multiplier", 1.0), 0.25)
             stop_loss_multiplier = max(risk_cfg.get("stop_loss_multiplier", 1.0), 0.25)
@@ -1937,7 +1987,14 @@ def run_autopilot_cycle(force: bool = False) -> None:
             logged_candidates: set[str] = set()
             candidate_skip_reasons: dict[str, str] = {}
 
-            def _log_filtered_candidate(symbol: str, score: float | None, reason: str) -> None:
+            def _log_filtered_candidate(
+                symbol: str,
+                score: float | None,
+                reason: str,
+                *,
+                bullish_considered: bool = False,
+                bearish_considered: bool = False,
+            ) -> None:
                 if not symbol or symbol in logged_candidates:
                     return
                 score_fragment = f"{score:.2f}" if isinstance(score, (int, float)) else "n/a"
@@ -1948,23 +2005,27 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     "none",
                     reason,
                     score_fragment,
-                    False,
-                    False,
+                    bullish_considered,
+                    bearish_considered,
                 )
                 logged_candidates.add(symbol)
-            for rec in recs_snapshot:
+
+            for rec in bullish_slice:
                 symbol = str(rec.get("Symbol", "")).upper()
                 if not symbol:
                     continue
                 score = safe_float(rec.get("Score"))
                 if score is None:
-                    _log_filtered_candidate(symbol, score, "no entry, missing score")
+                    _log_filtered_candidate(
+                        symbol, score, "no entry, missing score", bullish_considered=True
+                    )
                     continue
                 if score < min_entry_score:
                     _log_filtered_candidate(
                         symbol,
                         score,
                         f"no entry, score {score:.2f} below min {min_entry_score:.2f}",
+                        bullish_considered=True,
                     )
                     continue
                 if asset_class == "option":
@@ -1973,6 +2034,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             symbol,
                             score,
                             "no entry, order already pending for underlying",
+                            bullish_considered=True,
                         )
                         continue
                 else:
@@ -1981,6 +2043,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             symbol,
                             score,
                             "no entry, already have open position or pending order",
+                            bullish_considered=True,
                         )
                         continue
                 buy_candidates.append((symbol, score))
@@ -1989,12 +2052,36 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 bearish_min_score = safe_float(
                     strategy.get("bearish_min_score"), strategy.get("min_score", 3.0)
                 )
-                bearish_candidates = find_bearish_candidates(
-                    recs_snapshot,
-                    lookback=lookback,
-                    min_score=bearish_min_score,
-                    held_underlyings=pending_underlyings,
-                )
+                for rec in bearish_slice:
+                    symbol = str(rec.get("Symbol", "")).upper()
+                    if not symbol:
+                        continue
+                    score = safe_float(rec.get("BearishScore"))
+                    if score is None:
+                        _log_filtered_candidate(
+                            symbol,
+                            score,
+                            "no entry, missing bearish score",
+                            bearish_considered=True,
+                        )
+                        continue
+                    if score < bearish_min_score:
+                        _log_filtered_candidate(
+                            symbol,
+                            score,
+                            f"no entry, bearish score {score:.2f} below min {bearish_min_score:.2f}",
+                            bearish_considered=True,
+                        )
+                        continue
+                    if symbol in pending_underlyings:
+                        _log_filtered_candidate(
+                            symbol,
+                            score,
+                            "no entry, order already pending for underlying",
+                            bearish_considered=True,
+                        )
+                        continue
+                    bearish_candidates.append((symbol, score))
 
             if not buy_candidates and not bearish_candidates:
                 summary_lines.append("No new symbols met entry criteria.")
@@ -2018,7 +2105,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
             allocation_warning_logged = False
 
             if asset_class == "option":
-                for rec in recs_snapshot:
+                for rec in list(bullish_slice) + list(bearish_slice):
                     symbol = str(rec.get("Symbol", "")).upper()
                     if not symbol or symbol in evaluated_symbols:
                         continue
@@ -2425,7 +2512,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 symbol = str(rec.get("Symbol", "")).upper()
                 if not symbol or symbol in logged_candidates:
                     continue
-                score = safe_float(rec.get("Score"))
+                bearish_flag = symbol in bearish_symbols
+                score_key = "BearishScore" if bearish_flag else "Score"
+                score = safe_float(rec.get(score_key))
                 score_fragment = f"{score:.2f}" if isinstance(score, (int, float)) else "n/a"
                 reason = candidate_skip_reasons.get(
                     symbol, "no entry, filtered before evaluation"
@@ -2436,8 +2525,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     "none",
                     reason,
                     score_fragment,
-                    False,
-                    False,
+                    not bearish_flag,
+                    bearish_flag,
                 )
                 logged_candidates.add(symbol)
 
@@ -2704,7 +2793,7 @@ def seek_recommendations() -> None:
                 "No tickers passed the liquidity filter; keeping existing recommendations"
             )
             with _lock:
-                if not _recommendations:
+                if not _recommendations.get("bullish"):
                     _recommendations = _fallback_recommendations(
                         "No tickers passed the liquidity filter"
                     )
@@ -2736,8 +2825,31 @@ def seek_recommendations() -> None:
                     return None
                 df = compute_indicators(df)
                 score, reasons = score_stock(df)
+                bearish_score, bearish_reasons = score_bearish(df)
+                latest = df.iloc[-1]
+                bearish_meta = {
+                    "below_sma50": bool(
+                        pd.notna(latest.get("SMA_50")) and latest["Close"] < latest["SMA_50"]
+                    ),
+                    "below_sma200": bool(
+                        pd.notna(latest.get("SMA_200")) and latest["Close"] < latest["SMA_200"]
+                    ),
+                    "rsi": float(latest.get("RSI")) if pd.notna(latest.get("RSI")) else None,
+                    "atr_pct": float(latest.get("ATR_pct"))
+                    if pd.notna(latest.get("ATR_pct"))
+                    else None,
+                }
                 rec = "BUY" if score >= 3.5 else "HOLD"
-                return {"Symbol": sym, "Recommendation": rec, "Score": score, "Why": reasons}
+                return {
+                    "Symbol": sym,
+                    "Recommendation": rec,
+                    "Score": score,
+                    "BearishScore": bearish_score,
+                    "Why": reasons,
+                    "WhyBearish": bearish_reasons,
+                    "Trend": "down" if bearish_score > score else "up",
+                    "BearishMeta": bearish_meta,
+                }
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.warning("Skipping %s due to processing error: %s", sym, exc)
                 return None
@@ -2750,23 +2862,44 @@ def seek_recommendations() -> None:
         buys = [r for r in results if r["Recommendation"] == "BUY"]
         logger.info("Recommendations computed: %d BUY out of %d", len(buys), len(results))
         completed_at = datetime.now()
+        bearish_candidates: list[dict[str, Any]] = []
+        for entry in results:
+            bearish_score = safe_float(entry.get("BearishScore"))
+            meta = entry.get("BearishMeta") or {}
+            if bearish_score is None or bearish_score <= 0:
+                continue
+            if not (meta.get("below_sma50") and meta.get("below_sma200")):
+                continue
+            bearish_candidates.append(entry)
+
+        bearish_candidates.sort(
+            key=lambda x: (-safe_float(x.get("BearishScore"), 0.0), x.get("Symbol", ""))
+        )
+
         with _lock:
             if results:
-                _recommendations = results[:5]  # top 5 overall, already ranked
+                bullish_top = results[:5]
+                payload = {
+                    "timestamp": completed_at.isoformat(),
+                    "bullish": bullish_top,
+                    "bearish": bearish_candidates[:20],
+                    "top": bullish_top,
+                }
+                _recommendations = payload
                 _rec_state["last_completed"] = completed_at
                 _rec_state["last_error"] = None
-            elif not _recommendations:
+            elif not _recommendations.get("bullish"):
                 _recommendations = _fallback_recommendations(
                     "Unable to compute recommendations; using placeholders"
                 )
         if results:
-            _record_recommendations_snapshot(results[:5])
+            _record_recommendations_snapshot(payload)
     except Exception as exc:
         logger.exception("Recommendation refresh failed")
         with _lock:
             _rec_state["last_error"] = str(exc)
         with _lock:
-            if not _recommendations:
+            if not _recommendations.get("bullish"):
                 _recommendations = _fallback_recommendations(
                     "Refreshing recommendations failed; using placeholders"
                 )
@@ -2962,7 +3095,8 @@ def home():
                 flash(f"Analyze error for {t}: {e}")
 
     with _lock:
-        recs = [dict(r) for r in _recommendations]
+        rec_payload = _normalize_recommendations_payload(_recommendations)
+        recs = [dict(r) for r in rec_payload.get("bullish", [])]
         rec_state = dict(_rec_state)
 
     if not recs:
@@ -2972,9 +3106,10 @@ def home():
                 with _lock:
                     _rec_state["refreshing"] = True
                     rec_state["refreshing"] = True
-            recs = _fallback_recommendations(
+            rec_payload = _fallback_recommendations(
                 "No recommendations yet; first-time scan can take a few minutes."
             )
+            recs = rec_payload.get("bullish", [])
         except Exception:
             logger.exception("Initial recommendation refresh failed")
 
@@ -3005,12 +3140,28 @@ def seek_and_redirect():
 @app.route("/api/recommendations")
 def api_recommendations():
     with _lock:
-        data = [dict(r) for r in _recommendations]
+        payload = _normalize_recommendations_payload(_recommendations)
         state = dict(_rec_state)
-    if not data:
-        data = _fallback_recommendations("No recommendations available; using placeholders")
-    status = _format_recommendation_status(data, state)
-    return jsonify({"ok": True, "data": data, "status": status})
+    if not payload.get("bullish"):
+        payload = _fallback_recommendations("No recommendations available; using placeholders")
+    status = _format_recommendation_status(payload.get("bullish", []), state)
+    response_payload = {
+        "bullish": [dict(r) for r in payload.get("bullish", [])],
+        "bearish": [dict(r) for r in payload.get("bearish", [])],
+        "top": [dict(r) for r in payload.get("top", payload.get("bullish", []))],
+        "timestamp": payload.get("timestamp"),
+    }
+    return jsonify(
+        {
+            "ok": True,
+            "data": response_payload["bullish"],
+            "bullish": response_payload["bullish"],
+            "bearish": response_payload["bearish"],
+            "top": response_payload["top"],
+            "timestamp": response_payload.get("timestamp"),
+            "status": status,
+        }
+    )
 
 
 @app.route("/api/recommendations/refresh", methods=["POST"])
@@ -3018,10 +3169,30 @@ def api_refresh_recommendations():
     try:
         seek_recommendations()
         with _lock:
-            data = [dict(r) for r in _recommendations]
+            payload = _normalize_recommendations_payload(_recommendations)
             state = dict(_rec_state)
-        status = _format_recommendation_status(data, state)
-        return jsonify({"ok": True, "data": data, "status": status})
+        if not payload.get("bullish"):
+            payload = _fallback_recommendations(
+                "No recommendations available; using placeholders"
+            )
+        status = _format_recommendation_status(payload.get("bullish", []), state)
+        response_payload = {
+            "bullish": [dict(r) for r in payload.get("bullish", [])],
+            "bearish": [dict(r) for r in payload.get("bearish", [])],
+            "top": [dict(r) for r in payload.get("top", payload.get("bullish", []))],
+            "timestamp": payload.get("timestamp"),
+        }
+        return jsonify(
+            {
+                "ok": True,
+                "data": response_payload["bullish"],
+                "bullish": response_payload["bullish"],
+                "bearish": response_payload["bearish"],
+                "top": response_payload["top"],
+                "timestamp": response_payload.get("timestamp"),
+                "status": status,
+            }
+        )
     except Exception as exc:
         logger.exception("Recommendation refresh failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
