@@ -407,8 +407,43 @@ def fetch_option_contracts(
 
     normalized: List[dict] = []
     for contract in options:
-        if isinstance(contract, dict):
-            normalized.append(contract)
+        if not isinstance(contract, dict):
+            continue
+
+        # Ensure we have some sort of mark_price so the autopilot
+        # filters do not throw everything away as "no_mark_price".
+        mark = contract.get("mark_price")
+
+        if mark in (None, "", "0", "0.0"):
+            # /v2/options/contracts typically provides "close_price" and may
+            # also include bid/ask or last price fields depending on plan.
+            close = contract.get("close_price")
+            bid = contract.get("bid")
+            ask = contract.get("ask")
+            last = contract.get("last_price") or contract.get("last_trade_price")
+
+            # First choice: midpoint of bid/ask if both exist
+            if bid is not None and ask is not None:
+                try:
+                    contract["mark_price"] = (float(bid) + float(ask)) / 2.0
+                except (TypeError, ValueError):
+                    pass
+
+            # Second choice: close_price
+            if contract.get("mark_price") in (None, "", "0", "0.0") and close is not None:
+                try:
+                    contract["mark_price"] = float(close)
+                except (TypeError, ValueError):
+                    pass
+
+            # Third choice: last/last_trade
+            if contract.get("mark_price") in (None, "", "0", "0.0") and last is not None:
+                try:
+                    contract["mark_price"] = float(last)
+                except (TypeError, ValueError):
+                    pass
+
+        normalized.append(contract)
 
     logger.info(
         "Fetched %d option contracts for %s via %s",
