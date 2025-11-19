@@ -30,10 +30,10 @@ def _safe_float(value):
         return None
 
 _ALPACA_DATA_DEFAULT_BASE_URL = "https://paper-api.alpaca.markets/v2"
+_ALPACA_STOCK_DATA_DEFAULT_BASE_URL = "https://data.alpaca.markets/v2"
 ALPACA_DATA_BASE_URL = (
     os.getenv("ALPACA_DATA_BASE_URL")
-    or os.getenv("ALPACA_MARKET_DATA_URL")
-    or _ALPACA_DATA_DEFAULT_BASE_URL
+    or _ALPACA_STOCK_DATA_DEFAULT_BASE_URL
 ).rstrip("/")
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
 
