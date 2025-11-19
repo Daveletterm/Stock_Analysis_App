@@ -220,6 +220,22 @@ def fetch_reddit_sentiment(_ticker: str) -> float:
 # Helpers
 # -----------------------------
 
+
+def _fallback_recommendations(reason: str | None = None) -> list[dict[str, Any]]:
+    """Return placeholder picks so the UI isn't empty when data is unreachable."""
+
+    why_text = reason or "Data unavailable; using placeholder symbols."
+    return [
+        {
+            "Symbol": sym,
+            "Recommendation": "HOLD",
+            "Score": 0.0,
+            "Why": [why_text],
+        }
+        for sym in FALLBACK_TICKERS[:5]
+    ]
+# -----------------------------
+
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -1772,6 +1788,7 @@ def fast_filter_ticker(ticker: str) -> bool:
 
 
 def seek_recommendations() -> None:
+    global _recommendations
     logger.info("Refreshing recommendations…")
     update_sp500()
     with _lock:
@@ -1807,6 +1824,11 @@ def seek_recommendations() -> None:
 
     if not filtered:
         logger.warning("No tickers passed the liquidity filter; keeping existing recommendations")
+        with _lock:
+            if not _recommendations:
+                _recommendations = _fallback_recommendations(
+                    "No tickers passed the liquidity filter"
+                )
         return
 
     def worker(sym: str) -> dict:
@@ -1849,8 +1871,12 @@ def seek_recommendations() -> None:
     buys = [r for r in results if r["Recommendation"] == "BUY"]
     logger.info("Recommendations computed: %d BUY out of %d", len(buys), len(results))
     with _lock:
-        global _recommendations
-        _recommendations = results[:5]  # top 5 overall, already ranked
+        if results:
+            _recommendations = results[:5]  # top 5 overall, already ranked
+        elif not _recommendations:
+            _recommendations = _fallback_recommendations(
+                "Unable to compute recommendations; using placeholders"
+            )
 
 
 # -----------------------------
@@ -1992,9 +2018,11 @@ def home():
 
     if not recs:
         try:
-            seek_recommendations()
+            threading.Thread(target=seek_recommendations, daemon=True).start()
             with _lock:
                 recs = _recommendations[:]
+                if not recs:
+                    recs = _fallback_recommendations("Refreshing recommendations; showing placeholders")
         except Exception:
             logger.exception("Initial recommendation refresh failed")
 
@@ -2021,7 +2049,10 @@ def seek_and_redirect():
 @app.route("/api/recommendations")
 def api_recommendations():
     with _lock:
-        return jsonify({"ok": True, "data": _recommendations})
+        data = _recommendations[:]
+    if not data:
+        data = _fallback_recommendations("No recommendations available; using placeholders")
+    return jsonify({"ok": True, "data": data})
 
 
 @app.route("/api/recommendations/refresh", methods=["POST"])
