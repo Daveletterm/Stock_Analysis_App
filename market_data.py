@@ -29,7 +29,7 @@ def _safe_float(value):
     except (TypeError, ValueError):
         return None
 
-_ALPACA_DATA_DEFAULT_BASE_URL = "https://data.alpaca.markets/v2"
+_ALPACA_DATA_DEFAULT_BASE_URL = "https://paper-api.alpaca.markets/v2"
 ALPACA_DATA_BASE_URL = (
     os.getenv("ALPACA_DATA_BASE_URL")
     or os.getenv("ALPACA_MARKET_DATA_URL")
@@ -43,27 +43,16 @@ _ALPACA_TRADING_DEFAULT_BASE_URL = (
 ).rstrip("/")
 
 
-def _resolve_alpaca_options_base_url() -> str:
-    """Return the fully-qualified Alpaca options contracts endpoint."""
-
-    env_options_url = (os.getenv("ALPACA_OPTIONS_DATA_URL") or "").strip()
-
-    base_candidate = env_options_url or _ALPACA_TRADING_DEFAULT_BASE_URL
-
-    resolved = _ensure_options_contracts_path(base_candidate)
-    return resolved or _DEFAULT_ALPACA_OPTIONS_BASE_URL
-
-
 def _ensure_options_contracts_path(url: str | None) -> str:
     """Ensure *url* targets Alpaca's /v2/options/contracts endpoint."""
 
-    candidate = (url or _ALPACA_TRADING_DEFAULT_BASE_URL).strip()
+    candidate = (url or _ALPACA_DATA_DEFAULT_BASE_URL).strip()
     if not candidate:
-        candidate = _ALPACA_TRADING_DEFAULT_BASE_URL
+        candidate = _ALPACA_DATA_DEFAULT_BASE_URL
 
+    # Make sure we have a scheme and netloc
     if "://" not in candidate:
         candidate = f"https://{candidate.lstrip('/')}"
-
     parsed = urlparse(candidate)
     if not parsed.scheme:
         parsed = parsed._replace(scheme="https")
@@ -71,9 +60,10 @@ def _ensure_options_contracts_path(url: str | None) -> str:
         parsed = urlparse(f"https://{candidate.lstrip('/')}")
 
     path = parsed.path.rstrip("/")
-    if not path:
+    if not path or path == "/":
         path = "/v2"
 
+    # If there is already an /options segment, make sure it ends with /contracts
     if "/options" in path:
         if not path.endswith("/contracts"):
             path = f"{path}/contracts"
@@ -86,7 +76,20 @@ def _ensure_options_contracts_path(url: str | None) -> str:
     return normalized.rstrip("/")
 
 
-_DEFAULT_ALPACA_OPTIONS_BASE_URL = f"{_ALPACA_TRADING_DEFAULT_BASE_URL}/options/contracts"
+def _resolve_alpaca_options_base_url() -> str:
+    """Return the fully-qualified Alpaca options contracts endpoint."""
+
+    env_options_url = (os.getenv("ALPACA_OPTIONS_DATA_URL") or "").strip()
+    base_candidate = env_options_url or (
+        os.getenv("ALPACA_DATA_BASE_URL")
+        or os.getenv("ALPACA_MARKET_DATA_URL")
+        or _ALPACA_DATA_DEFAULT_BASE_URL
+    )
+    resolved = _ensure_options_contracts_path(base_candidate)
+    return resolved or _DEFAULT_ALPACA_OPTIONS_BASE_URL
+
+
+_DEFAULT_ALPACA_OPTIONS_BASE_URL = "https://paper-api.alpaca.markets/v2/options/contracts"
 ALPACA_OPTIONS_BASE_URL = _resolve_alpaca_options_base_url()
 logger.debug("Resolved Alpaca options base URL: %s", ALPACA_OPTIONS_BASE_URL)
 
@@ -403,9 +406,11 @@ def fetch_option_contracts(
         "limit": max(1, min(limit, 1000)),
         # Primary, documented parameter for underlying
         "underlying_symbols": symbol.upper(),
+        # Avoid halted/expired contracts unless explicitly requested
+        "status": "active",
     }
 
-    # Optional filters
+    # Optional filters supported by the contracts endpoint
     if expiration_date_from:
         params["expiration_date_gte"] = expiration_date_from.isoformat()
     if expiration_date_to:
@@ -413,23 +418,6 @@ def fetch_option_contracts(
     if option_type:
         # "call" or "put"
         params["type"] = option_type.lower()
-
-    # Request the rich payload so we get quotes/trades/greeks in one call.
-    # Alpaca's docs allow either snake_case or camelCase flags depending on
-    # the deployed API gateway, so include both to maximize compatibility.
-    include_flags = {
-        "include_greeks": "true",
-        "includeGreeks": "true",
-        "include_quotes": "true",
-        "includeQuotes": "true",
-        "include_quote": "true",
-        "includeQuote": "true",
-        "include_trades": "true",
-        "includeTrades": "true",
-        "include_trade": "true",
-        "includeTrade": "true",
-    }
-    params.update(include_flags)
 
     # ALPACA_OPTIONS_BASE_URL should normally be:
     #   https://paper-api.alpaca.markets/v2/options/contracts
@@ -448,6 +436,11 @@ def fetch_option_contracts(
         # Surface a clear error if the contracts endpoint itself fails
         message = f"Alpaca option contracts endpoint failed for {symbol.upper()}: {exc}"
         logger.warning(message)
+        logger.debug(
+            "Option contracts request debug -- url=%s params=%s",
+            base_url,
+            params,
+        )
         raise PriceDataError(message) from exc
 
     try:
@@ -490,6 +483,7 @@ def fetch_option_contracts(
         bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
         ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
         mark = _safe_float(contract.get("mark_price") or contract.get("mark"))
+        close = _safe_float(contract.get("close_price") or contract.get("close"))
 
         price: float | None = None
         if last is not None and last > 0:
@@ -498,6 +492,8 @@ def fetch_option_contracts(
             price = (bid + ask) / 2.0
         elif mark is not None and mark > 0:
             price = mark
+        elif close is not None and close > 0:
+            price = close
 
         if price is not None:
             contract["price"] = price
