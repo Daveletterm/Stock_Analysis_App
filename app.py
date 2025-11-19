@@ -2022,13 +2022,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 )
                                 allocation_warning_logged = True
                             break
-                        qty = max(1, int(target_notional // max(unit_cost, 1e-6)))
+                        qty = int(target_notional // max(unit_cost, 1e-6))
                         max_contracts = int(safe_float(strategy.get("max_contracts_per_trade"), 0))
                         if max_contracts:
                             qty = min(qty, max_contracts)
                         if qty <= 0:
                             summary_lines.append(
-                                f"Skip bearish {symbol}; size rounds to zero contracts."
+                                f"Skip bearish {symbol}; notional ${target_notional:.2f} too small for put cost ${unit_cost:.2f}."
                             )
                             continue
                         try:
