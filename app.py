@@ -2006,6 +2006,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 (symbol, score, "bearish") for symbol, score in bearish_candidates
             )
             combined_candidates.sort(key=lambda item: item[1], reverse=True)
+            evaluated_symbols = {symbol for symbol, _ in buy_candidates}.union(
+                {symbol for symbol, _ in bearish_candidates}
+            )
             max_positions = max(1, int(strategy.get("max_positions", 5)))
             available_slots = max(0, max_positions - len(current_positions))
             gross_notional = (
@@ -2013,6 +2016,18 @@ def run_autopilot_cycle(force: bool = False) -> None:
             )
 
             allocation_warning_logged = False
+
+            if asset_class == "option":
+                for rec in recs_snapshot:
+                    symbol = str(rec.get("Symbol", "")).upper()
+                    if not symbol or symbol in evaluated_symbols:
+                        continue
+                    reason = candidate_skip_reasons.get(
+                        symbol, "no entry, did not meet entry criteria"
+                    )
+                    logger.info(
+                        "Candidate %s: direction=none reason=%s", symbol, reason
+                    )
 
             for symbol, score, bias in combined_candidates:
                 if available_slots <= 0:
