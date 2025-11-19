@@ -1335,18 +1335,35 @@ def _autopilot_select_option_contract(
     diagnostics["evaluation_passes"] = [p["label"] for p in passes]
 
     final_rejections: Counter[str] = Counter()
+    relaxed_liquidity_flags: Counter[str] = Counter()
     best_choice: Optional[dict[str, Any]] = None
     best_score: Optional[tuple[float, float, float, float, float, float]] = None
     best_pass = None
     target_mid = (min_days + max_days) / 2.0
 
     for idx, pass_cfg in enumerate(passes, start=1):
+        pass_label = pass_cfg["label"]
         min_oi = min_open_interest_base
-        if min_oi:
-            min_oi = max(15, int(round(min_oi * pass_cfg["oi_scale"])))
         min_vol = min_volume_base
-        if min_vol:
-            min_vol = max(2, int(round(min_vol * pass_cfg["vol_scale"])))
+        if pass_label == "strict":
+            if min_oi:
+                # Even the strict pass should allow thinner markets when paper
+                # liquidity is sparse, but keep a modest floor.
+                min_oi = max(5, int(round(min_oi * pass_cfg["oi_scale"])))
+            if min_vol:
+                min_vol = max(1, int(round(min_vol * pass_cfg["vol_scale"])))
+        else:
+            # Alpaca's paper option chains often report zero volume/OI. On the
+            # relaxed pass allow requirements to scale all the way to zero so
+            # we can still consider contracts that meet every other risk check.
+            if min_oi is None:
+                min_oi = 0
+            else:
+                min_oi = max(0, int(round(min_oi * pass_cfg["oi_scale"])))
+            if min_vol is None:
+                min_vol = 0
+            else:
+                min_vol = max(0, int(round(min_vol * pass_cfg["vol_scale"])))
         spread_limit = max_spread_pct * pass_cfg["spread_scale"] if max_spread_pct else None
         if spread_limit:
             spread_limit = min(spread_limit, 0.9)
@@ -1366,10 +1383,24 @@ def _autopilot_select_option_contract(
             iv = metrics["iv"]
             premium_pct = metrics["premium_pct"]
 
-            if min_oi and (oi is None or oi < min_oi):
-                reasons.append("open_interest")
-            if min_vol and (vol is None or vol < min_vol):
-                reasons.append("volume")
+            oi_for_check = oi if oi is not None else (0 if pass_label == "relaxed" else None)
+            if min_oi and (oi_for_check is None or oi_for_check < min_oi):
+                if pass_label == "strict":
+                    reasons.append("open_interest")
+                else:
+                    # Track that the relaxed pass tolerated thin liquidity so
+                    # diagnostics still reflect the weaker tape, but do not
+                    # let this be a hard rejection for paper trading.
+                    relaxed_liquidity_flags["open_interest"] += 1
+            vol_for_check = vol if vol is not None else (0 if pass_label == "relaxed" else None)
+            if min_vol and (vol_for_check is None or vol_for_check < min_vol):
+                if pass_label == "strict":
+                    reasons.append("volume")
+                else:
+                    # Same idea for reported volume: log it but keep the
+                    # contract in the running when every other risk test
+                    # passes.
+                    relaxed_liquidity_flags["volume"] += 1
             if spread_limit and (spread_pct is None or spread_pct > spread_limit):
                 reasons.append("bid_ask_spread")
             if min_delta_pass is not None and delta_abs is not None and delta_abs < min_delta_pass:
@@ -1410,6 +1441,8 @@ def _autopilot_select_option_contract(
             break
 
     diagnostics["final_rejections"] = dict(final_rejections)
+    if relaxed_liquidity_flags:
+        diagnostics["relaxed_liquidity_flags"] = dict(relaxed_liquidity_flags)
 
     if not best_choice:
         return OptionSelection(None, None, None, diagnostics)
