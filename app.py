@@ -62,7 +62,7 @@ except ImportError:
 # Paper trading configuration
 paper_broker = AlpacaPaperBroker()
 PAPER_MAX_POSITION_PCT = float(os.getenv("PAPER_MAX_POSITION_PCT", "0.1"))
-PAPER_MAX_POSITION_NOTIONAL = float(os.getenv("PAPER_MAX_POSITION_NOTIONAL", "5000"))
+PAPER_MAX_POSITION_NOTIONAL = float(os.getenv("PAPER_MAX_POSITION_NOTIONAL", "8000"))
 PAPER_DEFAULT_STOP_LOSS_PCT = float(os.getenv("PAPER_STOP_LOSS_PCT", "0.05"))
 PAPER_DEFAULT_TAKE_PROFIT_PCT = float(os.getenv("PAPER_TAKE_PROFIT_PCT", "0.1"))
 
@@ -1671,17 +1671,30 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     market_price = safe_float(
                         pos.get("current_price"), safe_float(pos.get("market_price"), None)
                     )
+                    avg_entry_price = safe_float(pos.get("avg_entry_price"), None)
+                    # Alpaca's paper API rejects market exits when no NBBO quote exists,
+                    # so synthesize a conservative limit using whatever reference price
+                    # we have to keep the order accepted and resting on the book.
+                    price_hint = market_price or avg_entry_price
+                    limit_price = None
+                    if market_price and market_price > 0:
+                        limit_price = round(max(market_price * 0.98, 0.01), 2)
+                    elif avg_entry_price and avg_entry_price > 0:
+                        limit_price = round(max(avg_entry_price * 0.5, 0.01), 2)
+                    order_type = "limit" if limit_price else "market"
+                    price_hint = price_hint if (price_hint and price_hint > 0) else limit_price
                     try:
                         place_guarded_paper_order(
                             contract_symbol,
                             qty,
                             "sell",
-                            order_type="market",
+                            order_type=order_type,
+                            limit_price=limit_price,
                             stop_loss_pct=None,
                             take_profit_pct=None,
                             time_in_force="day",
                             asset_class="option",
-                            price_hint=market_price,
+                            price_hint=price_hint,
                             support_brackets=False,
                         )
                         orders_placed += 1

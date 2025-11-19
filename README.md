@@ -84,7 +84,7 @@ recommendations start automatically when the Flask app boots.
 ### Paper trading guardrails
 
 - Set `PAPER_MAX_POSITION_PCT` (default `0.10`) to cap each order at a percentage of account equity.
-- Set `PAPER_MAX_POSITION_NOTIONAL` (default `5000`) to limit the absolute notional per order.
+- Set `PAPER_MAX_POSITION_NOTIONAL` (default `8000`) to limit the absolute notional per order.
 - Adjust `PAPER_STOP_LOSS_PCT` and `PAPER_TAKE_PROFIT_PCT` (defaults `0.05` and `0.10`) to control
   the protective bracket that wraps buy orders.
 - API endpoints under `/api/paper/*` expose account, positions, orders, and allow programmatic order
