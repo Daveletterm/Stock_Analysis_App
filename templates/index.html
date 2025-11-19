@@ -183,6 +183,7 @@
       </section>
 
       <h3 class="h5 mt-4">Top 5 Stock Picks</h3>
+      <p id="rec-status" class="text-muted small">{{ rec_status.message if rec_status else '' }}</p>
       <ul id="recs" class="list-group mb-4"></ul>
     </div>
 
@@ -223,6 +224,7 @@ let refreshCharts = () => {};
   // Pre-serialized JSON from app.py
   const r        = {{ result_json | default('{}') | safe }};
   const recsData = {{ recommendations_json | default('[]') | safe }};
+  const recStatusData = {{ rec_status | default({}) | tojson | safe }};
 
   const isDarkMode = () => document.documentElement.classList.contains('dark-mode');
   const axisColor = () => isDarkMode() ? '#e9ecef' : '#212529';
@@ -272,6 +274,7 @@ let refreshCharts = () => {};
 
   // ----- Recommendations (single declaration) -----
   const recsUl = document.getElementById('recs');
+  const recStatusEl = document.getElementById('rec-status');
   const renderRecs = (list) => {
     const items = Array.isArray(list) ? list : [];
     recsUl.innerHTML = items.map(item => {
@@ -284,6 +287,9 @@ let refreshCharts = () => {};
     }).join('');
   };
   renderRecs(recsData);
+  if (recStatusEl && recStatusData && recStatusData.message) {
+    recStatusEl.textContent = recStatusData.message;
+  }
 
   // ----- Charts -----
   const chartDiv = document.getElementById('chart');
@@ -338,8 +344,14 @@ let refreshCharts = () => {};
         const json = await res.json();
         const list = (json && json.ok && Array.isArray(json.data)) ? json.data : [];
         renderRecs(list);
+        if (recStatusEl && json && json.status && json.status.message) {
+          recStatusEl.textContent = json.status.message;
+        }
       } catch (err) {
         console.error('Failed to refresh recommendations', err);
+        if (recStatusEl) {
+          recStatusEl.textContent = 'Refresh failed; showing last known recommendations.';
+        }
       } finally {
         if (recsBtn) {
           recsBtn.disabled = false;
