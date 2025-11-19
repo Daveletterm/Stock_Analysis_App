@@ -193,8 +193,11 @@ AUTOPILOT_RISK_LEVELS = {
     },
 }
 
+AUTOPILOT_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "autopilot_state.json")
+
 _autopilot_state = {
     "enabled": False,
+    "paused": False,
     "strategy": "balanced",
     "risk": "medium",
     "last_run": None,
@@ -203,6 +206,52 @@ _autopilot_state = {
 }
 _autopilot_lock = threading.Lock()
 _autopilot_runtime_lock = threading.Lock()
+
+
+def _load_autopilot_state() -> None:
+    """Load persisted autopilot settings if present."""
+
+    if not os.path.exists(AUTOPILOT_CONFIG_FILE):
+        return
+
+    try:
+        with open(AUTOPILOT_CONFIG_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception as exc:  # pragma: no cover - best-effort restore
+        logger.warning("Failed to load autopilot config: %s", exc)
+        return
+
+    if not isinstance(saved, dict):
+        return
+
+    with _autopilot_lock:
+        for key in ("enabled", "paused"):
+            if key in saved:
+                _autopilot_state[key] = bool(saved.get(key))
+        for key in ("strategy", "risk"):
+            if key in saved and isinstance(saved.get(key), str):
+                _autopilot_state[key] = str(saved.get(key))
+
+
+def _persist_autopilot_state() -> None:
+    """Persist the current autopilot settings to disk."""
+
+    with _autopilot_lock:
+        payload = {
+            "enabled": bool(_autopilot_state.get("enabled")),
+            "paused": bool(_autopilot_state.get("paused")),
+            "strategy": _autopilot_state.get("strategy"),
+            "risk": _autopilot_state.get("risk"),
+        }
+
+    try:  # pragma: no cover - minimal persistence wrapper
+        with open(AUTOPILOT_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as exc:
+        logger.warning("Failed to persist autopilot config: %s", exc)
+
+
+_load_autopilot_state()
 
 # -----------------------------
 # Sentiment stubs (no external calls for now)
@@ -835,6 +884,7 @@ def get_autopilot_status() -> dict:
         snapshot["last_run"] = last_run.isoformat(timespec="seconds")
     snapshot.setdefault("strategy", "balanced")
     snapshot.setdefault("risk", "medium")
+    snapshot.setdefault("paused", False)
     actions = snapshot.get("last_actions")
     if isinstance(actions, list):
         snapshot["last_actions"] = actions
@@ -845,14 +895,21 @@ def get_autopilot_status() -> dict:
     return snapshot
 
 
-def update_autopilot_config(*, enabled: bool | None = None, strategy: str | None = None, risk: str | None = None) -> dict:
+def update_autopilot_config(
+    *, enabled: bool | None = None, paused: bool | None = None, strategy: str | None = None, risk: str | None = None
+) -> dict:
     with _autopilot_lock:
         if enabled is not None:
             _autopilot_state["enabled"] = bool(enabled)
+            if paused is None:
+                _autopilot_state["paused"] = not bool(enabled)
+        if paused is not None:
+            _autopilot_state["paused"] = bool(paused)
         if strategy and strategy in AUTOPILOT_STRATEGIES:
             _autopilot_state["strategy"] = strategy
         if risk and risk in AUTOPILOT_RISK_LEVELS:
             _autopilot_state["risk"] = risk
+    _persist_autopilot_state()
     return get_autopilot_status()
 
 
@@ -1220,16 +1277,16 @@ def run_autopilot_cycle(force: bool = False) -> None:
     summary_lines: list[str] = []
     errors: list[str] = []
     try:
-        prerequisites_met = True
-        if not paper_broker.enabled:
-            summary_lines.append("Paper trading disabled; autopilot idle.")
-            prerequisites_met = False
-
         with _autopilot_lock:
             config = dict(_autopilot_state)
 
-        if prerequisites_met and not config.get("enabled"):
+        if config.get("enabled") is False or config.get("paused") is True:
             summary_lines.append("Autopilot is paused.")
+            return
+
+        prerequisites_met = True
+        if not paper_broker.enabled:
+            summary_lines.append("Paper trading disabled; autopilot idle.")
             prerequisites_met = False
 
         strategy: dict[str, Any] = {}
@@ -2296,10 +2353,21 @@ def api_paper_autopilot():
     elif enabled is not None:
         enabled = bool(enabled)
 
+    paused = payload.get("paused")
+    if isinstance(paused, str):
+        paused = paused.lower() in {"true", "1", "yes", "on"}
+    elif paused is not None:
+        paused = bool(paused)
+
     strategy = payload.get("strategy")
     risk = payload.get("risk")
 
-    status = update_autopilot_config(enabled=enabled, strategy=strategy, risk=risk)
+    status = update_autopilot_config(
+        enabled=enabled,
+        paused=paused,
+        strategy=strategy,
+        risk=risk,
+    )
     if status.get("enabled") and paper_broker.enabled:
         trigger_autopilot_run(force=True)
     return jsonify({"ok": True, "data": status})

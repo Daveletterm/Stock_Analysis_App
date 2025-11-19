@@ -3,4 +3,5 @@ __pycache__/
 .env
 venv/
 paper_credentials.json
+autopilot_state.json
 .DS_Store
