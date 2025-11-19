@@ -1237,16 +1237,15 @@ def _autopilot_select_option_contract(
     total_priced_contracts = sum(priced_counts.values())
     diagnostics["total_contracts"] = total_contracts
     diagnostics["total_priced_contracts"] = total_priced_contracts
+    logger.info(
+        "Option chain summary for %s: %d total contracts (%d priced)",
+        symbol.upper(),
+        total_contracts,
+        total_priced_contracts,
+    )
     if total_contracts == 0:
         diagnostics["base_rejections"] = {"empty_chain": len(contract_types)}
         return OptionSelection(None, None, None, diagnostics)
-
-    logger.info(
-        "Using %d priced option contracts out of %d total for %s",
-        total_priced_contracts,
-        total_contracts,
-        symbol.upper(),
-    )
 
     base_rejections: Counter[str] = Counter()
     candidates: list[dict[str, Any]] = []
@@ -1313,6 +1312,11 @@ def _autopilot_select_option_contract(
     diagnostics["candidates_considered"] = len(candidates)
 
     if not candidates:
+        logger.warning(
+            "Option selection aborted for %s: no candidates with usable prices (%s)",
+            symbol.upper(),
+            diagnostics.get("base_rejections"),
+        )
         return OptionSelection(None, None, None, diagnostics)
 
     passes = [
@@ -1795,6 +1799,17 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         if rejection_counts:
                             for reason, count in rejection_counts.most_common(3):
                                 reason_bits.append(f"{reason}:{count}")
+                        if reason_bits:
+                            logger.warning(
+                                "Option selection rejected %s: %s",
+                                symbol.upper(),
+                                ", ".join(reason_bits),
+                            )
+                        else:
+                            logger.warning(
+                                "Option selection rejected %s: no priced contracts",
+                                symbol.upper(),
+                            )
                         summary_lines.append(
                             "No option contracts matched filters for {}.{}".format(
                                 symbol,
@@ -1851,6 +1866,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             pending_underlyings.add(parsed["underlying"])
                         summary_lines.append(
                             f"Buy {qty} {contract_symbol} ({symbol} {parsed.get('type', 'call')} {parsed.get('strike', 0):.2f} exp {parsed.get('expiration')}, premium ${premium:.2f})"
+                        )
+                        logger.info(
+                            "Autopilot option entry: %s qty=%d premium=%.2f notional=%.2f",
+                            contract_symbol,
+                            qty,
+                            premium,
+                            qty * unit_cost,
                         )
                         orders_placed += 1
                     except Exception as exc:
