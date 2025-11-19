@@ -1121,14 +1121,7 @@ def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | Non
 
 
 def run_autopilot_cycle(force: bool = False) -> None:
-    if not paper_broker.enabled:
-        return
-
-    with _autopilot_lock:
-        config = dict(_autopilot_state)
-
-    if not config.get("enabled"):
-        return
+    logger.info("Autopilot cycle starting%s", " (forced)" if force else "")
 
     if not _autopilot_runtime_lock.acquire(blocking=force):
         logger.debug("Autopilot cycle skipped; previous cycle still running")
@@ -1137,6 +1130,17 @@ def run_autopilot_cycle(force: bool = False) -> None:
     summary_lines: list[str] = []
     errors: list[str] = []
     try:
+        if not paper_broker.enabled:
+            summary_lines.append("Paper trading disabled; autopilot idle.")
+            return
+
+        with _autopilot_lock:
+            config = dict(_autopilot_state)
+
+        if not config.get("enabled"):
+            summary_lines.append("Autopilot is paused.")
+            return
+
         strategy_key = config.get("strategy", "balanced")
         risk_key = config.get("risk", "medium")
         strategy = AUTOPILOT_STRATEGIES.get(strategy_key, AUTOPILOT_STRATEGIES["balanced"])
