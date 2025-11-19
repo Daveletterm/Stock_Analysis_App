@@ -365,6 +365,23 @@ def fetch_option_contracts(
         # "call" or "put"
         params["type"] = option_type.lower()
 
+    # Request the rich payload so we get quotes/trades/greeks in one call.
+    # Alpaca's docs allow either snake_case or camelCase flags depending on
+    # the deployed API gateway, so include both to maximize compatibility.
+    include_flags = {
+        "include_greeks": "true",
+        "includeGreeks": "true",
+        "include_quotes": "true",
+        "includeQuotes": "true",
+        "include_quote": "true",
+        "includeQuote": "true",
+        "include_trades": "true",
+        "includeTrades": "true",
+        "include_trade": "true",
+        "includeTrade": "true",
+    }
+    params.update(include_flags)
+
     # ALPACA_OPTIONS_BASE_URL should normally be:
     #   https://paper-api.alpaca.markets/v2/options/contracts
     # Use it as-is and do NOT append any /options/chain style paths.
@@ -413,6 +430,7 @@ def fetch_option_contracts(
         return []
 
     normalized: List[dict] = []
+    priced_contracts = 0
     for contract in options:
         if not isinstance(contract, dict):
             continue
@@ -436,14 +454,16 @@ def fetch_option_contracts(
             contract["price"] = price
             if mark is None:
                 contract.setdefault("mark_price", price)
+            priced_contracts += 1
 
         normalized.append(contract)
 
     logger.info(
-        "Fetched %d option contracts for %s via %s",
+        "Fetched %d option contracts for %s via %s (%d priced)",
         len(normalized),
         symbol.upper(),
         response.url,
+        priced_contracts,
     )
 
     return normalized
