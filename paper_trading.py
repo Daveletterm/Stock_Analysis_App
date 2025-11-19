@@ -21,6 +21,12 @@ class NoAvailableBidError(AlpacaAPIError):
 
     code = "no_available_bid"
 
+
+class OptionCloseRejectedError(AlpacaAPIError):
+    """Raised when Alpaca rejects a closing option trade as uncovered."""
+
+    code = "option_close_rejected"
+
 import requests
 
 logger = logging.getLogger("paper_trading")
@@ -134,6 +140,20 @@ class AlpacaPaperBroker:
                 and "no available bid for symbol" in message
             ):
                 raise NoAvailableBidError(exc.status_code, exc.api_message, payload=exc.payload) from exc
+            if (
+                side == "sell"
+                and asset_class == "option"
+                and exc.status_code == 403
+                and "uncovered option" in message
+            ):
+                logger.warning(
+                    "Option close rejected for %s: %s",
+                    payload.get("symbol", "unknown"),
+                    exc.api_message,
+                )
+                raise OptionCloseRejectedError(
+                    exc.status_code, exc.api_message, payload=exc.payload
+                ) from exc
             raise
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:

@@ -22,7 +22,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
-from paper_trading import AlpacaPaperBroker, NoAvailableBidError
+from paper_trading import AlpacaPaperBroker, NoAvailableBidError, OptionCloseRejectedError
 from market_data import PriceDataError
 from market_data import fetch_option_contracts
 from market_data import get_price_history as load_price_history
@@ -963,6 +963,7 @@ def place_guarded_paper_order(
     asset_class: str | None = None,
     price_hint: float | None = None,
     support_brackets: bool = True,
+    position_effect: str | None = None,
 ):
     if not paper_broker.enabled:
         raise RuntimeError("Paper trading credentials are not configured")
@@ -1021,6 +1022,8 @@ def place_guarded_paper_order(
         payload["limit_price"] = round(float(limit_price), 2)
     if asset_class:
         payload["asset_class"] = asset_class
+    if position_effect:
+        payload["position_effect"] = position_effect
 
     if side == "buy" and support_brackets and not is_option:
         stop_loss_pct = PAPER_DEFAULT_STOP_LOSS_PCT if stop_loss_pct is None else max(stop_loss_pct, 0.0)
@@ -1105,6 +1108,31 @@ def _autopilot_order_blocked(symbol: str, open_orders: list[dict]) -> bool:
         except Exception:
             continue
     return False
+
+
+def _option_position_quantity(position: dict[str, Any] | None) -> int:
+    if not position:
+        return 0
+    qty = safe_float(position.get("qty"), safe_float(position.get("quantity"), 0.0))
+    return int(abs(qty))
+
+
+def _find_option_position(symbol: str, positions_snapshot: list[dict[str, Any]]) -> dict[str, Any] | None:
+    target = symbol.replace(" ", "").upper()
+    for pos in positions_snapshot:
+        try:
+            if str(pos.get("symbol", "")).replace(" ", "").upper() != target:
+                continue
+            asset = str(pos.get("asset_class", "")).lower()
+            if "option" not in asset:
+                continue
+            qty = _option_position_quantity(pos)
+            if qty <= 0:
+                continue
+            return pos
+        except Exception:
+            continue
+    return None
 
 
 def _autopilot_select_option_contract(
@@ -1634,10 +1662,43 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 expiry_buffer = max(0, int(safe_float(strategy.get("options_expiry_buffer"), 5)))
 
                 for contract_symbol, entry in current_positions.items():
-                    pos = entry["position"]
+                    pos = entry.get("position")
                     qty = int(abs(entry.get("qty", 0)))
-                    if qty < 1:
+                    available_qty = max(qty, _option_position_quantity(pos))
+                    if available_qty <= 0:
+                        refreshed = _find_option_position(contract_symbol, positions)
+                        if not refreshed:
+                            try:
+                                positions = list(paper_broker.get_positions())
+                            except Exception as refresh_exc:
+                                logger.warning(
+                                    "Skip exit for %s: failed to refresh positions (%s)",
+                                    contract_symbol,
+                                    refresh_exc,
+                                )
+                                summary_lines.append(
+                                    f"Skip exit for {contract_symbol}; unable to confirm position."
+                                )
+                                continue
+                            refreshed = _find_option_position(contract_symbol, positions)
+                        if refreshed:
+                            entry["position"] = refreshed
+                            available_qty = _option_position_quantity(refreshed)
+                            entry["qty"] = available_qty
+                    if available_qty <= 0:
+                        logger.warning("Skip exit for %s: no matching position found", contract_symbol)
+                        summary_lines.append(
+                            f"Skip exit for {contract_symbol}; no matching position found."
+                        )
                         continue
+                    if qty <= 0:
+                        qty = available_qty
+                    if qty > available_qty:
+                        logger.info(
+                            "Clamping exit qty for %s to %d from %d", contract_symbol, available_qty, qty
+                        )
+                        qty = available_qty
+                    pos = entry.get("position") or {}
                     parsed = entry.get("meta") or parse_option_symbol(contract_symbol)
                     underlying = parsed.get("underlying") if parsed else None
                     reasons: list[str] = []
@@ -1702,6 +1763,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             asset_class="option",
                             price_hint=price_hint,
                             support_brackets=False,
+                            position_effect="close",
                         )
                         orders_placed += 1
                         summary_lines.append(
@@ -1713,6 +1775,12 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         )
                         logger.info(postpone_msg)
                         summary_lines.append(postpone_msg)
+                    except OptionCloseRejectedError as exc:
+                        warning = (
+                            f"Exit for {contract_symbol} rejected: {exc.api_message or exc}"
+                        )
+                        logger.warning(warning)
+                        summary_lines.append(warning)
                     except Exception as exc:
                         logger.exception("Autopilot option exit failed for %s", contract_symbol)
                         errors.append(f"sell {contract_symbol} failed: {exc}")
