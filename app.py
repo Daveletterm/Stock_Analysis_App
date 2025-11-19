@@ -1931,28 +1931,55 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 except Exception:
                     continue
 
+            min_entry_score = strategy.get("min_score", 3.0)
             buy_candidates: list[tuple[str, float]] = []
             bearish_candidates: list[tuple[str, float]] = []
-            candidate_skip_reasons: dict[str, str] = {}
-            min_score = strategy.get("min_score", 3.0)
+            logged_candidates: set[str] = set()
+
+            def _log_filtered_candidate(symbol: str, score: float | None, reason: str) -> None:
+                if not symbol or symbol in logged_candidates:
+                    return
+                score_fragment = f"{score:.2f}" if isinstance(score, (int, float)) else "n/a"
+                logger.info(
+                    "Candidate %s: direction=%s reason=%s score=%s bullish_considered=%s bearish_considered=%s",
+                    symbol,
+                    "none",
+                    reason,
+                    score_fragment,
+                    False,
+                    False,
+                )
+                logged_candidates.add(symbol)
             for rec in recs_snapshot:
                 symbol = str(rec.get("Symbol", "")).upper()
                 if not symbol:
                     continue
                 score = safe_float(rec.get("Score"))
                 if score is None:
-                    candidate_skip_reasons[symbol] = "no score available"
+                    _log_filtered_candidate(symbol, score, "no entry, missing score")
                     continue
-                if score < min_score:
-                    candidate_skip_reasons[symbol] = f"score {score:.2f} below min {min_score:.2f}"
+                if score < min_entry_score:
+                    _log_filtered_candidate(
+                        symbol,
+                        score,
+                        f"no entry, score {score:.2f} below min {min_entry_score:.2f}",
+                    )
                     continue
                 if asset_class == "option":
                     if symbol in pending_underlyings:
-                        candidate_skip_reasons[symbol] = "order already pending for underlying"
+                        _log_filtered_candidate(
+                            symbol,
+                            score,
+                            "no entry, order already pending for underlying",
+                        )
                         continue
                 else:
                     if symbol in held_and_pending:
-                        candidate_skip_reasons[symbol] = "position or pending order already open"
+                        _log_filtered_candidate(
+                            symbol,
+                            score,
+                            "no entry, already have open position or pending order",
+                        )
                         continue
                 buy_candidates.append((symbol, score))
 
@@ -2029,6 +2056,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     )
                     # Prevent duplicate logs if finalize called multiple times defensively
                     candidate_logged = True
+                    logged_candidates.add(symbol)
 
                 if asset_class == "option":
                     if bias == "bearish":
@@ -2416,6 +2444,23 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 if not candidate_logged:
                     set_candidate_outcome("no entry, evaluation complete", "none")
                     finalize_candidate_log()
+
+            for rec in recs_snapshot:
+                symbol = str(rec.get("Symbol", "")).upper()
+                if not symbol or symbol in logged_candidates:
+                    continue
+                score = safe_float(rec.get("Score"))
+                score_fragment = f"{score:.2f}" if isinstance(score, (int, float)) else "n/a"
+                logger.info(
+                    "Candidate %s: direction=%s reason=%s score=%s bullish_considered=%s bearish_considered=%s",
+                    symbol,
+                    "none",
+                    "no entry, filtered before evaluation",
+                    score_fragment,
+                    False,
+                    False,
+                )
+                logged_candidates.add(symbol)
 
             if not summary_lines:
                 summary_lines.append("Cycle complete with no trades.")
