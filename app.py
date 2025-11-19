@@ -5,6 +5,7 @@ import json
 import random
 import threading
 import logging
+import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
@@ -35,6 +36,9 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "supersecret")
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
+
+BASE_DIR = os.path.dirname(__file__)
+DB_PATH = os.path.join(BASE_DIR, "appdata.sqlite3")
 
 # Logging
 logging.basicConfig(
@@ -70,8 +74,10 @@ _sp500 = {"tickers": [], "updated": datetime.min}
 _price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = {}
 PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations = []
+_rec_state = {"refreshing": False, "last_completed": None, "last_error": None}
 _background_jobs_started = False
 _background_jobs_lock = threading.Lock()
+_scheduler: BackgroundScheduler | None = None
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
@@ -206,6 +212,117 @@ _autopilot_state = {
 }
 _autopilot_lock = threading.Lock()
 _autopilot_runtime_lock = threading.Lock()
+_autopilot_last_run: dict[str, Any] | None = None
+
+
+def _get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db() -> None:
+    try:
+        conn = _get_db_connection()
+        with conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS recommendation_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS autopilot_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at TEXT NOT NULL,
+                    success INTEGER NOT NULL,
+                    summary TEXT,
+                    error TEXT
+                );
+                """
+            )
+    except Exception:
+        logger.exception("Failed to initialize local sqlite cache")
+
+
+def _load_latest_recommendations_from_db() -> None:
+    try:
+        conn = _get_db_connection()
+        cur = conn.execute(
+            "SELECT payload, created_at FROM recommendation_snapshots ORDER BY created_at DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        payload = json.loads(row["payload"])
+        created_at = row["created_at"]
+        with _lock:
+            if isinstance(payload, list):
+                _recommendations.clear()
+                _recommendations.extend(payload)
+            _rec_state["last_completed"] = datetime.fromisoformat(created_at)
+            _rec_state["last_error"] = None
+        logger.info("Loaded cached recommendations snapshot from %s", created_at)
+    except Exception:
+        logger.exception("Failed to load cached recommendations from sqlite")
+
+
+def _record_recommendations_snapshot(recs: list[dict[str, Any]]) -> None:
+    try:
+        conn = _get_db_connection()
+        with conn:
+            conn.execute(
+                "INSERT INTO recommendation_snapshots (created_at, payload) VALUES (?, ?)",
+                (datetime.now().isoformat(), json.dumps(to_plain(recs))),
+            )
+    except Exception:
+        logger.exception("Failed to persist recommendation snapshot")
+
+
+def _load_last_autopilot_run() -> None:
+    global _autopilot_last_run
+    try:
+        conn = _get_db_connection()
+        cur = conn.execute(
+            "SELECT run_at, success, summary, error FROM autopilot_runs ORDER BY run_at DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        _autopilot_last_run = {
+            "run_at": datetime.fromisoformat(row["run_at"]),
+            "success": bool(row["success"]),
+            "summary": row["summary"],
+            "error": row["error"],
+        }
+        with _autopilot_lock:
+            _autopilot_state["last_run"] = _autopilot_last_run["run_at"]
+            _autopilot_state["last_actions"] = [row["summary"]] if row["summary"] else []
+            _autopilot_state["last_error"] = row["error"]
+        logger.info("Loaded last autopilot run from %s", row["run_at"])
+    except Exception:
+        logger.exception("Failed to load last autopilot run from sqlite")
+
+
+def _record_autopilot_run(success: bool, summary: str | None, error: str | None) -> None:
+    global _autopilot_last_run
+    run_at = datetime.now()
+    _autopilot_last_run = {
+        "run_at": run_at,
+        "success": success,
+        "summary": summary,
+        "error": error,
+    }
+    try:
+        conn = _get_db_connection()
+        with conn:
+            conn.execute(
+                "INSERT INTO autopilot_runs (run_at, success, summary, error) VALUES (?, ?, ?, ?)",
+                (run_at.isoformat(), int(success), summary, error),
+            )
+    except Exception:
+        logger.exception("Failed to persist autopilot run")
 
 
 def _load_autopilot_state() -> None:
@@ -251,6 +368,9 @@ def _persist_autopilot_state() -> None:
         logger.warning("Failed to persist autopilot config: %s", exc)
 
 
+_init_db()
+_load_latest_recommendations_from_db()
+_load_last_autopilot_run()
 _load_autopilot_state()
 
 # -----------------------------
@@ -283,6 +403,35 @@ def _fallback_recommendations(reason: str | None = None) -> list[dict[str, Any]]
         }
         for sym in FALLBACK_TICKERS[:5]
     ]
+
+
+def _format_recommendation_status(recs: list[dict[str, Any]], state: dict[str, Any]) -> dict[str, Any]:
+    last_completed = state.get("last_completed")
+    if isinstance(last_completed, datetime):
+        last_completed_str = last_completed.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        last_completed_str = None
+
+    refreshing = bool(state.get("refreshing"))
+    last_error = state.get("last_error")
+
+    if not recs:
+        message = "No completed scans yet; first-time refresh can take a few minutes."
+    elif refreshing:
+        when = f" from {last_completed_str}" if last_completed_str else ""
+        message = f"Refreshing in the background; showing last completed scan{when}."
+    else:
+        when = f" from {last_completed_str}" if last_completed_str else ""
+        message = f"Showing latest recommendations{when}."
+    if last_error:
+        message += f" Last refresh error: {last_error}."
+
+    return {
+        "refreshing": refreshing,
+        "last_completed": last_completed_str,
+        "last_error": last_error,
+        "message": message,
+    }
 # -----------------------------
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -903,6 +1052,10 @@ def get_autopilot_status() -> dict:
     last_run = snapshot.get("last_run")
     if isinstance(last_run, datetime):
         snapshot["last_run"] = last_run.isoformat(timespec="seconds")
+    if _autopilot_last_run:
+        snapshot["last_run_summary"] = _autopilot_last_run.get("summary")
+        snapshot["last_run_error"] = _autopilot_last_run.get("error")
+        snapshot["last_run_success"] = bool(_autopilot_last_run.get("success"))
     snapshot.setdefault("strategy", "balanced")
     snapshot.setdefault("risk", "medium")
     snapshot.setdefault("paused", False)
@@ -1303,9 +1456,18 @@ def run_autopilot_cycle(force: bool = False) -> None:
 
     summary_lines: list[str] = []
     errors: list[str] = []
+    orders_placed = 0
+    candidate_count = 0
     try:
         with _autopilot_lock:
             config = dict(_autopilot_state)
+        logger.info(
+            "Autopilot config loaded: enabled=%s paused=%s strategy=%s risk=%s",
+            config.get("enabled"),
+            config.get("paused"),
+            config.get("strategy"),
+            config.get("risk"),
+        )
 
         if config.get("enabled") is False or config.get("paused") is True:
             summary_lines.append("Autopilot is paused.")
@@ -1331,22 +1493,30 @@ def run_autopilot_cycle(force: bool = False) -> None:
             risk_cfg = AUTOPILOT_RISK_LEVELS.get(risk_key, AUTOPILOT_RISK_LEVELS["medium"])
             asset_class = _strategy_asset_class(strategy)
 
-            account = paper_broker.get_account()
-            equity = safe_float(account.get("equity"), safe_float(account.get("cash")))
-            if equity <= 0:
-                summary_lines.append("Account equity unavailable; skipping cycle.")
+            try:
+                account = paper_broker.get_account()
+            except Exception as exc:
+                logger.exception("Autopilot failed to fetch account")
+                errors.append(f"account error: {exc}")
                 prerequisites_met = False
+            else:
+                equity = safe_float(account.get("equity"), safe_float(account.get("cash")))
+                if equity <= 0:
+                    summary_lines.append("Account equity unavailable; skipping cycle.")
+                    prerequisites_met = False
 
         if prerequisites_met:
             try:
                 positions = list(paper_broker.get_positions())
             except Exception as exc:
+                logger.exception("Autopilot failed to fetch positions")
                 errors.append(f"positions error: {exc}")
                 positions = []
 
             try:
                 open_orders = list(paper_broker.list_orders(status="open", limit=200))
             except Exception as exc:
+                logger.exception("Autopilot failed to fetch open orders")
                 errors.append(f"orders error: {exc}")
                 open_orders = []
 
@@ -1390,6 +1560,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 seek_recommendations()
                 with _lock:
                     recs_snapshot = [dict(r) for r in _recommendations]
+            candidate_count = len(recs_snapshot)
+            logger.info("Autopilot evaluating %d recommendation candidates", candidate_count)
 
             position_multiplier = max(risk_cfg.get("position_multiplier", 1.0), 0.25)
             stop_loss_multiplier = max(risk_cfg.get("stop_loss_multiplier", 1.0), 0.25)
@@ -1466,10 +1638,12 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             price_hint=market_price,
                             support_brackets=False,
                         )
+                        orders_placed += 1
                         summary_lines.append(
                             f"Exit {qty} {contract_symbol} ({'; '.join(reasons)})"
                         )
                     except Exception as exc:
+                        logger.exception("Autopilot option exit failed for %s", contract_symbol)
                         errors.append(f"sell {contract_symbol} failed: {exc}")
             else:
                 for symbol, entry in current_positions.items():
@@ -1496,7 +1670,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             summary_lines.append(
                                 f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
                             )
+                            orders_placed += 1
                         except Exception as exc:
+                            logger.exception("Autopilot equity exit failed for %s", symbol)
                             errors.append(f"sell {symbol} failed: {exc}")
 
             held_and_pending = set(current_positions.keys())
@@ -1557,6 +1733,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     try:
                         spot_price = fetch_latest_price(symbol)
                     except Exception as exc:
+                        logger.exception("Autopilot price fetch failed for %s", symbol)
                         errors.append(f"price {symbol} failed: {exc}")
                         continue
                     try:
@@ -1675,7 +1852,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         summary_lines.append(
                             f"Buy {qty} {contract_symbol} ({symbol} {parsed.get('type', 'call')} {parsed.get('strike', 0):.2f} exp {parsed.get('expiration')}, premium ${premium:.2f})"
                         )
+                        orders_placed += 1
                     except Exception as exc:
+                        logger.exception("Autopilot option entry failed for %s", contract_symbol)
                         errors.append(f"buy {contract_symbol} failed: {exc}")
                 else:
                     if _autopilot_order_blocked(symbol, open_orders):
@@ -1683,6 +1862,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     try:
                         price = fetch_latest_price(symbol)
                     except Exception as exc:
+                        logger.exception("Autopilot price fetch failed for %s", symbol)
                         errors.append(f"price {symbol} failed: {exc}")
                         continue
                     notional_cap_pct = min(max_position_pct, max_total_allocation)
@@ -1720,7 +1900,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         summary_lines.append(
                             f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
                         )
+                        orders_placed += 1
                     except Exception as exc:
+                        logger.exception("Autopilot equity entry failed for %s", symbol)
                         errors.append(f"buy {symbol} failed: {exc}")
 
             if not summary_lines:
@@ -1731,9 +1913,19 @@ def run_autopilot_cycle(force: bool = False) -> None:
     finally:
         with _autopilot_lock:
             _autopilot_state["last_run"] = datetime.now()
-            _autopilot_state["last_actions"] = summary_lines
+            _autopilot_state["last_actions"] = summary_lines or ["Cycle complete with no trades."]
             _autopilot_state["last_error"] = "; ".join(errors) if errors else None
         _autopilot_runtime_lock.release()
+
+        summary_text = " | ".join(summary_lines) if summary_lines else "Cycle complete with no trades."
+        error_text = "; ".join(errors) if errors else None
+        _record_autopilot_run(not errors, summary_text, error_text)
+        logger.info(
+            "Autopilot cycle finished; candidates=%d, orders=%d, errors=%d",
+            candidate_count,
+            orders_placed,
+            len(errors),
+        )
 
         if errors:
             logger.warning("Autopilot cycle completed with errors: %s", "; ".join(errors))
@@ -1933,93 +2125,153 @@ def fast_filter_ticker(ticker: str) -> bool:
 def seek_recommendations() -> None:
     global _recommendations
     logger.info("Refreshing recommendations…")
-    update_sp500()
     with _lock:
-        tickers = _sp500["tickers"][:]
+        _rec_state["refreshing"] = True
+        _rec_state["last_error"] = None
 
-    if not tickers:
-        fallback_env = os.getenv("FALLBACK_TICKERS", "")
-        fallback_cfg = [t.strip().upper() for t in fallback_env.split(",") if t.strip()]
-        fallback = fallback_cfg or FALLBACK_TICKERS
-        tickers = fallback[:]
-        logger.warning(
-            "S&P 500 cache is empty; using %d fallback tickers for recommendations",
-            len(tickers),
-        )
+    try:
+        update_sp500()
+        with _lock:
+            tickers = _sp500["tickers"][:]
+
         if not tickers:
-            logger.warning("No fallback tickers configured; skipping recommendation refresh")
+            fallback_env = os.getenv("FALLBACK_TICKERS", "")
+            fallback_cfg = [t.strip().upper() for t in fallback_env.split(",") if t.strip()]
+            fallback = fallback_cfg or FALLBACK_TICKERS
+            tickers = fallback[:]
+            logger.warning(
+                "S&P 500 cache is empty; using %d fallback tickers for recommendations",
+                len(tickers),
+            )
+            if not tickers:
+                logger.warning("No fallback tickers configured; skipping recommendation refresh")
+                return
+
+        # deterministic daily shuffle to avoid A* bias
+        rng = random.Random(date.today().toordinal())
+        rng.shuffle(tickers)
+
+        # pick first ~30 that pass volume filter
+        filtered = []
+        for t in tickers:
+            try:
+                if fast_filter_ticker(t):
+                    filtered.append(t)
+                    if len(filtered) >= 30:
+                        break
+            except Exception as exc:
+                logger.warning("Liquidity filter failed for %s: %s", t, exc)
+                continue
+
+        if not filtered:
+            logger.warning(
+                "No tickers passed the liquidity filter; keeping existing recommendations"
+            )
+            with _lock:
+                if not _recommendations:
+                    _recommendations = _fallback_recommendations(
+                        "No tickers passed the liquidity filter"
+                    )
             return
 
-    # deterministic daily shuffle to avoid A* bias
-    rng = random.Random(date.today().toordinal())
-    rng.shuffle(tickers)
+        def worker(sym: str) -> dict | None:
+            try:
+                df = get_price_history(sym, "1y")
+            except PriceDataError as exc:
+                logger.warning("Skipping %s: %s", sym, exc)
+                return None
+            except Exception as exc:
+                logger.warning("Unexpected error loading %s: %s", sym, exc)
+                return None
+            try:
+                if df is None or df.empty:
+                    logger.warning("Skipping %s: no historical data", sym)
+                    return None
 
-    # pick first ~30 that pass volume filter
-    filtered = []
-    for t in tickers:
-        try:
-            if fast_filter_ticker(t):
-                filtered.append(t)
-                if len(filtered) >= 30:
-                    break
-        except Exception:
-            continue
+                # Ensure we have needed cols
+                missing = [col for col in ("High", "Low", "Close") if col not in df.columns]
+                if missing:
+                    logger.warning("Skipping %s: missing columns %s", sym, ", ".join(missing))
+                    return None
 
-    if not filtered:
-        logger.warning("No tickers passed the liquidity filter; keeping existing recommendations")
+                df = df[["High", "Low", "Close"]].dropna().copy()
+                if df.empty:
+                    logger.warning("Skipping %s: insufficient price data after cleaning", sym)
+                    return None
+                df = compute_indicators(df)
+                score, reasons = score_stock(df)
+                rec = "BUY" if score >= 3.5 else "HOLD"
+                return {"Symbol": sym, "Recommendation": rec, "Score": score, "Why": reasons}
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("Skipping %s due to processing error: %s", sym, exc)
+                return None
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            results = [res for res in ex.map(worker, filtered) if res]
+
+        # rank by score desc, then symbol
+        results.sort(key=lambda x: (-x.get("Score", 0.0), x.get("Symbol", "")))
+        buys = [r for r in results if r["Recommendation"] == "BUY"]
+        logger.info("Recommendations computed: %d BUY out of %d", len(buys), len(results))
+        completed_at = datetime.now()
+        with _lock:
+            if results:
+                _recommendations = results[:5]  # top 5 overall, already ranked
+                _rec_state["last_completed"] = completed_at
+                _rec_state["last_error"] = None
+            elif not _recommendations:
+                _recommendations = _fallback_recommendations(
+                    "Unable to compute recommendations; using placeholders"
+                )
+        if results:
+            _record_recommendations_snapshot(results[:5])
+    except Exception as exc:
+        logger.exception("Recommendation refresh failed")
+        with _lock:
+            _rec_state["last_error"] = str(exc)
         with _lock:
             if not _recommendations:
                 _recommendations = _fallback_recommendations(
-                    "No tickers passed the liquidity filter"
+                    "Refreshing recommendations failed; using placeholders"
                 )
-        return
-
-    def worker(sym: str) -> dict:
-        try:
-            df = get_price_history(sym, "1y")
-        except PriceDataError as exc:
-            logger.warning("Skipping %s: %s", sym, exc)
-            return None
-        except Exception as exc:
-            logger.warning("Unexpected error loading %s: %s", sym, exc)
-            return None
-        try:
-            if df is None or df.empty:
-                logger.warning("Skipping %s: no historical data", sym)
-                return None
-
-            # Ensure we have needed cols
-            missing = [col for col in ("High", "Low", "Close") if col not in df.columns]
-            if missing:
-                logger.warning("Skipping %s: missing columns %s", sym, ", ".join(missing))
-                return None
-
-            df = df[["High", "Low", "Close"]].dropna().copy()
-            if df.empty:
-                logger.warning("Skipping %s: insufficient price data after cleaning", sym)
-                return None
-            df = compute_indicators(df)
-            score, reasons = score_stock(df)
-            rec = "BUY" if score >= 3.5 else "HOLD"
-            return {"Symbol": sym, "Recommendation": rec, "Score": score, "Why": reasons}
-        except Exception as e:
-            logger.exception("Worker failed for %s", sym)
-            return {"Symbol": sym, "Recommendation": "HOLD", "Score": 0.0, "Why": [f"error: {e}"]}
-
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        results = [res for res in ex.map(worker, filtered) if res]
-
-    # rank by score desc, then symbol
-    results.sort(key=lambda x: (-x.get("Score", 0.0), x.get("Symbol", "")))
-    buys = [r for r in results if r["Recommendation"] == "BUY"]
-    logger.info("Recommendations computed: %d BUY out of %d", len(buys), len(results))
-    with _lock:
-        if results:
-            _recommendations = results[:5]  # top 5 overall, already ranked
-        elif not _recommendations:
-            _recommendations = _fallback_recommendations(
-                "Unable to compute recommendations; using placeholders"
-            )
+    finally:
+        with _lock:
+            _rec_state["refreshing"] = False
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
 
 
 # -----------------------------
@@ -2111,28 +2363,45 @@ def backtest_ticker(ticker: str, years: int = 3, cost_bps: float = 5.0) -> dict:
 # -----------------------------
 
 def start_background_jobs():
-    global _background_jobs_started
+    global _background_jobs_started, _scheduler
     should_start = not app.debug or str(os.environ.get("WERKZEUG_RUN_MAIN", "")).lower() == "true"
     if not should_start:
+        logger.debug("Skipping scheduler start in reloader parent process")
         return
     with _background_jobs_lock:
         if _background_jobs_started:
             return
         _background_jobs_started = True
+    logger.info("Starting background scheduler")
     # Run both routines immediately so the UI has fresh data without waiting
-    # for the first scheduler interval.
     threading.Thread(target=seek_recommendations, daemon=True).start()
     trigger_autopilot_run()
-    sched = BackgroundScheduler()
-    sched.add_job(seek_recommendations, "interval", hours=1, next_run_time=datetime.now())
-    sched.add_job(run_autopilot_cycle, "interval", minutes=5, next_run_time=datetime.now())
-    sched.start()
+    _scheduler = BackgroundScheduler()
+    _scheduler.add_job(
+        seek_recommendations,
+        "interval",
+        hours=1,
+        next_run_time=datetime.now(),
+        id="seek_recommendations",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        run_autopilot_cycle,
+        "interval",
+        minutes=5,
+        next_run_time=datetime.now(),
+        id="run_autopilot_cycle",
+        replace_existing=True,
+    )
+    _scheduler.start()
     logger.info("Background jobs started")
 
+def _ensure_background_jobs() -> None:
+    if not _background_jobs_started:
+        start_background_jobs()
 
-@app.before_request
-def _start_background_jobs_once() -> None:
-    start_background_jobs()
+
+app.before_request(_ensure_background_jobs)
 
 
 # -----------------------------
@@ -2157,26 +2426,34 @@ def home():
                 flash(f"Analyze error for {t}: {e}")
 
     with _lock:
-        recs = _recommendations[:]
+        recs = [dict(r) for r in _recommendations]
+        rec_state = dict(_rec_state)
 
     if not recs:
         try:
-            threading.Thread(target=seek_recommendations, daemon=True).start()
-            with _lock:
-                recs = _recommendations[:]
-                if not recs:
-                    recs = _fallback_recommendations("Refreshing recommendations; showing placeholders")
+            if not rec_state.get("refreshing"):
+                threading.Thread(target=seek_recommendations, daemon=True).start()
+                with _lock:
+                    _rec_state["refreshing"] = True
+                    rec_state["refreshing"] = True
+            recs = _fallback_recommendations(
+                "No recommendations yet; first-time scan can take a few minutes."
+            )
         except Exception:
             logger.exception("Initial recommendation refresh failed")
 
-    with _lock:
-        recs = recs[:]
+    rec_status = _format_recommendation_status(recs, rec_state)
     # Pre-serialize for safe JS usage in template
     result_clean = to_plain(result or {})
     recs_clean = to_plain(recs or [])
     result_json = json.dumps(result_clean, ensure_ascii=False)
     recs_json = json.dumps(recs_clean, ensure_ascii=False)
-    return render_template("index.html", result_json=result_json, recommendations_json=recs_json)
+    return render_template(
+        "index.html",
+        result_json=result_json,
+        recommendations_json=recs_json,
+        rec_status=rec_status,
+    )
 
 
 @app.route("/seek")
@@ -2192,10 +2469,12 @@ def seek_and_redirect():
 @app.route("/api/recommendations")
 def api_recommendations():
     with _lock:
-        data = _recommendations[:]
+        data = [dict(r) for r in _recommendations]
+        state = dict(_rec_state)
     if not data:
         data = _fallback_recommendations("No recommendations available; using placeholders")
-    return jsonify({"ok": True, "data": data})
+    status = _format_recommendation_status(data, state)
+    return jsonify({"ok": True, "data": data, "status": status})
 
 
 @app.route("/api/recommendations/refresh", methods=["POST"])
@@ -2204,7 +2483,9 @@ def api_refresh_recommendations():
         seek_recommendations()
         with _lock:
             data = [dict(r) for r in _recommendations]
-        return jsonify({"ok": True, "data": data})
+            state = dict(_rec_state)
+        status = _format_recommendation_status(data, state)
+        return jsonify({"ok": True, "data": data, "status": status})
     except Exception as exc:
         logger.exception("Recommendation refresh failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -2325,7 +2606,27 @@ def paper_autopilot_update():
         )
     )
     if status.get("enabled"):
-        trigger_autopilot_run(force=True)
+        run_autopilot_cycle(force=True)
+    return redirect(url_for("paper_dashboard"))
+
+
+@app.route("/paper/autopilot/run", methods=["POST"])
+def paper_autopilot_run_now():
+    if not paper_broker.enabled:
+        flash("Enable paper trading to use the autopilot.")
+        return redirect(url_for("paper_dashboard"))
+
+    try:
+        run_autopilot_cycle(force=True)
+        status = get_autopilot_status()
+        if status.get("last_run_error"):
+            flash(f"Autopilot run finished with warnings: {status.get('last_run_error')}")
+        else:
+            summary = status.get("last_run_summary") or "Run complete."
+            flash(summary)
+    except Exception as exc:
+        logger.exception("Forced autopilot run failed")
+        flash(f"Autopilot run failed: {exc}")
     return redirect(url_for("paper_dashboard"))
 
 
@@ -2396,7 +2697,7 @@ def api_paper_autopilot():
         risk=risk,
     )
     if status.get("enabled") and paper_broker.enabled:
-        trigger_autopilot_run(force=True)
+        run_autopilot_cycle(force=True)
     return jsonify({"ok": True, "data": status})
 
 
