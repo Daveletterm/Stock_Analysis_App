@@ -159,6 +159,7 @@ AUTOPILOT_STRATEGIES = {
         ),
         "asset_class": "option",
         "min_score": 3.4,
+        "bearish_min_score": 3.0,
         "exit_score": 2.4,
         "max_positions": 4,
         "max_position_pct": 0.06,

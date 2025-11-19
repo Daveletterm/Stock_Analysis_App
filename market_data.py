@@ -536,8 +536,8 @@ def _latest_spot_price(symbol: str, as_of: datetime) -> Optional[float]:
 def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
     """Select a reasonably liquid put contract near the money.
 
-    The selection favors expirations 30–60 days out and strikes within
-    roughly ±5% of the current price. Contracts must have a non-zero
+    The selection favors expirations roughly 21–60 days out and strikes within
+    about ±8% of the current price. Contracts must have a non-zero
     bid and either volume or open interest to be considered.
     """
 
@@ -548,7 +548,7 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
         logger.warning("Skipping put selection for %s: no recent price", symbol.upper())
         return None
 
-    min_expiry = now.date() + timedelta(days=30)
+    min_expiry = now.date() + timedelta(days=21)
     max_expiry = now.date() + timedelta(days=60)
 
     try:
@@ -586,7 +586,7 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
             strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
             if not strike:
                 continue
-            if strike < spot * 0.95 or strike > spot * 1.05:
+            if strike < spot * 0.92 or strike > spot * 1.08:
                 continue
 
             bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
