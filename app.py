@@ -370,15 +370,30 @@ def option_bid_ask(contract: dict[str, Any]) -> tuple[Optional[float], Optional[
     quote = _option_quote(contract)
     bid: Optional[float] = None
     ask: Optional[float] = None
-    if quote:
-        for bid_key in ("bid_price", "bid", "bp"):
-            bid = safe_float(quote.get(bid_key), None)
-            if bid is not None:
+
+    def _extract_bid_ask(source: dict[str, Any] | None) -> tuple[Optional[float], Optional[float]]:
+        local_bid: Optional[float] = None
+        local_ask: Optional[float] = None
+        if not source:
+            return None, None
+        for bid_key in ("bid_price", "bid", "bp", "best_bid_price"):
+            local_bid = safe_float(source.get(bid_key), None)
+            if local_bid is not None:
                 break
-        for ask_key in ("ask_price", "ask", "ap"):
-            ask = safe_float(quote.get(ask_key), None)
-            if ask is not None:
+        for ask_key in ("ask_price", "ask", "ap", "best_ask_price"):
+            local_ask = safe_float(source.get(ask_key), None)
+            if local_ask is not None:
                 break
+        return local_bid, local_ask
+
+    bid, ask = _extract_bid_ask(quote)
+
+    # Some Alpaca contract payloads expose bid/ask at the top level, not just within quotes.
+    if bid is None or ask is None:
+        top_bid, top_ask = _extract_bid_ask(contract)
+        bid = bid if bid is not None else top_bid
+        ask = ask if ask is not None else top_ask
+
     return bid, ask
 
 
@@ -1130,15 +1145,19 @@ def run_autopilot_cycle(force: bool = False) -> None:
     summary_lines: list[str] = []
     errors: list[str] = []
     try:
+        prerequisites_met = True
         if not paper_broker.enabled:
             summary_lines.append("Paper trading disabled; autopilot idle.")
-            return
+            prerequisites_met = False
 
         with _autopilot_lock:
             config = dict(_autopilot_state)
 
-        if not config.get("enabled"):
+        if prerequisites_met and not config.get("enabled"):
             summary_lines.append("Autopilot is paused.")
+            prerequisites_met = False
+
+        if not prerequisites_met:
             return
 
         strategy_key = config.get("strategy", "balanced")
@@ -1531,10 +1550,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
             _autopilot_state["last_error"] = "; ".join(errors) if errors else None
         _autopilot_runtime_lock.release()
 
-    if errors:
-        logger.warning("Autopilot cycle completed with errors: %s", "; ".join(errors))
-    else:
-        logger.info("Autopilot cycle completed: %s", " | ".join(summary_lines))
+        if errors:
+            logger.warning("Autopilot cycle completed with errors: %s", "; ".join(errors))
+        else:
+            logger.info("Autopilot cycle completed: %s", " | ".join(summary_lines))
 
 
 # Helper to trigger an autopilot cycle without blocking the caller
@@ -1899,7 +1918,7 @@ def backtest_ticker(ticker: str, years: int = 3, cost_bps: float = 5.0) -> dict:
 
 def start_background_jobs():
     global _background_jobs_started
-    should_start = not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    should_start = not app.debug or str(os.environ.get("WERKZEUG_RUN_MAIN", "")).lower() == "true"
     if not should_start:
         return
     with _background_jobs_lock:
@@ -1942,8 +1961,20 @@ def home():
                 else:
                     logger.exception("Analyze error for %s", t)
                 flash(f"Analyze error for {t}: {e}")
+
     with _lock:
         recs = _recommendations[:]
+
+    if not recs:
+        try:
+            seek_recommendations()
+            with _lock:
+                recs = _recommendations[:]
+        except Exception:
+            logger.exception("Initial recommendation refresh failed")
+
+    with _lock:
+        recs = recs[:]
     # Pre-serialize for safe JS usage in template
     result_clean = to_plain(result or {})
     recs_clean = to_plain(recs or [])
