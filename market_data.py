@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import time
+from urllib.parse import urlparse, urlunparse
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
@@ -45,25 +46,53 @@ def _resolve_alpaca_options_base_url() -> str:
     """Return the fully-qualified Alpaca options contracts endpoint."""
 
     default_options_url = f"{_ALPACA_DATA_DEFAULT_BASE_URL}/options/contracts"
-    env_options_url = os.getenv("ALPACA_OPTIONS_DATA_URL")
+    env_options_url = (os.getenv("ALPACA_OPTIONS_DATA_URL") or "").strip()
 
-    if env_options_url and "/options" in env_options_url:
-        resolved = env_options_url.rstrip("/")
-    else:
-        base = (
-            env_options_url
-            or os.getenv("ALPACA_DATA_BASE_URL")
-            or os.getenv("ALPACA_MARKET_DATA_URL")
-            or _ALPACA_DATA_DEFAULT_BASE_URL
-        ).rstrip("/")
-        if not base.endswith("/options/contracts"):
-            if base.endswith("/options"):
-                base = f"{base}/contracts"
-            else:
-                base = f"{base}/options/contracts"
-        resolved = base
+    if env_options_url:
+        parsed_env = urlparse(env_options_url)
+        if "/options" in parsed_env.path:
+            return env_options_url.rstrip("/")
 
+    base_candidate = env_options_url or (
+        os.getenv("ALPACA_DATA_BASE_URL")
+        or os.getenv("ALPACA_MARKET_DATA_URL")
+        or _ALPACA_DATA_DEFAULT_BASE_URL
+    )
+
+    resolved = _ensure_options_contracts_path(base_candidate)
     return resolved or default_options_url
+
+
+def _ensure_options_contracts_path(url: str | None) -> str:
+    """Ensure *url* targets Alpaca's /v2/options/contracts endpoint."""
+
+    candidate = (url or _ALPACA_DATA_DEFAULT_BASE_URL).strip()
+    if not candidate:
+        candidate = _ALPACA_DATA_DEFAULT_BASE_URL
+
+    if "://" not in candidate:
+        candidate = f"https://{candidate.lstrip('/')}"
+
+    parsed = urlparse(candidate)
+    if not parsed.scheme:
+        parsed = parsed._replace(scheme="https")
+    if not parsed.netloc:
+        parsed = urlparse(f"https://{candidate.lstrip('/')}")
+
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/v2"
+
+    if "/options" in path:
+        if not path.endswith("/contracts"):
+            path = f"{path}/contracts"
+    else:
+        prefix = path if path and path != "/" else "/v2"
+        versioned_prefix = prefix.rstrip("/") or "/v2"
+        path = f"{versioned_prefix}/options/contracts"
+
+    normalized = urlunparse(parsed._replace(path=path.rstrip("/")))
+    return normalized.rstrip("/")
 
 
 _DEFAULT_ALPACA_OPTIONS_BASE_URL = f"{_ALPACA_DATA_DEFAULT_BASE_URL}/options/contracts"
