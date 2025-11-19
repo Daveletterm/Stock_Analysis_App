@@ -1752,9 +1752,34 @@ def run_autopilot_cycle(force: bool = False) -> None:
             bearish_pool = bearish_recs if asset_class == "option" else []
             bullish_slice = bullish_pool[:5] if asset_class == "option" else bullish_pool
             bearish_slice = bearish_pool[:5] if asset_class == "option" else []
+            candidate_entries: list[dict[str, Any]] = []
+            for rec in bullish_slice:
+                symbol = str(rec.get("Symbol", "")).upper()
+                if not symbol:
+                    continue
+                candidate_entries.append(
+                    {
+                        "symbol": symbol,
+                        "score": safe_float(rec.get("Score")),
+                        "bias": "bullish",
+                        "rec": rec,
+                    }
+                )
+            for rec in bearish_slice:
+                symbol = str(rec.get("Symbol", "")).upper()
+                if not symbol:
+                    continue
+                candidate_entries.append(
+                    {
+                        "symbol": symbol,
+                        "score": safe_float(rec.get("BearishScore")),
+                        "bias": "bearish",
+                        "rec": rec,
+                    }
+                )
             recs_snapshot = bullish_slice + bearish_slice
             bearish_symbols = {str(rec.get("Symbol", "")).upper() for rec in bearish_slice}
-            candidate_count = len(bullish_slice) + len(bearish_slice)
+            candidate_count = len(candidate_entries)
             logger.info(
                 "Autopilot evaluating %d recommendation candidates (bullish=%d bearish=%d)",
                 candidate_count,
@@ -1982,120 +2007,11 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     continue
 
             min_entry_score = strategy.get("min_score", 3.0)
-            buy_candidates: list[tuple[str, float]] = []
-            bearish_candidates: list[tuple[str, float]] = []
+            bearish_min_score = safe_float(
+                strategy.get("bearish_min_score"), strategy.get("min_score", 3.0)
+            )
             logged_candidates: set[str] = set()
-            candidate_skip_reasons: dict[str, str] = {}
 
-            def _log_filtered_candidate(
-                symbol: str,
-                score: float | None,
-                reason: str,
-                *,
-                bullish_considered: bool = False,
-                bearish_considered: bool = False,
-            ) -> None:
-                if not symbol or symbol in logged_candidates:
-                    return
-                score_fragment = f"{score:.2f}" if isinstance(score, (int, float)) else "n/a"
-                candidate_skip_reasons[symbol] = reason
-                logger.info(
-                    "Candidate %s: direction=%s reason=%s score=%s bullish_considered=%s bearish_considered=%s",
-                    symbol,
-                    "none",
-                    reason,
-                    score_fragment,
-                    bullish_considered,
-                    bearish_considered,
-                )
-                logged_candidates.add(symbol)
-
-            for rec in bullish_slice:
-                symbol = str(rec.get("Symbol", "")).upper()
-                if not symbol:
-                    continue
-                score = safe_float(rec.get("Score"))
-                if score is None:
-                    _log_filtered_candidate(
-                        symbol, score, "no entry, missing score", bullish_considered=True
-                    )
-                    continue
-                if score < min_entry_score:
-                    _log_filtered_candidate(
-                        symbol,
-                        score,
-                        f"no entry, score {score:.2f} below min {min_entry_score:.2f}",
-                        bullish_considered=True,
-                    )
-                    continue
-                if asset_class == "option":
-                    if symbol in pending_underlyings:
-                        _log_filtered_candidate(
-                            symbol,
-                            score,
-                            "no entry, order already pending for underlying",
-                            bullish_considered=True,
-                        )
-                        continue
-                else:
-                    if symbol in held_and_pending:
-                        _log_filtered_candidate(
-                            symbol,
-                            score,
-                            "no entry, already have open position or pending order",
-                            bullish_considered=True,
-                        )
-                        continue
-                buy_candidates.append((symbol, score))
-
-            if asset_class == "option":
-                bearish_min_score = safe_float(
-                    strategy.get("bearish_min_score"), strategy.get("min_score", 3.0)
-                )
-                for rec in bearish_slice:
-                    symbol = str(rec.get("Symbol", "")).upper()
-                    if not symbol:
-                        continue
-                    score = safe_float(rec.get("BearishScore"))
-                    if score is None:
-                        _log_filtered_candidate(
-                            symbol,
-                            score,
-                            "no entry, missing bearish score",
-                            bearish_considered=True,
-                        )
-                        continue
-                    if score < bearish_min_score:
-                        _log_filtered_candidate(
-                            symbol,
-                            score,
-                            f"no entry, bearish score {score:.2f} below min {bearish_min_score:.2f}",
-                            bearish_considered=True,
-                        )
-                        continue
-                    if symbol in pending_underlyings:
-                        _log_filtered_candidate(
-                            symbol,
-                            score,
-                            "no entry, order already pending for underlying",
-                            bearish_considered=True,
-                        )
-                        continue
-                    bearish_candidates.append((symbol, score))
-
-            if not buy_candidates and not bearish_candidates:
-                summary_lines.append("No new symbols met entry criteria.")
-
-            combined_candidates: list[tuple[str, float, str]] = [
-                (symbol, score, "bullish") for symbol, score in buy_candidates
-            ]
-            combined_candidates.extend(
-                (symbol, score, "bearish") for symbol, score in bearish_candidates
-            )
-            combined_candidates.sort(key=lambda item: item[1], reverse=True)
-            evaluated_symbols = {symbol for symbol, _ in buy_candidates}.union(
-                {symbol for symbol, _ in bearish_candidates}
-            )
             max_positions = max(1, int(strategy.get("max_positions", 5)))
             available_slots = max(0, max_positions - len(current_positions))
             gross_notional = (
@@ -2104,21 +2020,21 @@ def run_autopilot_cycle(force: bool = False) -> None:
 
             allocation_warning_logged = False
 
-            if asset_class == "option":
-                for rec in list(bullish_slice) + list(bearish_slice):
-                    symbol = str(rec.get("Symbol", "")).upper()
-                    if not symbol or symbol in evaluated_symbols:
-                        continue
-                    reason = candidate_skip_reasons.get(
-                        symbol, "no entry, did not meet entry criteria"
-                    )
-                    logger.info(
-                        "Candidate %s: direction=none reason=%s", symbol, reason
-                    )
+            sorted_candidates = sorted(
+                candidate_entries,
+                key=lambda item: safe_float(item.get("score"), 0.0),
+                reverse=True,
+            )
 
-            for symbol, score, bias in combined_candidates:
-                if available_slots <= 0:
-                    break
+            if asset_class == "option" and not sorted_candidates:
+                summary_lines.append("No new symbols met entry criteria.")
+
+            for candidate in sorted_candidates:
+                symbol = candidate.get("symbol", "")
+                score = candidate.get("score")
+                bias = candidate.get("bias") or "bullish"
+                if not symbol:
+                    continue
 
                 direction_label = "bullish" if bias == "bullish" else "bearish"
                 reason_label = "pending evaluation"
@@ -2126,24 +2042,59 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 bearish_considered = bias == "bearish"
                 candidate_logged = False
 
-                def log_candidate_outcome(reason: str, direction_override: str | None = None) -> None:
+                def log_candidate_outcome(
+                    reason: str, direction_override: str | None = None
+                ) -> None:
                     nonlocal reason_label, direction_label, candidate_logged
                     reason_label = reason
                     if direction_override:
                         direction_label = direction_override
+                    score_fragment = (
+                        f"{score:.2f}" if isinstance(score, (int, float)) else "n/a"
+                    )
                     logger.info(
-                        "Candidate %s: direction=%s reason=%s score=%.2f bullish_considered=%s bearish_considered=%s",
+                        "Candidate %s: direction=%s reason=%s score=%s bullish_considered=%s bearish_considered=%s bias=%s",
                         symbol,
                         direction_label,
                         reason_label,
-                        score,
+                        score_fragment,
                         bullish_considered,
                         bearish_considered,
+                        bias,
                     )
                     candidate_logged = True
                     logged_candidates.add(symbol)
 
+                if available_slots <= 0:
+                    log_candidate_outcome("no entry, max positions reached", "none")
+                    continue
+
+                if score is None:
+                    log_candidate_outcome(
+                        "no entry, missing score", "none"
+                    )
+                    continue
+
+                if bias == "bullish" and score < min_entry_score:
+                    log_candidate_outcome(
+                        f"no entry, score {score:.2f} below min {min_entry_score:.2f}",
+                        "none",
+                    )
+                    continue
+                if bias == "bearish" and asset_class == "option" and score < bearish_min_score:
+                    log_candidate_outcome(
+                        f"no entry, bearish score {score:.2f} below min {bearish_min_score:.2f}",
+                        "none",
+                    )
+                    continue
+
                 if asset_class == "option":
+                    if symbol in pending_underlyings:
+                        log_candidate_outcome(
+                            "no entry, order already pending for underlying", "none"
+                        )
+                        continue
+
                     if bias == "bearish":
                         logger.info("Candidate %s: evaluating bearish path (puts)", symbol)
                         if symbol in held_put_underlyings:
@@ -2151,7 +2102,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 f"Skip bearish {symbol}; put position already open."
                             )
                             log_candidate_outcome(
-                                "bearish entry blocked, already have open position"
+                                "bearish entry blocked, already have open position",
+                                "none",
                             )
                             continue
                         put_choice = choose_put_contract(symbol, datetime.now(timezone.utc))
@@ -2160,13 +2112,15 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 f"Skip bearish {symbol}; no suitable put contract found."
                             )
                             log_candidate_outcome(
-                                "bearish entry blocked, no suitable put contract"
+                                "bearish entry blocked, no suitable put contract",
+                                "none",
                             )
                             continue
                         contract_symbol = put_choice["option_symbol"].upper()
                         if contract_symbol in held_and_pending:
                             log_candidate_outcome(
-                                "bearish entry blocked, order already pending"
+                                "bearish entry blocked, order already pending",
+                                "none",
                             )
                             continue
                         bid = safe_float(put_choice.get("bid"))
@@ -2179,7 +2133,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 f"Skip bearish {symbol}; invalid quote for {contract_symbol}."
                             )
                             log_candidate_outcome(
-                                "bearish entry blocked, invalid option quote"
+                                "bearish entry blocked, invalid option quote",
+                                "none",
                             )
                             continue
                         unit_cost = mid_price * OPTION_CONTRACT_MULTIPLIER
@@ -2197,7 +2152,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 )
                                 allocation_warning_logged = True
                             log_candidate_outcome(
-                                "bearish entry blocked by portfolio allocation"
+                                "bearish entry blocked by portfolio allocation",
+                                "none",
                             )
                             break
                         qty = int(target_notional // max(unit_cost, 1e-6))
@@ -2209,7 +2165,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 f"Skip bearish {symbol}; notional ${target_notional:.2f} too small for put cost ${unit_cost:.2f}."
                             )
                             log_candidate_outcome(
-                                "bearish entry blocked by sizing rules"
+                                "bearish entry blocked by sizing rules",
+                                "none",
                             )
                             continue
                         try:
@@ -2253,7 +2210,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             errors.append(f"buy {contract_symbol} failed: {exc}")
                             if not candidate_logged:
                                 log_candidate_outcome(
-                                    "bearish entry failed during order placement"
+                                    "bearish entry failed during order placement",
+                                    "bearish",
                                 )
                     else:
                         logger.info(
@@ -2266,7 +2224,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             logger.exception("Autopilot price fetch failed for %s", symbol)
                             errors.append(f"price {symbol} failed: {exc}")
                             log_candidate_outcome(
-                                "bullish entry blocked, price fetch failed"
+                                "bullish entry blocked, price fetch failed",
+                                "none",
                             )
                             continue
                         try:
@@ -2279,7 +2238,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         except PriceDataError as exc:
                             errors.append(f"options {symbol} chain failed: {exc}")
                             log_candidate_outcome(
-                                "bullish entry blocked, option chain unavailable"
+                                "bullish entry blocked, option chain unavailable",
+                                "none",
                             )
                             continue
                         diag = selection.diagnostics or {}
@@ -2349,7 +2309,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 )
                             )
                             log_candidate_outcome(
-                                "bullish entry blocked, no suitable call contract"
+                                "bullish entry blocked, no suitable call contract",
+                                "none",
                             )
                             continue
                         contract_symbol = (
@@ -2359,17 +2320,33 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         )
                         if not contract_symbol or contract_symbol in held_and_pending:
                             log_candidate_outcome(
-                                "bullish entry blocked, order already pending"
+                                "bullish entry blocked, order already pending",
+                                "none",
                             )
                             continue
-                        unit_cost = premium * OPTION_CONTRACT_MULTIPLIER
+                        if asset_class == "option" and contract_symbol in held_and_pending:
+                            log_candidate_outcome(
+                                "bullish entry blocked, already have open position or pending order",
+                                "none",
+                            )
+                            continue
+                        stop_loss_pct = abs(
+                            safe_float(strategy.get("options_stop_loss_pct"), 0.45)
+                        )
+                        take_profit_pct = safe_float(
+                            strategy.get("options_take_profit_pct"), 0.8
+                        )
                         notional_cap_pct = min(max_position_pct, max_total_allocation)
-                        target_notional = max(min_entry_notional, equity * notional_cap_pct)
+                        position_mult = risk_cfg.get("position_multiplier", 1.0)
+                        target_notional = (
+                            max(min_entry_notional, equity * notional_cap_pct) * position_mult
+                        )
                         max_debit = safe_float(strategy.get("max_position_debit"), None)
                         if max_debit:
                             target_notional = min(target_notional, max_debit)
                         if PAPER_MAX_POSITION_NOTIONAL:
                             target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
+                        unit_cost = premium * OPTION_CONTRACT_MULTIPLIER
                         if gross_notional + target_notional > equity * max_total_allocation:
                             if not allocation_warning_logged:
                                 summary_lines.append(
@@ -2377,16 +2354,21 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 )
                                 allocation_warning_logged = True
                             log_candidate_outcome(
-                                "bullish entry blocked by portfolio allocation"
+                                "bullish entry blocked by portfolio allocation",
+                                "none",
                             )
                             break
-                        qty = max(1, int(target_notional // max(unit_cost, 1e-6)))
+                        qty = int(target_notional // max(unit_cost, 1e-6))
                         max_contracts = int(safe_float(strategy.get("max_contracts_per_trade"), 0))
                         if max_contracts:
                             qty = min(qty, max_contracts)
                         if qty <= 0:
+                            summary_lines.append(
+                                f"Skip bullish {symbol}; notional ${target_notional:.2f} too small for call cost ${unit_cost:.2f}."
+                            )
                             log_candidate_outcome(
-                                "bullish entry blocked by sizing rules"
+                                "bullish entry blocked by sizing rules",
+                                "none",
                             )
                             continue
                         try:
@@ -2399,59 +2381,79 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 contract_symbol,
                                 qty,
                                 "buy",
-                                order_type="limit",
-                                limit_price=round(premium, 2),
-                                stop_loss_pct=None,
-                                take_profit_pct=None,
+                                order_type="market",
+                                stop_loss_pct=stop_loss_pct,
+                                take_profit_pct=take_profit_pct,
                                 time_in_force="day",
                                 asset_class="option",
                                 price_hint=premium,
-                                support_brackets=False,
                             )
                             gross_notional += qty * unit_cost
                             available_slots -= 1
                             held_and_pending.add(contract_symbol)
-                            if parsed and parsed.get("underlying"):
-                                pending_underlyings.add(parsed["underlying"])
+                            pending_underlyings.add(symbol)
                             summary_lines.append(
-                                f"Buy {qty} {contract_symbol} ({symbol} {parsed.get('type', 'call')} {parsed.get('strike', 0):.2f} exp {parsed.get('expiration')}, premium ${premium:.2f})"
-                            )
-                            logger.info(
-                                "Autopilot option entry: %s qty=%d premium=%.2f notional=%.2f",
-                                contract_symbol,
-                                qty,
-                                premium,
-                                qty * unit_cost,
+                                f"Buy {qty} {contract_symbol} (score {score:.2f}, premium ${premium:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
                             )
                             orders_placed += 1
                             log_candidate_outcome("bullish entry placed")
                         except Exception as exc:
-                            logger.exception("Autopilot option entry failed for %s", contract_symbol)
+                            logger.exception(
+                                "Autopilot option entry failed for %s", contract_symbol
+                            )
                             errors.append(f"buy {contract_symbol} failed: {exc}")
                             if not candidate_logged:
                                 log_candidate_outcome(
-                                    "bullish entry failed during order placement"
+                                    "bullish entry failed during order placement",
+                                    "bullish",
                                 )
                 else:
-                    logger.info(
-                        "Candidate %s: evaluating bullish path (stock)", symbol
-                    )
-                    if _autopilot_order_blocked(symbol, open_orders):
-                        log_candidate_outcome(
-                            "bullish entry blocked by existing order"
-                        )
-                        continue
                     try:
-                        price = fetch_latest_price(symbol)
-                    except Exception as exc:
+                        df = _autopilot_prepare_dataframe(symbol, lookback)
+                    except PriceDataError as exc:
                         logger.exception("Autopilot price fetch failed for %s", symbol)
-                        errors.append(f"price {symbol} failed: {exc}")
+                        errors.append(f"data {symbol} failed: {exc}")
                         log_candidate_outcome(
-                            "bullish entry blocked, price fetch failed"
+                            "bullish entry blocked, historical data unavailable",
+                            "none",
                         )
                         continue
+                    if df is None:
+                        log_candidate_outcome("bullish entry blocked, no price history", "none")
+                        continue
+                    score, _ = score_stock(df)
+                    if score < min_entry_score:
+                        log_candidate_outcome(
+                            f"bullish entry blocked, score {score:.2f} below {min_entry_score:.2f}",
+                            "none",
+                        )
+                        continue
+                    price = safe_float(df.iloc[-1].get("Close"), 0.0)
+                    if price <= 0:
+                        log_candidate_outcome(
+                            "bullish entry blocked, invalid last close",
+                            "none",
+                        )
+                        continue
+                    stop_loss_pct = max(
+                        0.0,
+                        float(
+                            PAPER_DEFAULT_STOP_LOSS_PCT
+                            * risk_cfg.get("stop_loss_multiplier", 1.0)
+                        ),
+                    )
+                    take_profit_pct = max(
+                        0.0,
+                        float(
+                            PAPER_DEFAULT_TAKE_PROFIT_PCT
+                            * risk_cfg.get("take_profit_multiplier", 1.0)
+                        ),
+                    )
                     notional_cap_pct = min(max_position_pct, max_total_allocation)
-                    target_notional = max(min_entry_notional, equity * notional_cap_pct)
+                    position_mult = risk_cfg.get("position_multiplier", 1.0)
+                    target_notional = (
+                        max(min_entry_notional, equity * notional_cap_pct) * position_mult
+                    )
                     if PAPER_MAX_POSITION_NOTIONAL:
                         target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
                     if gross_notional + target_notional > equity * max_total_allocation:
@@ -2461,21 +2463,22 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             allocation_warning_logged = True
                         log_candidate_outcome(
-                            "bullish entry blocked by portfolio allocation"
+                            "bullish entry blocked by portfolio allocation",
+                            "none",
                         )
                         break
-                    qty = int(target_notional // price)
+                    qty = int(target_notional // max(price, 1e-6))
                     if qty <= 0:
+                        summary_lines.append(
+                            f"Skip {symbol}; notional ${target_notional:.2f} too small for price ${price:.2f}."
+                        )
                         log_candidate_outcome(
-                            "bullish entry blocked by sizing rules"
+                            "bullish entry blocked by sizing rules",
+                            "none",
                         )
                         continue
-                    stop_loss_pct = max(
-                        0.01, strategy.get("stop_loss_pct", 0.04) * stop_loss_multiplier
-                    )
-                    take_profit_pct = max(
-                        0.02, strategy.get("take_profit_pct", 0.1) * take_profit_multiplier
-                    )
+                    if qty > max(1, int(equity * max_position_pct // max(price, 1e-6))):
+                        qty = max(1, int(equity * max_position_pct // max(price, 1e-6)))
                     try:
                         logger.info(
                             "Placing bullish order: symbol=%s asset_class=stock qty=%s side=buy",
@@ -2502,7 +2505,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         errors.append(f"buy {symbol} failed: {exc}")
                         if not candidate_logged:
                             log_candidate_outcome(
-                                "bullish entry failed during order placement"
+                                "bullish entry failed during order placement",
+                                "bullish",
                             )
 
                 if not candidate_logged:
@@ -2516,17 +2520,16 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 score_key = "BearishScore" if bearish_flag else "Score"
                 score = safe_float(rec.get(score_key))
                 score_fragment = f"{score:.2f}" if isinstance(score, (int, float)) else "n/a"
-                reason = candidate_skip_reasons.get(
-                    symbol, "no entry, filtered before evaluation"
-                )
+                reason = "no entry, filtered before evaluation"
                 logger.info(
-                    "Candidate %s: direction=%s reason=%s score=%s bullish_considered=%s bearish_considered=%s",
+                    "Candidate %s: direction=%s reason=%s score=%s bullish_considered=%s bearish_considered=%s bias=%s",
                     symbol,
                     "none",
                     reason,
                     score_fragment,
                     not bearish_flag,
                     bearish_flag,
+                    "bearish" if bearish_flag else "bullish",
                 )
                 logged_candidates.add(symbol)
 
@@ -2825,7 +2828,9 @@ def seek_recommendations() -> None:
                     return None
                 df = compute_indicators(df)
                 score, reasons = score_stock(df)
+                bullish_score = max(score, 0.0)
                 bearish_score, bearish_reasons = score_bearish(df)
+                bearish_score = max(bearish_score, 0.0)
                 latest = df.iloc[-1]
                 bearish_meta = {
                     "below_sma50": bool(
@@ -2843,11 +2848,11 @@ def seek_recommendations() -> None:
                 return {
                     "Symbol": sym,
                     "Recommendation": rec,
-                    "Score": score,
+                    "Score": bullish_score,
                     "BearishScore": bearish_score,
                     "Why": reasons,
                     "WhyBearish": bearish_reasons,
-                    "Trend": "down" if bearish_score > score else "up",
+                    "Trend": "down" if bearish_score > bullish_score else "up",
                     "BearishMeta": bearish_meta,
                 }
             except Exception as exc:  # pragma: no cover - defensive logging
