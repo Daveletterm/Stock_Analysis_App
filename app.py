@@ -22,7 +22,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
-from paper_trading import AlpacaPaperBroker
+from paper_trading import AlpacaPaperBroker, NoAvailableBidError
 from market_data import PriceDataError
 from market_data import fetch_option_contracts
 from market_data import get_price_history as load_price_history
@@ -1663,9 +1663,15 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 reasons.append(f"score {underlying_score:.2f} < {exit_threshold}")
                     if not reasons:
                         continue
-                    if _autopilot_order_blocked(contract_symbol, open_orders):
+                    open_exit_orders = paper_broker.list_open_orders_for_symbol(
+                        contract_symbol,
+                        asset_class="option",
+                        side="sell",
+                        orders=open_orders,
+                    )
+                    if open_exit_orders:
                         summary_lines.append(
-                            f"Exit pending for {contract_symbol}; open order detected."
+                            f"Exit pending for {contract_symbol}; open exit order already open."
                         )
                         continue
                     market_price = safe_float(
@@ -1701,6 +1707,12 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         summary_lines.append(
                             f"Exit {qty} {contract_symbol} ({'; '.join(reasons)})"
                         )
+                    except NoAvailableBidError:
+                        postpone_msg = (
+                            f"Exit for {contract_symbol} postponed; Alpaca reports no available bid."
+                        )
+                        logger.info(postpone_msg)
+                        summary_lines.append(postpone_msg)
                     except Exception as exc:
                         logger.exception("Autopilot option exit failed for %s", contract_symbol)
                         errors.append(f"sell {contract_symbol} failed: {exc}")

@@ -5,6 +5,22 @@ import logging
 import os
 from typing import Any, Dict, Iterable
 
+
+class AlpacaAPIError(RuntimeError):
+    """Raised when Alpaca returns a non-success response."""
+
+    def __init__(self, status_code: int, message: str, *, payload: Any | None = None):
+        self.status_code = status_code
+        self.api_message = message or ""
+        self.payload = payload
+        super().__init__(f"Alpaca error {status_code}: {message}")
+
+
+class NoAvailableBidError(AlpacaAPIError):
+    """Raised when Alpaca rejects option exits because no bid is available."""
+
+    code = "no_available_bid"
+
 import requests
 
 logger = logging.getLogger("paper_trading")
@@ -59,7 +75,7 @@ class AlpacaPaperBroker:
             raise RuntimeError("Unexpected response from Alpaca") from exc
         if response.status_code >= 400:
             message = data.get("message") if isinstance(data, dict) else str(data)
-            raise RuntimeError(f"Alpaca error {response.status_code}: {message}")
+            raise AlpacaAPIError(response.status_code, message, payload=data)
         return data
 
     def get_account(self) -> Dict[str, Any]:
@@ -74,9 +90,51 @@ class AlpacaPaperBroker:
         data = self._request("GET", "/orders", params=params)
         return data if isinstance(data, list) else []
 
+    def list_open_orders_for_symbol(
+        self,
+        symbol: str,
+        *,
+        asset_class: str | None = None,
+        side: str | None = None,
+        orders: Iterable[Dict[str, Any]] | None = None,
+    ) -> list[Dict[str, Any]]:
+        """Return open orders for the requested symbol, filtered by asset class/side."""
+
+        symbol_cmp = symbol.replace(" ", "").upper()
+        active_status = {"new", "accepted", "open", "pending_new", "partially_filled"}
+        order_source = orders if orders is not None else self.list_orders(status="open", limit=200)
+        matches: list[Dict[str, Any]] = []
+        for order in order_source:
+            try:
+                if str(order.get("symbol", "")).replace(" ", "").upper() != symbol_cmp:
+                    continue
+                if str(order.get("status", "")).lower() not in active_status:
+                    continue
+                if asset_class and str(order.get("asset_class", "")).lower() != asset_class.lower():
+                    continue
+                if side and str(order.get("side", "")).lower() != side.lower():
+                    continue
+                matches.append(order)
+            except Exception:
+                continue
+        return matches
+
     def submit_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("Submitting paper order: %s", payload)
-        return self._request("POST", "/orders", json=payload)
+        try:
+            return self._request("POST", "/orders", json=payload)
+        except AlpacaAPIError as exc:
+            side = str(payload.get("side", "")).lower()
+            asset_class = str(payload.get("asset_class", "")).lower()
+            message = exc.api_message.lower()
+            if (
+                side == "sell"
+                and asset_class == "option"
+                and exc.status_code == 403
+                and "no available bid for symbol" in message
+            ):
+                raise NoAvailableBidError(exc.status_code, exc.api_message, payload=exc.payload) from exc
+            raise
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/orders/{order_id}")
