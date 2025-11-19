@@ -21,6 +21,13 @@ except Exception:  # pragma: no cover - fallback when module layout changes
 
 logger = logging.getLogger("market_data")
 
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 ALPACA_DATA_BASE_URL = (
     os.getenv("ALPACA_DATA_BASE_URL")
     or os.getenv("ALPACA_MARKET_DATA_URL")
@@ -410,38 +417,25 @@ def fetch_option_contracts(
         if not isinstance(contract, dict):
             continue
 
-        # Ensure we have some sort of mark_price so the autopilot
-        # filters do not throw everything away as "no_mark_price".
-        mark = contract.get("mark_price")
+        last = _safe_float(
+            contract.get("last_price") or contract.get("last_trade_price")
+        )
+        bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
+        ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
+        mark = _safe_float(contract.get("mark_price") or contract.get("mark"))
 
-        if mark in (None, "", "0", "0.0"):
-            # /v2/options/contracts typically provides "close_price" and may
-            # also include bid/ask or last price fields depending on plan.
-            close = contract.get("close_price")
-            bid = contract.get("bid")
-            ask = contract.get("ask")
-            last = contract.get("last_price") or contract.get("last_trade_price")
+        price: float | None = None
+        if last is not None and last > 0:
+            price = last
+        elif bid is not None and bid > 0 and ask is not None and ask > 0:
+            price = (bid + ask) / 2.0
+        elif mark is not None and mark > 0:
+            price = mark
 
-            # First choice: midpoint of bid/ask if both exist
-            if bid is not None and ask is not None:
-                try:
-                    contract["mark_price"] = (float(bid) + float(ask)) / 2.0
-                except (TypeError, ValueError):
-                    pass
-
-            # Second choice: close_price
-            if contract.get("mark_price") in (None, "", "0", "0.0") and close is not None:
-                try:
-                    contract["mark_price"] = float(close)
-                except (TypeError, ValueError):
-                    pass
-
-            # Third choice: last/last_trade
-            if contract.get("mark_price") in (None, "", "0", "0.0") and last is not None:
-                try:
-                    contract["mark_price"] = float(last)
-                except (TypeError, ValueError):
-                    pass
+        if price is not None:
+            contract["price"] = price
+            if mark is None:
+                contract.setdefault("mark_price", price)
 
         normalized.append(contract)
 

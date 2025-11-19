@@ -492,27 +492,64 @@ def option_implied_volatility(contract: dict[str, Any]) -> float | None:
     return safe_float(iv, None)
 
 
-def option_mid_price(contract: dict[str, Any]) -> float | None:
+def _derive_option_price(
+    contract: dict[str, Any],
+    *,
+    bid: Optional[float] | None = None,
+    ask: Optional[float] | None = None,
+) -> tuple[Optional[float], bool]:
+    """
+    Determine a usable option price from available fields.
+
+    Preference order:
+      1) last_price / latest trade price if present and positive
+      2) Midpoint of bid/ask when both are present and positive
+      3) mark_price / mark if present and positive
+
+    Returns a tuple of (price, has_price_fields) where has_price_fields
+    indicates whether the payload contained any price-related fields at all.
+    """
+
     if not isinstance(contract, dict):
-        return None
-    mark_price = safe_float(contract.get("mark_price", contract.get("mark")), None)
-    bid, ask = option_bid_ask(contract)
+        return None, False
+
+    local_bid, local_ask = bid, ask
+    if local_bid is None or local_ask is None:
+        local_bid, local_ask = option_bid_ask(contract)
+
     last_price = _option_last_price(contract)
+    mark_price = safe_float(contract.get("mark_price", contract.get("mark")), None)
 
-    if mark_price is None:
-        if bid is not None and ask is not None:
-            mark_price = (bid + ask) / 2.0
-        elif bid is not None:
-            mark_price = bid
-        elif ask is not None:
-            mark_price = ask
-        else:
-            mark_price = last_price
+    has_price_fields = any(
+        val is not None for val in (last_price, local_bid, local_ask, mark_price)
+    )
 
-    if mark_price is None:
-        mark_price = last_price
+    price: Optional[float] = None
+    if last_price is not None and last_price > 0:
+        price = last_price
+    elif (
+        local_bid is not None
+        and local_bid > 0
+        and local_ask is not None
+        and local_ask > 0
+    ):
+        price = (local_bid + local_ask) / 2.0
+    elif mark_price is not None and mark_price > 0:
+        price = mark_price
 
-    return mark_price
+    if price is not None and price > 0:
+        contract["price"] = price
+        if mark_price is None:
+            contract.setdefault("mark_price", price)
+    else:
+        contract.pop("price", None)
+
+    return contract.get("price"), has_price_fields
+
+
+def option_mid_price(contract: dict[str, Any]) -> float | None:
+    price, _ = _derive_option_price(contract)
+    return price
 
 
 _PERIOD_RE = re.compile(r"^(\d+)([a-zA-Z]+)$")
@@ -520,11 +557,12 @@ _PERIOD_RE = re.compile(r"^(\d+)([a-zA-Z]+)$")
 
 def enrich_option_mark_prices(contracts: list[dict[str, Any]]) -> None:
     """
-    For each contract, ensure there is a usable mark_price.
-    If contract["mark_price"] is missing or null, try in order:
-      1) mark_price = (bid + ask) / 2 if both bid and ask exist
-      2) mark_price = last_price or last_trade_price if available
-    Only leave mark_price as None if no price information exists at all.
+    For each contract, ensure there is a usable price/mark_price.
+    Preference order:
+      1) last_price / latest trade price if present and positive
+      2) Midpoint of bid/ask when both are present and positive
+      3) mark_price / mark if present and positive
+    Only leave mark_price/price as None if no price information exists at all.
     This function mutates the contracts list in place.
     """
 
@@ -532,24 +570,7 @@ def enrich_option_mark_prices(contracts: list[dict[str, Any]]) -> None:
         if not isinstance(contract, dict):
             continue
 
-        mark_price = safe_float(contract.get("mark_price", contract.get("mark")), None)
-        if mark_price is not None:
-            continue
-
-        bid, ask = option_bid_ask(contract)
-        last_price = _option_last_price(contract)
-
-        if bid is not None and ask is not None:
-            mark_price = (bid + ask) / 2.0
-        elif bid is not None:
-            mark_price = bid
-        elif ask is not None:
-            mark_price = ask
-        elif last_price is not None:
-            mark_price = last_price
-
-        if mark_price is not None:
-            contract["mark_price"] = mark_price
+        _derive_option_price(contract)
 
 
 def _period_to_range(period: str, *, interval: str | None = None) -> tuple[datetime, datetime, str]:
@@ -1032,6 +1053,7 @@ def _autopilot_select_option_contract(
 
     chains: dict[str, list[dict[str, Any]]] = {}
     chain_sizes: dict[str, int] = {}
+    priced_counts: dict[str, int] = {}
     chain_errors: dict[str, str] = {}
     for option_type in contract_types:
         try:
@@ -1045,18 +1067,33 @@ def _autopilot_select_option_contract(
         except PriceDataError as exc:
             chain = []
             chain_errors[option_type] = str(exc)
-        enrich_option_mark_prices(chain)
+        priced = 0
+        for contract in chain:
+            price, _ = _derive_option_price(contract)
+            if price is not None and price > 0:
+                priced += 1
         chains[option_type] = chain
         chain_sizes[option_type] = len(chain)
+        priced_counts[option_type] = priced
     diagnostics["chain_sizes"] = chain_sizes
+    diagnostics["priced_contracts"] = priced_counts
     if chain_errors:
         diagnostics["chain_errors"] = chain_errors
 
     total_contracts = sum(chain_sizes.values())
+    total_priced_contracts = sum(priced_counts.values())
     diagnostics["total_contracts"] = total_contracts
+    diagnostics["total_priced_contracts"] = total_priced_contracts
     if total_contracts == 0:
         diagnostics["base_rejections"] = {"empty_chain": len(contract_types)}
         return OptionSelection(None, None, None, diagnostics)
+
+    logger.info(
+        "Using %d priced option contracts out of %d total for %s",
+        total_priced_contracts,
+        total_contracts,
+        symbol.upper(),
+    )
 
     base_rejections: Counter[str] = Counter()
     candidates: list[dict[str, Any]] = []
@@ -1078,25 +1115,15 @@ def _autopilot_select_option_contract(
                 base_rejections["expiry_window"] += 1
                 continue
             bid, ask = option_bid_ask(contract)
-            last_price = _option_last_price(contract)
-            price = option_mid_price(contract)
-            price_sources = [
-                safe_float(contract.get("mark_price"), None),
-                bid,
-                ask,
-                last_price,
-            ]
-            has_price_info = any(
-                val is not None and val > 0 for val in price_sources
+            price, has_price_fields = _derive_option_price(
+                contract, bid=bid, ask=ask
             )
             if price is None or price <= 0:
-                if not has_price_info:
+                if not has_price_fields:
                     base_rejections["no_mark_price"] += 1
-                    continue
-                price = next((val for val in price_sources if val is not None and val > 0), None)
-                if price is None:
-                    base_rejections["no_mark_price"] += 1
-                    continue
+                else:
+                    base_rejections["invalid_price"] += 1
+                continue
             if ask is None or ask <= 0:
                 base_rejections["no_ask_price"] += 1
                 continue
