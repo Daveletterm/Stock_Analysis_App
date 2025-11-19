@@ -213,6 +213,7 @@ _autopilot_state = {
 _autopilot_lock = threading.Lock()
 _autopilot_runtime_lock = threading.Lock()
 _autopilot_last_run: dict[str, Any] | None = None
+_autopilot_uncovered_exits: set[str] = set()
 
 
 def _get_db_connection() -> sqlite3.Connection:
@@ -1655,6 +1656,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
             current_positions = (
                 held_positions["option"] if asset_class == "option" else held_positions["equity"]
             )
+            if asset_class == "option":
+                _autopilot_uncovered_exits.intersection_update(set(current_positions.keys()))
+            else:
+                _autopilot_uncovered_exits.clear()
 
             if asset_class == "option":
                 option_profit = safe_float(strategy.get("options_take_profit_pct"), 0.8)
@@ -1662,6 +1667,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 expiry_buffer = max(0, int(safe_float(strategy.get("options_expiry_buffer"), 5)))
 
                 for contract_symbol, entry in current_positions.items():
+                    if contract_symbol in _autopilot_uncovered_exits:
+                        notice = (
+                            f"Manual attention required for {contract_symbol}; previous exit rejected as uncovered."
+                        )
+                        logger.info(notice)
+                        summary_lines.append(notice)
+                        continue
                     pos = entry.get("position")
                     qty = int(abs(entry.get("qty", 0)))
                     available_qty = max(qty, _option_position_quantity(pos))
@@ -1751,7 +1763,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     order_type = "limit" if limit_price else "market"
                     price_hint = price_hint if (price_hint and price_hint > 0) else limit_price
                     try:
-                        place_guarded_paper_order(
+                        result = place_guarded_paper_order(
                             contract_symbol,
                             qty,
                             "sell",
@@ -1765,6 +1777,14 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             support_brackets=False,
                             position_effect="close",
                         )
+                        if isinstance(result, dict) and result.get("status") == "rejected_uncovered":
+                            warning = (
+                                f"Exit for {contract_symbol} rejected as uncovered; manual attention required."
+                            )
+                            logger.warning(warning)
+                            summary_lines.append(warning)
+                            _autopilot_uncovered_exits.add(contract_symbol)
+                            continue
                         orders_placed += 1
                         summary_lines.append(
                             f"Exit {qty} {contract_symbol} ({'; '.join(reasons)})"
@@ -1781,6 +1801,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         )
                         logger.warning(warning)
                         summary_lines.append(warning)
+                        _autopilot_uncovered_exits.add(contract_symbol)
                     except Exception as exc:
                         logger.exception("Autopilot option exit failed for %s", contract_symbol)
                         errors.append(f"sell {contract_symbol} failed: {exc}")

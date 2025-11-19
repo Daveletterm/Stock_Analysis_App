@@ -133,6 +133,7 @@ class AlpacaPaperBroker:
             side = str(payload.get("side", "")).lower()
             asset_class = str(payload.get("asset_class", "")).lower()
             message = exc.api_message.lower()
+            is_close = str(payload.get("position_effect", "")).lower() == "close"
             if (
                 side == "sell"
                 and asset_class == "option"
@@ -151,6 +152,14 @@ class AlpacaPaperBroker:
                     payload.get("symbol", "unknown"),
                     exc.api_message,
                 )
+                if is_close:
+                    return {
+                        "status": "rejected_uncovered",
+                        "symbol": payload.get("symbol"),
+                        "side": side,
+                        "asset_class": asset_class,
+                        "message": exc.api_message,
+                    }
                 raise OptionCloseRejectedError(
                     exc.status_code, exc.api_message, payload=exc.payload
                 ) from exc
