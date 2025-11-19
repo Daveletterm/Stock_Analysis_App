@@ -7,7 +7,7 @@ import threading
 import time
 from urllib.parse import urlparse, urlunparse
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -513,6 +513,130 @@ def fetch_option_contracts(
 
     return normalized
 
+
+def _latest_spot_price(symbol: str, as_of: datetime) -> Optional[float]:
+    """Return the most recent close for *symbol* before *as_of*.
+
+    A small helper to avoid circular imports when option sizing needs
+    the underlying's current price.
+    """
+
+    start = as_of - timedelta(days=7)
+    end = as_of + timedelta(days=1)
+    try:
+        hist = get_price_history(symbol, start, end, interval="1d")
+    except Exception:
+        return None
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return None
+    price = _safe_float(hist["Close"].iloc[-1])
+    return price if price and price > 0 else None
+
+
+def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
+    """Select a reasonably liquid put contract near the money.
+
+    The selection favors expirations 30–60 days out and strikes within
+    roughly ±5% of the current price. Contracts must have a non-zero
+    bid and either volume or open interest to be considered.
+    """
+
+    spot = _latest_spot_price(symbol, now)
+    if not spot:
+        logger.warning("Skipping put selection for %s: no recent price", symbol.upper())
+        return None
+
+    min_expiry = now.date() + timedelta(days=30)
+    max_expiry = now.date() + timedelta(days=60)
+
+    try:
+        chain = fetch_option_contracts(
+            symbol,
+            expiration_date_from=min_expiry,
+            expiration_date_to=max_expiry,
+            option_type="put",
+            limit=500,
+        )
+    except Exception as exc:
+        logger.warning("Put chain fetch failed for %s: %s", symbol.upper(), exc)
+        return None
+
+    if not chain:
+        logger.info("No put contracts returned for %s in desired window", symbol.upper())
+        return None
+
+    best: dict | None = None
+    best_sort: tuple[int, float] | None = None
+    for contract in chain:
+        try:
+            raw_exp = contract.get("expiration_date") or contract.get("expiry")
+            expiration = None
+            if isinstance(raw_exp, str):
+                try:
+                    expiration = datetime.fromisoformat(raw_exp).date()
+                except ValueError:
+                    expiration = None
+            elif isinstance(raw_exp, date):
+                expiration = raw_exp
+            if not expiration or expiration < min_expiry or expiration > max_expiry:
+                continue
+
+            strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
+            if not strike:
+                continue
+            if strike < spot * 0.95 or strike > spot * 1.05:
+                continue
+
+            bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
+            ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
+            last = _safe_float(contract.get("last_price") or contract.get("last_trade_price"))
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
+                continue
+            spread_pct = (ask - bid) / ask if ask else 1.0
+            if spread_pct > 0.6:
+                continue
+
+            open_int = _safe_float(contract.get("open_interest"), 0.0)
+            volume = _safe_float(contract.get("volume"), 0.0)
+            if (open_int or 0) <= 0 and (volume or 0) <= 0:
+                continue
+
+            mid = (bid + ask) / 2.0
+            option_symbol = str(contract.get("symbol", "")).strip()
+            if not option_symbol:
+                continue
+
+            sort_key = ((expiration - min_expiry).days, abs(strike - spot))
+            if best_sort is None or sort_key < best_sort:
+                best_sort = sort_key
+                best = {
+                    "underlying": symbol.upper(),
+                    "option_symbol": option_symbol,
+                    "strike": strike,
+                    "expiration": expiration,
+                    "bid": bid,
+                    "ask": ask,
+                    "last": last,
+                    "mid": mid,
+                }
+        except Exception:
+            continue
+
+    if not best:
+        logger.info("No suitable put found for %s after filtering", symbol.upper())
+        return None
+
+    logger.info(
+        "Selected put for %s: %s strike=%.2f exp=%s bid=%.2f ask=%.2f",
+        symbol.upper(),
+        best["option_symbol"],
+        best["strike"],
+        best["expiration"],
+        best["bid"],
+        best["ask"],
+    )
+    return best
+
 def _fetch_yfinance_history(symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame:
     """Retrieve bars from yfinance as a fallback."""
     _respect_yfinance_rate_limit()
@@ -583,4 +707,9 @@ def get_price_history(symbol: str, start: datetime, end: datetime, interval: str
     return df.copy()
 
 
-__all__ = ["get_price_history", "PriceDataError"]
+__all__ = [
+    "get_price_history",
+    "PriceDataError",
+    "fetch_option_contracts",
+    "choose_put_contract",
+]
