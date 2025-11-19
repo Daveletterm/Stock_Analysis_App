@@ -34,7 +34,11 @@ ALPACA_DATA_BASE_URL = (
     or "https://data.alpaca.markets/v2"
 ).rstrip("/")
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
-_DEFAULT_ALPACA_OPTIONS_BASE_URL = "https://paper-api.alpaca.markets/v2/options/contracts"
+# Options market data lives on Alpaca's data host, not the trading (paper) API.
+# Hitting the paper endpoint returns HTTP 422 because it does not understand the
+# contracts query parameters; default to the documented data endpoint so we can
+# price contracts for the autopilot.
+_DEFAULT_ALPACA_OPTIONS_BASE_URL = "https://data.alpaca.markets/v2/options/contracts"
 ALPACA_OPTIONS_BASE_URL = (
     os.getenv("ALPACA_OPTIONS_DATA_URL")
     or os.getenv("ALPACA_MARKET_DATA_URL")
