@@ -28,22 +28,47 @@ def _safe_float(value):
     except (TypeError, ValueError):
         return None
 
+_ALPACA_DATA_DEFAULT_BASE_URL = "https://data.alpaca.markets/v2"
 ALPACA_DATA_BASE_URL = (
     os.getenv("ALPACA_DATA_BASE_URL")
     or os.getenv("ALPACA_MARKET_DATA_URL")
-    or "https://data.alpaca.markets/v2"
+    or _ALPACA_DATA_DEFAULT_BASE_URL
 ).rstrip("/")
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
 # Options market data lives on Alpaca's data host, not the trading (paper) API.
 # Hitting the paper endpoint returns HTTP 422 because it does not understand the
 # contracts query parameters; default to the documented data endpoint so we can
 # price contracts for the autopilot.
-_DEFAULT_ALPACA_OPTIONS_BASE_URL = "https://data.alpaca.markets/v2/options/contracts"
-ALPACA_OPTIONS_BASE_URL = (
-    os.getenv("ALPACA_OPTIONS_DATA_URL")
-    or os.getenv("ALPACA_MARKET_DATA_URL")
-    or _DEFAULT_ALPACA_OPTIONS_BASE_URL
-).rstrip("/")
+
+
+def _resolve_alpaca_options_base_url() -> str:
+    """Return the fully-qualified Alpaca options contracts endpoint."""
+
+    default_options_url = f"{_ALPACA_DATA_DEFAULT_BASE_URL}/options/contracts"
+    env_options_url = os.getenv("ALPACA_OPTIONS_DATA_URL")
+
+    if env_options_url and "/options" in env_options_url:
+        resolved = env_options_url.rstrip("/")
+    else:
+        base = (
+            env_options_url
+            or os.getenv("ALPACA_DATA_BASE_URL")
+            or os.getenv("ALPACA_MARKET_DATA_URL")
+            or _ALPACA_DATA_DEFAULT_BASE_URL
+        ).rstrip("/")
+        if not base.endswith("/options/contracts"):
+            if base.endswith("/options"):
+                base = f"{base}/contracts"
+            else:
+                base = f"{base}/options/contracts"
+        resolved = base
+
+    return resolved or default_options_url
+
+
+_DEFAULT_ALPACA_OPTIONS_BASE_URL = f"{_ALPACA_DATA_DEFAULT_BASE_URL}/options/contracts"
+ALPACA_OPTIONS_BASE_URL = _resolve_alpaca_options_base_url()
+logger.debug("Resolved Alpaca options base URL: %s", ALPACA_OPTIONS_BASE_URL)
 
 _broker = AlpacaPaperBroker()
 _data_session = requests.Session()
