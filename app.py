@@ -2396,10 +2396,12 @@ def start_background_jobs():
     _scheduler.start()
     logger.info("Background jobs started")
 
+def _ensure_background_jobs() -> None:
+    if not _background_jobs_started:
+        start_background_jobs()
 
-@app.before_serving
-def _start_background_jobs_once() -> None:
-    start_background_jobs()
+
+app.before_request(_ensure_background_jobs)
 
 
 # -----------------------------
