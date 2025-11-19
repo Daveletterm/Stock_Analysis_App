@@ -2397,7 +2397,7 @@ def start_background_jobs():
     logger.info("Background jobs started")
 
 
-@app.before_first_request
+@app.before_serving
 def _start_background_jobs_once() -> None:
     start_background_jobs()
 
