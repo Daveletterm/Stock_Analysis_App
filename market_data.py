@@ -36,10 +36,11 @@ ALPACA_DATA_BASE_URL = (
     or _ALPACA_DATA_DEFAULT_BASE_URL
 ).rstrip("/")
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
-# Options market data lives on Alpaca's data host, not the trading (paper) API.
-# Hitting the paper endpoint returns HTTP 422 because it does not understand the
-# contracts query parameters; default to the documented data endpoint so we can
-# price contracts for the autopilot.
+
+_ALPACA_TRADING_DEFAULT_BASE_URL = (
+    os.getenv("APCA_API_BASE_URL")
+    or "https://paper-api.alpaca.markets/v2"
+).rstrip("/")
 
 
 def _resolve_alpaca_options_base_url() -> str:
@@ -47,11 +48,7 @@ def _resolve_alpaca_options_base_url() -> str:
 
     env_options_url = (os.getenv("ALPACA_OPTIONS_DATA_URL") or "").strip()
 
-    base_candidate = env_options_url or (
-        os.getenv("ALPACA_DATA_BASE_URL")
-        or os.getenv("ALPACA_MARKET_DATA_URL")
-        or _ALPACA_DATA_DEFAULT_BASE_URL
-    )
+    base_candidate = env_options_url or _ALPACA_TRADING_DEFAULT_BASE_URL
 
     resolved = _ensure_options_contracts_path(base_candidate)
     return resolved or _DEFAULT_ALPACA_OPTIONS_BASE_URL
@@ -60,9 +57,9 @@ def _resolve_alpaca_options_base_url() -> str:
 def _ensure_options_contracts_path(url: str | None) -> str:
     """Ensure *url* targets Alpaca's /v2/options/contracts endpoint."""
 
-    candidate = (url or _ALPACA_DATA_DEFAULT_BASE_URL).strip()
+    candidate = (url or _ALPACA_TRADING_DEFAULT_BASE_URL).strip()
     if not candidate:
-        candidate = _ALPACA_DATA_DEFAULT_BASE_URL
+        candidate = _ALPACA_TRADING_DEFAULT_BASE_URL
 
     if "://" not in candidate:
         candidate = f"https://{candidate.lstrip('/')}"
@@ -89,7 +86,7 @@ def _ensure_options_contracts_path(url: str | None) -> str:
     return normalized.rstrip("/")
 
 
-_DEFAULT_ALPACA_OPTIONS_BASE_URL = f"{_ALPACA_DATA_DEFAULT_BASE_URL}/options/contracts"
+_DEFAULT_ALPACA_OPTIONS_BASE_URL = f"{_ALPACA_TRADING_DEFAULT_BASE_URL}/options/contracts"
 ALPACA_OPTIONS_BASE_URL = _resolve_alpaca_options_base_url()
 logger.debug("Resolved Alpaca options base URL: %s", ALPACA_OPTIONS_BASE_URL)
 
