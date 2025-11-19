@@ -541,6 +541,8 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
     bid and either volume or open interest to be considered.
     """
 
+    logger.info("Choosing put contract for %s", symbol.upper())
+
     spot = _latest_spot_price(symbol, now)
     if not spot:
         logger.warning("Skipping put selection for %s: no recent price", symbol.upper())
@@ -562,7 +564,7 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
         return None
 
     if not chain:
-        logger.info("No put contracts returned for %s in desired window", symbol.upper())
+        logger.info("No put contracts available for %s", symbol.upper())
         return None
 
     best: dict | None = None
@@ -623,17 +625,19 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
             continue
 
     if not best:
-        logger.info("No suitable put found for %s after filtering", symbol.upper())
+        logger.info(
+            "No suitable put contract for %s (filtered out by liquidity or strike rules)",
+            symbol.upper(),
+        )
         return None
 
     logger.info(
-        "Selected put for %s: %s strike=%.2f exp=%s bid=%.2f ask=%.2f",
+        "Selected put for %s: option_symbol=%s strike=%.2f expiry=%s mid_price=%.2f",
         symbol.upper(),
         best["option_symbol"],
         best["strike"],
         best["expiration"],
-        best["bid"],
-        best["ask"],
+        best.get("mid", 0.0),
     )
     return best
 
