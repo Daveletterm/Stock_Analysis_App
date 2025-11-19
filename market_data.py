@@ -45,13 +45,7 @@ ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
 def _resolve_alpaca_options_base_url() -> str:
     """Return the fully-qualified Alpaca options contracts endpoint."""
 
-    default_options_url = f"{_ALPACA_DATA_DEFAULT_BASE_URL}/options/contracts"
     env_options_url = (os.getenv("ALPACA_OPTIONS_DATA_URL") or "").strip()
-
-    if env_options_url:
-        parsed_env = urlparse(env_options_url)
-        if "/options" in parsed_env.path:
-            return env_options_url.rstrip("/")
 
     base_candidate = env_options_url or (
         os.getenv("ALPACA_DATA_BASE_URL")
@@ -60,7 +54,7 @@ def _resolve_alpaca_options_base_url() -> str:
     )
 
     resolved = _ensure_options_contracts_path(base_candidate)
-    return resolved or default_options_url
+    return resolved or _DEFAULT_ALPACA_OPTIONS_BASE_URL
 
 
 def _ensure_options_contracts_path(url: str | None) -> str:
