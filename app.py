@@ -226,6 +226,7 @@ _autopilot_runtime_lock = threading.Lock()
 _autopilot_last_run: dict[str, Any] | None = None
 _autopilot_uncovered_exits: set[str] = set()
 _autopilot_stale_exits: set[str] = set()
+_autopilot_option_cooldowns: dict[str, datetime] = {}
 
 
 def _get_db_connection() -> sqlite3.Connection:
@@ -1246,6 +1247,31 @@ def _find_option_position(symbol: str, positions_snapshot: list[dict[str, Any]])
     return None
 
 
+def _set_option_cooldown(underlying: str, now: datetime, minutes: int = 60) -> None:
+    """Prevent new option entries on this underlying for a short window."""
+
+    if not underlying:
+        return
+    underlying = underlying.upper()
+    _autopilot_option_cooldowns[underlying] = now + timedelta(minutes=minutes)
+
+
+def _option_on_cooldown(underlying: str, now: datetime) -> bool:
+    """Return True if this underlying is in a cooldown window."""
+
+    if not underlying:
+        return False
+    underlying = underlying.upper()
+    until = _autopilot_option_cooldowns.get(underlying)
+    if not until:
+        return False
+    if until <= now:
+        # Cooldown expired, clear it
+        _autopilot_option_cooldowns.pop(underlying, None)
+        return False
+    return True
+
+
 def _autopilot_select_option_contract(
     symbol: str,
     strategy: dict[str, Any],
@@ -1639,6 +1665,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
         logger.debug("Autopilot cycle skipped; previous cycle still running")
         return
 
+    now = datetime.now(timezone.utc)
     summary_lines: list[str] = []
     errors: list[str] = []
     orders_placed = 0
@@ -1952,12 +1979,17 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         summary_lines.append(
                             f"Exit {qty} {contract_symbol} ({'; '.join(reasons)})"
                         )
+                        # Apply cooldown to the underlying so we do not immediately reenter
+                        if underlying:
+                            _set_option_cooldown(underlying, now, minutes=60)
                     except NoAvailableBidError:
                         postpone_msg = (
                             f"Exit for {contract_symbol} postponed; Alpaca reports no available bid."
                         )
                         logger.info(postpone_msg)
                         summary_lines.append(postpone_msg)
+                        if underlying:
+                            _set_option_cooldown(underlying, now, minutes=60)
                     except OptionCloseRejectedError as exc:
                         warning = (
                             f"Exit for {contract_symbol} rejected: {exc.api_message or exc}"
@@ -1979,6 +2011,17 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             _autopilot_stale_exits.add(contract_symbol)
                             _autopilot_uncovered_exits.discard(contract_symbol)
+                            continue
+                        if "no available bid for symbol" in message_lower:
+                            logger.warning(
+                                "Exit for %s not filled: %s", contract_symbol, exc
+                            )
+                            summary_lines.append(
+                                f"Exit for {contract_symbol} postponed; Alpaca reports no available bid."
+                            )
+                            if underlying:
+                                _set_option_cooldown(underlying, now, minutes=60)
+                            _autopilot_stale_exits.add(contract_symbol)
                             continue
                         logger.exception("Autopilot option exit failed for %s", contract_symbol)
                         errors.append(f"sell {contract_symbol} failed: {exc}")
@@ -2120,6 +2163,14 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     continue
 
                 if asset_class == "option":
+                    # Skip underlyings that are in a cooldown window to avoid repeated churn
+                    if _option_on_cooldown(symbol, now):
+                        summary_lines.append(
+                            f"Candidate {symbol}: direction=none reason=cooldown in effect bias={bias}"
+                        )
+                        log_candidate_outcome("cooldown", "none")
+                        continue
+
                     if symbol in pending_underlyings:
                         log_candidate_outcome(
                             "no entry, order already pending for underlying", "none"
@@ -2137,7 +2188,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "none",
                             )
                             continue
-                        put_choice = choose_put_contract(symbol, datetime.now(timezone.utc))
+                        put_choice = choose_put_contract(symbol, now)
                         if not put_choice:
                             summary_lines.append(
                                 f"Skip bearish {symbol}; no suitable put contract found."
@@ -2571,7 +2622,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
         errors.append(str(exc))
     finally:
         with _autopilot_lock:
-            _autopilot_state["last_run"] = datetime.now()
+            _autopilot_state["last_run"] = now
             _autopilot_state["last_actions"] = summary_lines or ["Cycle complete with no trades."]
             _autopilot_state["last_error"] = "; ".join(errors) if errors else None
         _autopilot_runtime_lock.release()

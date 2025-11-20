@@ -533,19 +533,17 @@ def _latest_spot_price(symbol: str, as_of: datetime) -> Optional[float]:
     return price if price and price > 0 else None
 
 
-def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
-    """Select a reasonably liquid put contract near the money.
+def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Optional[dict]:
+    """Internal helper to select a reasonably liquid contract near the money."""
 
-    The selection favors expirations roughly 2–10 weeks out and strikes within
-    about ±10% of the current price. Contracts must have a non-zero
-    bid and either volume or open interest to be considered.
-    """
-
-    logger.info("Choosing put contract for %s", symbol.upper())
+    kind = option_type.lower()
+    logger.info("Choosing %s contract for %s", kind, symbol.upper())
 
     spot = _latest_spot_price(symbol, now)
     if not spot:
-        logger.warning("Skipping put selection for %s: no recent price", symbol.upper())
+        logger.warning(
+            "Skipping %s selection for %s: no recent price", kind, symbol.upper()
+        )
         return None
 
     min_expiry = now.date() + timedelta(days=14)
@@ -556,15 +554,15 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
             symbol,
             expiration_date_from=min_expiry,
             expiration_date_to=max_expiry,
-            option_type="put",
+            option_type=kind,
             limit=500,
         )
     except Exception as exc:
-        logger.warning("Put chain fetch failed for %s: %s", symbol.upper(), exc)
+        logger.warning("%s chain fetch failed for %s: %s", kind.title(), symbol.upper(), exc)
         return None
 
     if not chain:
-        logger.info("No put contracts available for %s", symbol.upper())
+        logger.info("No %s contracts available for %s", kind, symbol.upper())
         return None
 
     best: dict | None = None
@@ -591,16 +589,25 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
 
             bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
             ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
-            last = _safe_float(contract.get("last_price") or contract.get("last_trade_price"))
+            last = _safe_float(
+                contract.get("last_price") or contract.get("last_trade_price")
+            )
+
+            # Require a real, non zero market
             if bid is None or ask is None or bid <= 0 or ask <= 0:
                 continue
+
+            # Avoid penny wide ghost quotes
+            if bid < 0.05:
+                continue
+
             spread_pct = (ask - bid) / ask if ask else 1.0
-            if spread_pct > 0.8:
+            if spread_pct > 0.45:
                 continue
 
             open_int = _safe_float(contract.get("open_interest"), 0.0)
             volume = _safe_float(contract.get("volume"), 0.0)
-            if (open_int or 0) <= 0 and (volume or 0) <= 0:
+            if (open_int or 0) < 50 and (volume or 0) < 10:
                 continue
 
             mid = (bid + ask) / 2.0
@@ -626,13 +633,15 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
 
     if not best:
         logger.info(
-            "No suitable put contract for %s (filtered out by liquidity or strike rules)",
+            "No suitable %s contract for %s (filtered out by liquidity or strike rules)",
+            kind,
             symbol.upper(),
         )
         return None
 
     logger.info(
-        "Selected put for %s: option_symbol=%s strike=%.2f expiry=%s mid_price=%.2f",
+        "Selected %s for %s: option_symbol=%s strike=%.2f expiry=%s mid_price=%.2f",
+        kind,
         symbol.upper(),
         best["option_symbol"],
         best["strike"],
@@ -640,6 +649,26 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
         best.get("mid", 0.0),
     )
     return best
+
+
+def choose_call_contract(symbol: str, now: datetime) -> Optional[dict]:
+    """Select a reasonably liquid call near the money, skipping illiquid quotes.
+
+    Contracts with very low bids, wide spreads, or weak open interest/volume are
+    filtered out before selection.
+    """
+
+    return _choose_option_contract(symbol, now, "call")
+
+
+def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
+    """Select a reasonably liquid put near the money with liquidity guards.
+
+    Contracts with very low bids, wide spreads, or weak open interest/volume are
+    filtered out before selection.
+    """
+
+    return _choose_option_contract(symbol, now, "put")
 
 def _fetch_yfinance_history(symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame:
     """Retrieve bars from yfinance as a fallback."""
@@ -715,5 +744,6 @@ __all__ = [
     "get_price_history",
     "PriceDataError",
     "fetch_option_contracts",
+    "choose_call_contract",
     "choose_put_contract",
 ]
