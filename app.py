@@ -22,7 +22,12 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
-from paper_trading import AlpacaPaperBroker, NoAvailableBidError, OptionCloseRejectedError
+from paper_trading import (
+    AlpacaAPIError,
+    AlpacaPaperBroker,
+    NoAvailableBidError,
+    OptionCloseRejectedError,
+)
 from market_data import PriceDataError
 from market_data import choose_put_contract, fetch_option_contracts
 from market_data import get_price_history as load_price_history
@@ -220,6 +225,7 @@ _autopilot_lock = threading.Lock()
 _autopilot_runtime_lock = threading.Lock()
 _autopilot_last_run: dict[str, Any] | None = None
 _autopilot_uncovered_exits: set[str] = set()
+_autopilot_stale_exits: set[str] = set()
 
 
 def _get_db_connection() -> sqlite3.Connection:
@@ -1808,8 +1814,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
             )
             if asset_class == "option":
                 _autopilot_uncovered_exits.intersection_update(set(current_positions.keys()))
+                _autopilot_stale_exits.intersection_update(set(current_positions.keys()))
             else:
                 _autopilot_uncovered_exits.clear()
+                _autopilot_stale_exits.clear()
 
             if asset_class == "option":
                 option_profit = safe_float(strategy.get("options_take_profit_pct"), 0.8)
@@ -1817,6 +1825,11 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 expiry_buffer = max(0, int(safe_float(strategy.get("options_expiry_buffer"), 5)))
 
                 for contract_symbol, entry in current_positions.items():
+                    if contract_symbol in _autopilot_stale_exits:
+                        logger.debug(
+                            "Skipping stale exit for %s; previously cleared", contract_symbol
+                        )
+                        continue
                     if contract_symbol in _autopilot_uncovered_exits:
                         notice = (
                             f"Manual attention required for {contract_symbol}; previous exit rejected as uncovered."
@@ -1952,6 +1965,23 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         logger.warning(warning)
                         summary_lines.append(warning)
                         _autopilot_uncovered_exits.add(contract_symbol)
+                    except AlpacaAPIError as exc:
+                        message_lower = str(getattr(exc, "api_message", exc)).lower()
+                        if exc.status_code == 403 and (
+                            "insufficient qty available for order" in message_lower
+                            or "account not eligible to trade uncovered option contracts" in message_lower
+                        ):
+                            logger.warning(
+                                "Ignoring stale exit for %s: %s (status=%s)",
+                                contract_symbol,
+                                exc,
+                                getattr(exc, "status_code", None),
+                            )
+                            _autopilot_stale_exits.add(contract_symbol)
+                            _autopilot_uncovered_exits.discard(contract_symbol)
+                            continue
+                        logger.exception("Autopilot option exit failed for %s", contract_symbol)
+                        errors.append(f"sell {contract_symbol} failed: {exc}")
                     except Exception as exc:
                         logger.exception("Autopilot option exit failed for %s", contract_symbol)
                         errors.append(f"sell {contract_symbol} failed: {exc}")
@@ -3098,12 +3128,6 @@ app.before_request(_ensure_background_jobs)
 
 # Start background tasks as soon as the module is imported (e.g., via `flask run`)
 start_background_jobs()
-
-
-@app.before_serving
-def _start_background_jobs_before_serving() -> None:
-    """Ensure schedulers are running even if no HTTP traffic arrives."""
-    start_background_jobs()
 
 
 @app.route("/scheduler-status")
