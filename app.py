@@ -2550,7 +2550,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
         error_text = "; ".join(errors) if errors else None
         _record_autopilot_run(not errors, summary_text, error_text)
         logger.info(
-            "Autopilot cycle finished; candidates=%d, orders=%d, errors=%d",
+            "Autopilot cycle finished (%s); candidates=%d, orders=%d, errors=%d",
+            "forced" if force else "scheduled",
             candidate_count,
             orders_placed,
             len(errors),
@@ -3046,30 +3047,47 @@ def start_background_jobs():
     with _background_jobs_lock:
         if _background_jobs_started:
             return
+        logger.info("Starting background scheduler")
+        # Run both routines immediately so the UI has fresh data without waiting
+        threading.Thread(target=seek_recommendations, daemon=True).start()
+        trigger_autopilot_run()
+        _scheduler = BackgroundScheduler()
+        _scheduler.add_job(
+            seek_recommendations,
+            "interval",
+            hours=1,
+            next_run_time=datetime.now(),
+            id="seek_recommendations",
+            replace_existing=True,
+        )
+        _scheduler.add_job(
+            run_autopilot_cycle,
+            "interval",
+            minutes=5,
+            next_run_time=datetime.now(),
+            id="run_autopilot_cycle",
+            replace_existing=True,
+        )
+        _scheduler.start()
         _background_jobs_started = True
-    logger.info("Starting background scheduler")
-    # Run both routines immediately so the UI has fresh data without waiting
-    threading.Thread(target=seek_recommendations, daemon=True).start()
-    trigger_autopilot_run()
-    _scheduler = BackgroundScheduler()
-    _scheduler.add_job(
-        seek_recommendations,
-        "interval",
-        hours=1,
-        next_run_time=datetime.now(),
-        id="seek_recommendations",
-        replace_existing=True,
-    )
-    _scheduler.add_job(
-        run_autopilot_cycle,
-        "interval",
-        minutes=5,
-        next_run_time=datetime.now(),
-        id="run_autopilot_cycle",
-        replace_existing=True,
-    )
-    _scheduler.start()
     logger.info("Background jobs started")
+    job_seek = _scheduler.get_job("seek_recommendations")
+    job_auto = _scheduler.get_job("run_autopilot_cycle")
+    if job_seek:
+        logger.info(
+            "Job 'seek_recommendations' scheduled; next run at %s",
+            job_seek.next_run_time,
+        )
+    else:
+        logger.warning("Job 'seek_recommendations' not found after scheduler start")
+
+    if job_auto:
+        logger.info(
+            "Job 'run_autopilot_cycle' scheduled; next run at %s",
+            job_auto.next_run_time,
+        )
+    else:
+        logger.warning("Job 'run_autopilot_cycle' not found after scheduler start")
 
 def _ensure_background_jobs() -> None:
     if not _background_jobs_started:
@@ -3077,6 +3095,27 @@ def _ensure_background_jobs() -> None:
 
 
 app.before_request(_ensure_background_jobs)
+
+
+@app.route("/scheduler-status")
+def scheduler_status():
+    global _scheduler
+    if _scheduler is None:
+        return {"scheduler": "not_started"}, 200
+
+    jobs = _scheduler.get_jobs()
+    data = {
+        "scheduler": "running",
+        "jobs": [
+            {
+                "id": job.id,
+                "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+                "trigger": str(job.trigger),
+            }
+            for job in jobs
+        ],
+    }
+    return data, 200
 
 
 # -----------------------------
