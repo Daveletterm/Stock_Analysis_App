@@ -3096,6 +3096,9 @@ def _ensure_background_jobs() -> None:
 
 app.before_request(_ensure_background_jobs)
 
+# Start background tasks as soon as the module is imported (e.g., via `flask run`)
+start_background_jobs()
+
 
 @app.route("/scheduler-status")
 def scheduler_status():

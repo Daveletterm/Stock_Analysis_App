@@ -536,8 +536,8 @@ def _latest_spot_price(symbol: str, as_of: datetime) -> Optional[float]:
 def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
     """Select a reasonably liquid put contract near the money.
 
-    The selection favors expirations roughly 21–60 days out and strikes within
-    about ±8% of the current price. Contracts must have a non-zero
+    The selection favors expirations roughly 2–10 weeks out and strikes within
+    about ±10% of the current price. Contracts must have a non-zero
     bid and either volume or open interest to be considered.
     """
 
@@ -548,8 +548,8 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
         logger.warning("Skipping put selection for %s: no recent price", symbol.upper())
         return None
 
-    min_expiry = now.date() + timedelta(days=21)
-    max_expiry = now.date() + timedelta(days=60)
+    min_expiry = now.date() + timedelta(days=14)
+    max_expiry = now.date() + timedelta(days=75)
 
     try:
         chain = fetch_option_contracts(
@@ -586,7 +586,7 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
             strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
             if not strike:
                 continue
-            if strike < spot * 0.92 or strike > spot * 1.08:
+            if strike < spot * 0.90 or strike > spot * 1.10:
                 continue
 
             bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
@@ -595,7 +595,7 @@ def choose_put_contract(symbol: str, now: datetime) -> Optional[dict]:
             if bid is None or ask is None or bid <= 0 or ask <= 0:
                 continue
             spread_pct = (ask - bid) / ask if ask else 1.0
-            if spread_pct > 0.6:
+            if spread_pct > 0.8:
                 continue
 
             open_int = _safe_float(contract.get("open_interest"), 0.0)
