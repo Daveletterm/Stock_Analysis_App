@@ -3097,6 +3097,12 @@ def _ensure_background_jobs() -> None:
 app.before_request(_ensure_background_jobs)
 
 
+@app.before_serving
+def _start_background_jobs_before_serving() -> None:
+    """Ensure schedulers are running even if no HTTP traffic arrives."""
+    start_background_jobs()
+
+
 @app.route("/scheduler-status")
 def scheduler_status():
     global _scheduler
