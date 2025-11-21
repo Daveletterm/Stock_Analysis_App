@@ -228,6 +228,7 @@ _autopilot_last_run: dict[str, Any] | None = None
 _autopilot_uncovered_exits: set[str] = set()
 _autopilot_stale_exits: set[str] = set()
 _autopilot_option_cooldowns: dict[str, datetime] = {}
+ZOMBIE_POSITIONS: set[str] = set()
 
 
 def _get_db_connection() -> sqlite3.Connection:
@@ -1273,6 +1274,23 @@ def _option_on_cooldown(underlying: str, now: datetime) -> bool:
     return True
 
 
+def _mark_zombie_position(
+    symbol: str, *, reason: str | None = None, summary_lines: list[str] | None = None
+) -> None:
+    """Mark an option contract as a zombie so autopilot ignores it going forward."""
+
+    contract_symbol = symbol.replace(" ", "").upper()
+    if not contract_symbol or contract_symbol in ZOMBIE_POSITIONS:
+        return
+    ZOMBIE_POSITIONS.add(contract_symbol)
+    _autopilot_uncovered_exits.discard(contract_symbol)
+    _autopilot_stale_exits.discard(contract_symbol)
+    message = f"Marking {contract_symbol} as zombie; {reason or 'alpaca rejection'}"
+    logger.warning(message)
+    if summary_lines is not None:
+        summary_lines.append(f"{contract_symbol} marked zombie ({reason or 'ignored'})")
+
+
 def _autopilot_select_option_contract(
     symbol: str,
     strategy: dict[str, Any],
@@ -1372,7 +1390,9 @@ def _autopilot_select_option_contract(
 
     chains: dict[str, list[dict[str, Any]]] = {}
     chain_sizes: dict[str, int] = {}
+    raw_chain_sizes: dict[str, int] = {}
     priced_counts: dict[str, int] = {}
+    chain_filtered_counts: dict[str, int] = {}
     chain_errors: dict[str, str] = {}
     for option_type in contract_types:
         try:
@@ -1386,6 +1406,39 @@ def _autopilot_select_option_contract(
         except PriceDataError as exc:
             chain = []
             chain_errors[option_type] = str(exc)
+        raw_count = len(chain)
+        filtered_chain: list[dict[str, Any]] = []
+        filtered_out = 0
+        for contract in chain:
+            status_value = str(contract.get("status", "") or contract.get("state", "")).lower()
+            if status_value and status_value != "active":
+                filtered_out += 1
+                continue
+            bid, ask = option_bid_ask(contract)
+            bid_val = safe_float(bid, None)
+            ask_val = safe_float(ask, None)
+            if bid_val is None or ask_val is None or bid_val <= 0 or ask_val <= 0:
+                filtered_out += 1
+                continue
+            oi = safe_float(contract.get("open_interest"), None)
+            volume = safe_float(contract.get("volume"), None)
+            if volume is not None and volume < 1:
+                filtered_out += 1
+                continue
+            if oi is not None and oi < 1:
+                filtered_out += 1
+                continue
+            filtered_chain.append(contract)
+        if filtered_out:
+            logger.info(
+                "Option chain filtered %d/%d %s contracts for %s due to quote/liquidity rules",
+                filtered_out,
+                raw_count,
+                option_type,
+                symbol.upper(),
+            )
+        chain_filtered_counts[option_type] = filtered_out
+        chain = filtered_chain
         priced = 0
         for contract in chain:
             price, _ = _derive_option_price(contract)
@@ -1393,21 +1446,30 @@ def _autopilot_select_option_contract(
                 priced += 1
         chains[option_type] = chain
         chain_sizes[option_type] = len(chain)
+        raw_chain_sizes[option_type] = raw_count
         priced_counts[option_type] = priced
     diagnostics["chain_sizes"] = chain_sizes
+    diagnostics["chain_raw_sizes"] = raw_chain_sizes
+    diagnostics["chain_filtered_out"] = chain_filtered_counts
     diagnostics["priced_contracts"] = priced_counts
     if chain_errors:
         diagnostics["chain_errors"] = chain_errors
 
+    total_raw_contracts = sum(raw_chain_sizes.values())
     total_contracts = sum(chain_sizes.values())
+    total_filtered_contracts = sum(chain_filtered_counts.values())
     total_priced_contracts = sum(priced_counts.values())
+    diagnostics["total_raw_contracts"] = total_raw_contracts
     diagnostics["total_contracts"] = total_contracts
+    diagnostics["total_filtered_contracts"] = total_filtered_contracts
     diagnostics["total_priced_contracts"] = total_priced_contracts
     logger.info(
-        "Option chain summary for %s: %d total contracts (%d priced)",
+        "Option chain summary for %s: kept %d/%d after filters (%d priced, %d filtered out)",
         symbol.upper(),
         total_contracts,
+        total_raw_contracts,
         total_priced_contracts,
+        total_filtered_contracts,
     )
     if total_contracts == 0:
         diagnostics["base_rejections"] = {"empty_chain": len(contract_types)}
@@ -1745,6 +1807,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 qty = safe_float(pos.get("qty"), safe_float(pos.get("quantity")))
                 if not symbol or qty <= 0:
                     continue
+                if symbol in ZOMBIE_POSITIONS:
+                    logger.debug("Skipping zombie position %s from autopilot snapshot", symbol)
+                    continue
                 market_value = abs(
                     safe_float(
                         pos.get("market_value"),
@@ -1837,9 +1902,15 @@ def run_autopilot_cycle(force: bool = False) -> None:
             exit_threshold = strategy.get("exit_score", 2.0)
             lookback = strategy.get("lookback", "1y")
 
-            current_positions = (
+            base_positions = (
                 held_positions["option"] if asset_class == "option" else held_positions["equity"]
             )
+            if asset_class == "option":
+                current_positions = {
+                    sym: entry for sym, entry in base_positions.items() if sym not in ZOMBIE_POSITIONS
+                }
+            else:
+                current_positions = base_positions
             if asset_class == "option":
                 _autopilot_uncovered_exits.intersection_update(set(current_positions.keys()))
                 _autopilot_stale_exits.intersection_update(set(current_positions.keys()))
@@ -1853,6 +1924,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 expiry_buffer = max(0, int(safe_float(strategy.get("options_expiry_buffer"), 5)))
 
                 for contract_symbol, entry in current_positions.items():
+                    if contract_symbol in ZOMBIE_POSITIONS:
+                        logger.debug("Skipping zombie contract %s during exit review", contract_symbol)
+                        continue
                     if contract_symbol in _autopilot_stale_exits:
                         logger.debug(
                             "Skipping stale exit for %s; previously cleared", contract_symbol
@@ -1974,7 +2048,11 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             logger.warning(warning)
                             summary_lines.append(warning)
-                            _autopilot_uncovered_exits.add(contract_symbol)
+                            _mark_zombie_position(
+                                contract_symbol,
+                                reason="uncovered rejection",
+                                summary_lines=summary_lines,
+                            )
                             if ENABLE_ZOMBIE_DELETE:
                                 try:
                                     delete_result = paper_broker.delete_position(contract_symbol)
@@ -1989,7 +2067,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                     if underlying:
                                         _set_option_cooldown(underlying, now, minutes=60)
                                     _autopilot_stale_exits.add(contract_symbol)
-                                    _autopilot_uncovered_exits.discard(contract_symbol)
                                     continue
                                 except AlpacaAPIError as delete_err:
                                     logger.error(
@@ -2025,7 +2102,11 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         )
                         logger.warning(warning)
                         summary_lines.append(warning)
-                        _autopilot_uncovered_exits.add(contract_symbol)
+                        _mark_zombie_position(
+                            contract_symbol,
+                            reason="uncovered rejection",
+                            summary_lines=summary_lines,
+                        )
                         if ENABLE_ZOMBIE_DELETE:
                             try:
                                 delete_result = paper_broker.delete_position(contract_symbol)
@@ -2040,7 +2121,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 if underlying:
                                     _set_option_cooldown(underlying, now, minutes=60)
                                 _autopilot_stale_exits.add(contract_symbol)
-                                _autopilot_uncovered_exits.discard(contract_symbol)
                                 continue
                             except AlpacaAPIError as delete_err:
                                 logger.error(
@@ -2057,25 +2137,41 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     except AlpacaAPIError as exc:
                         msg = str(exc).lower()
                         underlying = parsed.get("underlying") if parsed else None
-                        if exc.status_code == 403 and "insufficient qty available for order" in msg:
-                            logger.warning(
-                                "Ignoring stale exit for %s: %s (status=%s)",
-                                contract_symbol,
-                                exc,
-                                getattr(exc, "status_code", None),
-                            )
-                            _autopilot_stale_exits.add(contract_symbol)
-                            _autopilot_uncovered_exits.discard(contract_symbol)
-                            if underlying:
-                                _set_option_cooldown(underlying, now, minutes=60)
-                            continue
+                        if exc.status_code == 403:
+                            if "insufficient qty available for order" in msg:
+                                logger.warning(
+                                    "Marking zombie for %s: insufficient qty rejection (%s)",
+                                    contract_symbol,
+                                    exc,
+                                )
+                                _mark_zombie_position(
+                                    contract_symbol,
+                                    reason="insufficient qty rejection",
+                                    summary_lines=summary_lines,
+                                )
+                                _autopilot_stale_exits.add(contract_symbol)
+                                _autopilot_uncovered_exits.discard(contract_symbol)
+                                if underlying:
+                                    _set_option_cooldown(underlying, now, minutes=60)
+                                continue
+                            if "account not eligible to trade uncovered option contracts" in msg:
+                                logger.warning(
+                                    "Marking zombie for %s: uncovered rejection (%s)",
+                                    contract_symbol,
+                                    exc,
+                                )
+                                _mark_zombie_position(
+                                    contract_symbol,
+                                    reason="uncovered rejection",
+                                    summary_lines=summary_lines,
+                                )
+                                if underlying:
+                                    _set_option_cooldown(underlying, now, minutes=60)
+                                continue
 
-                        if "no available bid for symbol" in msg or (
-                            exc.status_code == 403
-                            and "account not eligible to trade uncovered option contracts" in msg
-                        ):
+                        if "no available bid for symbol" in msg:
                             logger.warning(
-                                "Exit failed for %s due to illiquidity or uncovered rules: %s - attempting hard delete via positions API",
+                                "Exit failed for %s due to illiquidity (no available bid): %s - attempting hard delete via positions API",
                                 contract_symbol,
                                 exc,
                             )
@@ -2143,6 +2239,24 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         except Exception as exc:
                             logger.exception("Autopilot equity exit failed for %s", symbol)
                             errors.append(f"sell {symbol} failed: {exc}")
+
+            if asset_class == "option":
+                current_positions = {
+                    sym: entry for sym, entry in current_positions.items() if sym not in ZOMBIE_POSITIONS
+                }
+                held_option_underlyings = {
+                    entry["meta"].get("underlying")
+                    for entry in current_positions.values()
+                    if isinstance(entry.get("meta"), dict) and entry["meta"].get("underlying")
+                }
+                held_option_underlyings = {sym for sym in held_option_underlyings if sym}
+                held_put_underlyings = {
+                    entry["meta"].get("underlying")
+                    for entry in current_positions.values()
+                    if isinstance(entry.get("meta"), dict)
+                    and entry["meta"].get("underlying")
+                    and entry["meta"].get("type") == "put"
+                }
 
             held_and_pending = set(current_positions.keys())
             pending_underlyings = (
