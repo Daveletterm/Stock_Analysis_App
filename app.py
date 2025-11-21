@@ -1975,6 +1975,34 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             logger.warning(warning)
                             summary_lines.append(warning)
                             _autopilot_uncovered_exits.add(contract_symbol)
+                            if ENABLE_ZOMBIE_DELETE:
+                                try:
+                                    delete_result = paper_broker.delete_position(contract_symbol)
+                                    logger.warning(
+                                        "Hard delete for zombie position %s completed after uncovered rejection: %s",
+                                        contract_symbol,
+                                        delete_result,
+                                    )
+                                    summary_lines.append(
+                                        f"Hard-deleted zombie position {contract_symbol} via API after uncovered rejection"
+                                    )
+                                    if underlying:
+                                        _set_option_cooldown(underlying, now, minutes=60)
+                                    _autopilot_stale_exits.add(contract_symbol)
+                                    _autopilot_uncovered_exits.discard(contract_symbol)
+                                    continue
+                                except AlpacaAPIError as delete_err:
+                                    logger.error(
+                                        "Hard delete for %s failed after uncovered rejection: %s (status=%s)",
+                                        contract_symbol,
+                                        delete_err,
+                                        getattr(delete_err, "status_code", None),
+                                    )
+                            else:
+                                logger.warning(
+                                    "Zombie delete for %s skipped because ENABLE_ZOMBIE_DELETE is False",
+                                    contract_symbol,
+                                )
                             continue
                         orders_placed += 1
                         summary_lines.append(
@@ -1998,6 +2026,34 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         logger.warning(warning)
                         summary_lines.append(warning)
                         _autopilot_uncovered_exits.add(contract_symbol)
+                        if ENABLE_ZOMBIE_DELETE:
+                            try:
+                                delete_result = paper_broker.delete_position(contract_symbol)
+                                logger.warning(
+                                    "Hard delete for zombie position %s completed after close rejection: %s",
+                                    contract_symbol,
+                                    delete_result,
+                                )
+                                summary_lines.append(
+                                    f"Hard-deleted zombie position {contract_symbol} via API after close rejection"
+                                )
+                                if underlying:
+                                    _set_option_cooldown(underlying, now, minutes=60)
+                                _autopilot_stale_exits.add(contract_symbol)
+                                _autopilot_uncovered_exits.discard(contract_symbol)
+                                continue
+                            except AlpacaAPIError as delete_err:
+                                logger.error(
+                                    "Hard delete for %s failed after close rejection: %s (status=%s)",
+                                    contract_symbol,
+                                    delete_err,
+                                    getattr(delete_err, "status_code", None),
+                                )
+                        else:
+                            logger.warning(
+                                "Zombie delete for %s skipped because ENABLE_ZOMBIE_DELETE is False",
+                                contract_symbol,
+                            )
                     except AlpacaAPIError as exc:
                         msg = str(exc).lower()
                         underlying = parsed.get("underlying") if parsed else None
