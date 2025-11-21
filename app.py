@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, date, timezone
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from io import StringIO
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Literal
 
 import requests
 
@@ -118,77 +118,89 @@ class OptionSelection:
 # Autopilot configuration
 # -----------------------------
 
-AUTOPILOT_STRATEGIES = {
-    "conservative": {
-        "label": "Conservative Growth",
-        "description": "Focus on highest scoring names with tight risk controls and limited exposure.",
-        "min_score": 3.6,
-        "exit_score": 2.2,
-        "max_positions": 4,
-        "max_position_pct": 0.08,
+OPTION_MOMENTUM_DEFAULTS = {
+    "options_expiry_buffer": 5,
+    "options_expiry_window": (21, 45),
+    "min_open_interest": 75,
+    "min_volume": 10,
+    "target_delta": 0.4,
+    "min_delta": 0.25,
+    "max_delta": 0.65,
+    "max_spread_pct": 0.45,
+    "max_implied_volatility": 3.0,
+    "max_premium_pct_of_spot": 0.35,
+    "contract_type": "auto",
+    "allow_opposite_contract": True,
+    "max_contracts_per_trade": 5,
+    "max_position_debit": None,
+    "lookback": "1y",
+}
+
+HYBRID_STRATEGIES = {
+    "hybrid_conservative": {
+        **OPTION_MOMENTUM_DEFAULTS,
+        "label": "Conservative (hybrid)",
+        "description": "Favor shares with occasional options on very strong setups.",
+        "max_positions": 2,
+        "stock_position_fraction": 0.02,
+        "option_position_fraction": 0.01,
+        "min_bullish_score": 5.0,
+        "min_bearish_score": 3.5,
+        "option_bias": "rare",
+        "option_stop_loss_pct": 0.30,
+        "option_take_profit_pct": 0.60,
+        "stock_stop_loss_pct": 0.05,
+        "stock_take_profit_pct": 0.12,
         "max_total_allocation": 0.55,
-        "min_entry_notional": 300.0,
-        "stop_loss_pct": 0.03,
-        "take_profit_pct": 0.06,
-        "lookback": "1y",
+        "min_entry_notional": 200.0,
+        "exit_score": 2.2,
     },
-    "balanced": {
-        "label": "Balanced Momentum",
-        "description": "Blend of momentum and trend with moderate diversification and bracket exits.",
-        "min_score": 3.2,
-        "exit_score": 2.0,
-        "max_positions": 6,
-        "max_position_pct": 0.12,
+    "hybrid_balanced": {
+        **OPTION_MOMENTUM_DEFAULTS,
+        "label": "Balanced (hybrid)",
+        "description": "Blend shares and options depending on price level and score strength.",
+        "max_positions": 4,
+        "stock_position_fraction": 0.02,
+        "option_position_fraction": 0.02,
+        "min_bullish_score": 4.5,
+        "min_bearish_score": 3.0,
+        "option_bias": "mixed",
+        "option_stop_loss_pct": 0.40,
+        "option_take_profit_pct": 0.80,
+        "stock_stop_loss_pct": 0.06,
+        "stock_take_profit_pct": 0.15,
         "max_total_allocation": 0.8,
         "min_entry_notional": 200.0,
-        "stop_loss_pct": 0.045,
-        "take_profit_pct": 0.12,
-        "lookback": "1y",
+        "exit_score": 2.0,
     },
-    "aggressive": {
-        "label": "Aggressive Breakouts",
-        "description": "Targets early breakouts with wider stops and more simultaneous bets.",
-        "min_score": 2.8,
-        "exit_score": 1.6,
-        "max_positions": 9,
-        "max_position_pct": 0.16,
+    "hybrid_aggressive": {
+        **OPTION_MOMENTUM_DEFAULTS,
+        "label": "Aggressive (hybrid)",
+        "description": "Prefer options when available; fall back to shares when needed.",
+        "max_positions": 6,
+        "stock_position_fraction": 0.03,
+        "option_position_fraction": 0.03,
+        "min_bullish_score": 4.0,
+        "min_bearish_score": 2.5,
+        "option_bias": "prefer_options",
+        "option_stop_loss_pct": 0.50,
+        "option_take_profit_pct": 1.10,
+        "stock_stop_loss_pct": 0.08,
+        "stock_take_profit_pct": 0.20,
         "max_total_allocation": 1.05,
         "min_entry_notional": 150.0,
-        "stop_loss_pct": 0.065,
-        "take_profit_pct": 0.2,
-        "lookback": "9mo",
-    },
-    "options_momentum": {
-        "label": "Momentum Options",
-        "description": (
-            "Seek liquid, near-dated contracts on top-scoring names with conservative risk controls."
-        ),
-        "asset_class": "option",
-        "min_score": 3.4,
-        "bearish_min_score": 3.0,
-        "exit_score": 2.4,
-        "max_positions": 4,
-        "max_position_pct": 0.06,
-        "max_total_allocation": 0.4,
-        "min_entry_notional": 150.0,
-        "options_take_profit_pct": 0.85,
-        "options_stop_loss_pct": 0.45,
-        "options_expiry_buffer": 5,
-        "options_expiry_window": (21, 45),
-        "min_open_interest": 75,
-        "min_volume": 10,
-        "target_delta": 0.4,
-        "min_delta": 0.25,
-        "max_delta": 0.65,
-        "max_spread_pct": 0.45,
-        "max_implied_volatility": 3.0,
-        "max_premium_pct_of_spot": 0.35,
-        "contract_type": "auto",
-        "allow_opposite_contract": True,
-        "max_contracts_per_trade": 5,
-        "lookback": "6mo",
+        "exit_score": 1.6,
     },
 }
+
+HYBRID_STRATEGY_ALIASES = {
+    "conservative": "hybrid_conservative",
+    "balanced": "hybrid_balanced",
+    "aggressive": "hybrid_aggressive",
+    "options_momentum": "hybrid_balanced",
+}
+
+AUTOPILOT_STRATEGIES = HYBRID_STRATEGIES
 
 AUTOPILOT_RISK_LEVELS = {
     "low": {
@@ -212,11 +224,12 @@ AUTOPILOT_RISK_LEVELS = {
 }
 
 AUTOPILOT_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "autopilot_state.json")
+DEFAULT_HYBRID_STRATEGY = "hybrid_balanced"
 
 _autopilot_state = {
     "enabled": False,
     "paused": False,
-    "strategy": "balanced",
+    "strategy": DEFAULT_HYBRID_STRATEGY,
     "risk": "medium",
     "last_run": None,
     "last_actions": [],
@@ -228,6 +241,7 @@ _autopilot_last_run: dict[str, Any] | None = None
 _autopilot_uncovered_exits: set[str] = set()
 _autopilot_stale_exits: set[str] = set()
 _autopilot_option_cooldowns: dict[str, datetime] = {}
+_autopilot_position_params: dict[str, Any] = {}
 ZOMBIE_POSITIONS: set[str] = set()
 
 
@@ -360,6 +374,22 @@ def _record_autopilot_run(success: bool, summary: str | None, error: str | None)
         logger.exception("Failed to persist autopilot run")
 
 
+def _resolve_hybrid_strategy_key(strategy: str | None) -> str:
+    if not strategy:
+        return DEFAULT_HYBRID_STRATEGY
+    key = str(strategy).strip()
+    if key in HYBRID_STRATEGIES:
+        return key
+    if key in HYBRID_STRATEGY_ALIASES:
+        return HYBRID_STRATEGY_ALIASES[key]
+    logger.warning(
+        "Unsupported autopilot strategy '%s'; falling back to %s",
+        key,
+        DEFAULT_HYBRID_STRATEGY,
+    )
+    return DEFAULT_HYBRID_STRATEGY
+
+
 def _load_autopilot_state() -> None:
     """Load persisted autopilot settings if present."""
 
@@ -380,9 +410,13 @@ def _load_autopilot_state() -> None:
         for key in ("enabled", "paused"):
             if key in saved:
                 _autopilot_state[key] = bool(saved.get(key))
-        for key in ("strategy", "risk"):
-            if key in saved and isinstance(saved.get(key), str):
-                _autopilot_state[key] = str(saved.get(key))
+        if "strategy" in saved and isinstance(saved.get("strategy"), str):
+            _autopilot_state["strategy"] = _resolve_hybrid_strategy_key(saved.get("strategy"))
+        if "risk" in saved and isinstance(saved.get("risk"), str):
+            _autopilot_state["risk"] = str(saved.get("risk"))
+        if "position_params" in saved and isinstance(saved.get("position_params"), dict):
+            _autopilot_position_params.clear()
+            _autopilot_position_params.update(saved.get("position_params"))
 
 
 def _persist_autopilot_state() -> None:
@@ -394,6 +428,7 @@ def _persist_autopilot_state() -> None:
             "paused": bool(_autopilot_state.get("paused")),
             "strategy": _autopilot_state.get("strategy"),
             "risk": _autopilot_state.get("risk"),
+            "position_params": _autopilot_position_params,
         }
 
     try:  # pragma: no cover - minimal persistence wrapper
@@ -1140,7 +1175,7 @@ def get_autopilot_status() -> dict:
         snapshot["last_run_summary"] = _autopilot_last_run.get("summary")
         snapshot["last_run_error"] = _autopilot_last_run.get("error")
         snapshot["last_run_success"] = bool(_autopilot_last_run.get("success"))
-    snapshot.setdefault("strategy", "balanced")
+    snapshot.setdefault("strategy", DEFAULT_HYBRID_STRATEGY)
     snapshot.setdefault("risk", "medium")
     snapshot.setdefault("paused", False)
     actions = snapshot.get("last_actions")
@@ -1163,19 +1198,12 @@ def update_autopilot_config(
                 _autopilot_state["paused"] = not bool(enabled)
         if paused is not None:
             _autopilot_state["paused"] = bool(paused)
-        if strategy and strategy in AUTOPILOT_STRATEGIES:
-            _autopilot_state["strategy"] = strategy
+        if strategy:
+            _autopilot_state["strategy"] = _resolve_hybrid_strategy_key(strategy)
         if risk and risk in AUTOPILOT_RISK_LEVELS:
             _autopilot_state["risk"] = risk
     _persist_autopilot_state()
     return get_autopilot_status()
-
-
-def _strategy_asset_class(strategy: dict[str, Any]) -> str:
-    asset_class = str(strategy.get("asset_class", "equity")).lower().strip()
-    if asset_class in {"option", "options"}:
-        return "option"
-    return "equity"
 
 
 def _autopilot_order_blocked(symbol: str, open_orders: list[dict]) -> bool:
@@ -1721,6 +1749,83 @@ def _autopilot_prepare_dataframe(symbol: str, period: str) -> pd.DataFrame | Non
     return df
 
 
+def _remember_position_params(
+    symbol: str,
+    *,
+    asset_class: str,
+    stop_loss_pct: float | None,
+    take_profit_pct: float | None,
+    strategy: str,
+) -> None:
+    """Store stop/take parameters for a position so exits use entry-time values."""
+
+    if not symbol:
+        return
+    payload = {
+        "asset_class": asset_class,
+        "stop_loss_pct": stop_loss_pct,
+        "take_profit_pct": take_profit_pct,
+        "strategy": strategy,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _autopilot_lock:
+        _autopilot_position_params[symbol.upper()] = payload
+    _persist_autopilot_state()
+
+
+def _prune_position_params(active_symbols: set[str]) -> None:
+    """Drop stored params for positions that are no longer active."""
+
+    if not active_symbols:
+        active_symbols = set()
+    active_upper = {s.upper() for s in active_symbols}
+    with _autopilot_lock:
+        stale = [sym for sym in _autopilot_position_params if sym not in active_upper]
+        for sym in stale:
+            _autopilot_position_params.pop(sym, None)
+    if stale:
+        _persist_autopilot_state()
+
+
+def choose_instrument_for_candidate(
+    *,
+    bias: str,
+    hybrid_params: dict[str, Any],
+    has_option: bool,
+    score: float,
+    min_score: float,
+    equity_price: float | None,
+) -> tuple[Literal["stock", "option", "skip"], str]:
+    """Return instrument choice and reason for a candidate."""
+
+    bias = bias or "bullish"
+    option_bias = str(hybrid_params.get("option_bias", "mixed")).lower()
+    strong_signal = score >= (min_score + 0.5)
+    price_high = equity_price is not None and equity_price > 100
+
+    if bias == "bearish":
+        if has_option:
+            return "option", "bearish path uses options"
+        return "skip", "no suitable option and bearish path requires options"
+
+    if option_bias == "rare":
+        if has_option and strong_signal:
+            return "option", "very strong signal permits option"
+        return "stock", "prefers shares by default"
+
+    if option_bias == "mixed":
+        if has_option and (price_high or strong_signal):
+            return "option", "price/score favor option"
+        return "stock", "balanced bias leans to shares"
+
+    if option_bias == "prefer_options":
+        if has_option:
+            return "option", "prefers options when available"
+        return "stock", "no suitable option; falling back to shares"
+
+    return "stock", "defaulting to shares"
+
+
 def run_autopilot_cycle(force: bool = False) -> None:
     logger.info("Autopilot cycle starting%s", " (forced)" if force else "")
 
@@ -1736,12 +1841,23 @@ def run_autopilot_cycle(force: bool = False) -> None:
     try:
         with _autopilot_lock:
             config = dict(_autopilot_state)
+        strategy_key_raw = config.get("strategy", DEFAULT_HYBRID_STRATEGY)
+        strategy_key = _resolve_hybrid_strategy_key(strategy_key_raw)
+        if strategy_key != strategy_key_raw:
+            logger.info("Migrated autopilot strategy %s -> %s", strategy_key_raw, strategy_key)
+            with _autopilot_lock:
+                _autopilot_state["strategy"] = strategy_key
+                _persist_autopilot_state()
+        hybrid = HYBRID_STRATEGIES.get(strategy_key, HYBRID_STRATEGIES[DEFAULT_HYBRID_STRATEGY])
+        strategy = hybrid
+        risk_key = config.get("risk", "medium")
+        risk_cfg = AUTOPILOT_RISK_LEVELS.get(risk_key, AUTOPILOT_RISK_LEVELS["medium"])
         logger.info(
             "Autopilot config loaded: enabled=%s paused=%s strategy=%s risk=%s",
             config.get("enabled"),
             config.get("paused"),
-            config.get("strategy"),
-            config.get("risk"),
+            strategy_key,
+            risk_key,
         )
 
         if config.get("enabled") is False or config.get("paused") is True:
@@ -1753,21 +1869,12 @@ def run_autopilot_cycle(force: bool = False) -> None:
             summary_lines.append("Paper trading disabled; autopilot idle.")
             prerequisites_met = False
 
-        strategy: dict[str, Any] = {}
-        risk_cfg: dict[str, Any] = {}
-        asset_class = "equity"
         equity = 0.0
         positions: list[dict] = []
         open_orders: list[dict] = []
         recs_snapshot: list[dict] = []
 
         if prerequisites_met:
-            strategy_key = config.get("strategy", "balanced")
-            risk_key = config.get("risk", "medium")
-            strategy = AUTOPILOT_STRATEGIES.get(strategy_key, AUTOPILOT_STRATEGIES["balanced"])
-            risk_cfg = AUTOPILOT_RISK_LEVELS.get(risk_key, AUTOPILOT_RISK_LEVELS["medium"])
-            asset_class = _strategy_asset_class(strategy)
-
             try:
                 account = paper_broker.get_account()
             except Exception as exc:
@@ -1800,6 +1907,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
             gross_option_notional = 0.0
             held_option_underlyings: set[str] = set()
             held_put_underlyings: set[str] = set()
+            active_symbols: set[str] = set()
 
             for pos in positions:
                 symbol_raw = str(pos.get("symbol", ""))
@@ -1810,6 +1918,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 if symbol in ZOMBIE_POSITIONS:
                     logger.debug("Skipping zombie position %s from autopilot snapshot", symbol)
                     continue
+                active_symbols.add(symbol)
                 market_value = abs(
                     safe_float(
                         pos.get("market_value"),
@@ -1834,6 +1943,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     held_positions["equity"][symbol] = entry
                     gross_equity_notional += market_value
 
+            pending_order_symbols = {
+                str(o.get("symbol", "")).replace(" ", "").upper()
+                for o in open_orders
+                if str(o.get("side", "")).lower() == "buy"
+            }
+            _prune_position_params(active_symbols | pending_order_symbols)
+
             with _lock:
                 recs_payload = _normalize_recommendations_payload(_recommendations)
 
@@ -1848,10 +1964,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
 
             bullish_recs = [dict(r) for r in recs_payload.get("bullish", [])]
             bearish_recs = [dict(r) for r in recs_payload.get("bearish", [])]
-            bullish_pool = bullish_recs
-            bearish_pool = bearish_recs if asset_class == "option" else []
-            bullish_slice = bullish_pool[:5] if asset_class == "option" else bullish_pool
-            bearish_slice = bearish_pool[:5] if asset_class == "option" else []
+            bullish_slice = bullish_recs[:8]
+            bearish_slice = bearish_recs[:5]
             candidate_entries: list[dict[str, Any]] = []
             for rec in bullish_slice:
                 symbol = str(rec.get("Symbol", "")).upper()
@@ -1881,49 +1995,67 @@ def run_autopilot_cycle(force: bool = False) -> None:
             bearish_symbols = {str(rec.get("Symbol", "")).upper() for rec in bearish_slice}
             candidate_count = len(candidate_entries)
             logger.info(
-                "Autopilot evaluating %d recommendation candidates (bullish=%d bearish=%d)",
+                "Autopilot evaluating %d recommendation candidates (bullish=%d bearish=%d strategy=%s)",
                 candidate_count,
                 len(bullish_slice),
                 len(bearish_slice),
+                strategy_key,
             )
 
             position_multiplier = max(risk_cfg.get("position_multiplier", 1.0), 0.25)
             stop_loss_multiplier = max(risk_cfg.get("stop_loss_multiplier", 1.0), 0.25)
             take_profit_multiplier = max(risk_cfg.get("take_profit_multiplier", 1.0), 0.25)
 
-            max_position_pct = min(
-                strategy.get("max_position_pct", 0.1) * position_multiplier, 0.95
-            )
             max_total_allocation = max(
-                0.1, strategy.get("max_total_allocation", 1.0) * position_multiplier
+                0.1, hybrid.get("max_total_allocation", 1.0) * position_multiplier
             )
-            min_entry_notional = max(50.0, strategy.get("min_entry_notional", 200.0))
-
-            exit_threshold = strategy.get("exit_score", 2.0)
-            lookback = strategy.get("lookback", "1y")
-
-            base_positions = (
-                held_positions["option"] if asset_class == "option" else held_positions["equity"]
+            min_entry_notional = max(50.0, hybrid.get("min_entry_notional", 200.0))
+            stock_fraction = max(
+                0.001, hybrid.get("stock_position_fraction", 0.02) * position_multiplier
             )
-            if asset_class == "option":
-                current_positions = {
-                    sym: entry for sym, entry in base_positions.items() if sym not in ZOMBIE_POSITIONS
-                }
-            else:
-                current_positions = base_positions
-            if asset_class == "option":
-                _autopilot_uncovered_exits.intersection_update(set(current_positions.keys()))
-                _autopilot_stale_exits.intersection_update(set(current_positions.keys()))
-            else:
-                _autopilot_uncovered_exits.clear()
-                _autopilot_stale_exits.clear()
+            option_fraction = max(
+                0.001, hybrid.get("option_position_fraction", 0.02) * position_multiplier
+            )
 
-            if asset_class == "option":
-                option_profit = safe_float(strategy.get("options_take_profit_pct"), 0.8)
-                option_stop = abs(safe_float(strategy.get("options_stop_loss_pct"), 0.45))
-                expiry_buffer = max(0, int(safe_float(strategy.get("options_expiry_buffer"), 5)))
+            exit_threshold = hybrid.get(
+                "exit_score", hybrid.get("min_bullish_score", 3.0) - 1.0
+            )
+            lookback = hybrid.get("lookback", "1y")
 
-                for contract_symbol, entry in current_positions.items():
+            max_positions = max(1, int(hybrid.get("max_positions", 5)))
+            current_positions_equity = held_positions["equity"]
+            current_positions_option = {
+                sym: entry for sym, entry in held_positions["option"].items() if sym not in ZOMBIE_POSITIONS
+            }
+            _autopilot_uncovered_exits.intersection_update(set(current_positions_option.keys()))
+            _autopilot_stale_exits.intersection_update(set(current_positions_option.keys()))
+
+            current_positions: dict[str, dict[str, Any]] = {}
+            current_positions.update(current_positions_equity)
+            current_positions.update(current_positions_option)
+            available_slots = max(0, max_positions - len(current_positions))
+
+            option_profit_default = safe_float(hybrid.get("option_take_profit_pct"), 0.8)
+            option_stop_default = abs(
+                safe_float(hybrid.get("option_stop_loss_pct"), 0.45) * stop_loss_multiplier
+            )
+            option_profit_default = (
+                option_profit_default * take_profit_multiplier if option_profit_default is not None else None
+            )
+            expiry_buffer = max(0, int(safe_float(hybrid.get("options_expiry_buffer"), 5)))
+            stock_stop_default = max(
+                0.0,
+                safe_float(hybrid.get("stock_stop_loss_pct"), PAPER_DEFAULT_STOP_LOSS_PCT)
+                * stop_loss_multiplier,
+            )
+            stock_take_default = max(
+                0.0,
+                safe_float(hybrid.get("stock_take_profit_pct"), PAPER_DEFAULT_TAKE_PROFIT_PCT)
+                * take_profit_multiplier,
+            )
+
+            if current_positions_option:
+                for contract_symbol, entry in current_positions_option.items():
                     if contract_symbol in ZOMBIE_POSITIONS:
                         logger.debug("Skipping zombie contract %s during exit review", contract_symbol)
                         continue
@@ -1978,6 +2110,16 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     pos = entry.get("position") or {}
                     parsed = entry.get("meta") or parse_option_symbol(contract_symbol)
                     underlying = parsed.get("underlying") if parsed else None
+                    position_params = _autopilot_position_params.get(contract_symbol, {})
+                    option_profit = safe_float(
+                        position_params.get("take_profit_pct"), option_profit_default
+                    )
+                    option_stop = abs(
+                        safe_float(
+                            position_params.get("stop_loss_pct"),
+                            option_stop_default,
+                        )
+                    )
                     reasons: list[str] = []
                     plpc = safe_float(pos.get("unrealized_plpc"), None)
                     if plpc is None:
@@ -2210,87 +2352,85 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     except Exception as exc:
                         logger.exception("Autopilot option exit failed for %s", contract_symbol)
                         errors.append(f"sell {contract_symbol} failed: {exc}")
-            else:
-                for symbol, entry in current_positions.items():
-                    pos = entry["position"]
-                    qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
-                    if qty < 1:
+            for symbol, entry in current_positions_equity.items():
+                pos = entry["position"]
+                qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
+                if qty < 1:
+                    continue
+                df = _autopilot_prepare_dataframe(symbol, lookback)
+                if df is None:
+                    errors.append(f"no data for {symbol}; exit review skipped")
+                    continue
+                score, _ = score_stock(df)
+                if score < exit_threshold:
+                    if _autopilot_order_blocked(symbol, open_orders):
+                        summary_lines.append(
+                            f"Exit pending for {symbol}; open order detected."
+                        )
                         continue
-                    df = _autopilot_prepare_dataframe(symbol, lookback)
-                    if df is None:
-                        errors.append(f"no data for {symbol}; exit review skipped")
+                    qty_int = int(math.floor(qty))
+                    if qty_int <= 0:
                         continue
-                    score, _ = score_stock(df)
-                    if score < exit_threshold:
-                        if _autopilot_order_blocked(symbol, open_orders):
-                            summary_lines.append(
-                                f"Exit pending for {symbol}; open order detected."
-                            )
-                            continue
-                        qty_int = int(math.floor(qty))
-                        if qty_int <= 0:
-                            continue
-                        try:
-                            place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
-                            summary_lines.append(
-                                f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
-                            )
-                            orders_placed += 1
-                        except Exception as exc:
-                            logger.exception("Autopilot equity exit failed for %s", symbol)
-                            errors.append(f"sell {symbol} failed: {exc}")
+                    try:
+                        place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                        summary_lines.append(
+                            f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
+                        )
+                        orders_placed += 1
+                    except Exception as exc:
+                        logger.exception("Autopilot equity exit failed for %s", symbol)
+                        errors.append(f"sell {symbol} failed: {exc}")
 
-            if asset_class == "option":
-                current_positions = {
-                    sym: entry for sym, entry in current_positions.items() if sym not in ZOMBIE_POSITIONS
-                }
-                held_option_underlyings = {
-                    entry["meta"].get("underlying")
-                    for entry in current_positions.values()
-                    if isinstance(entry.get("meta"), dict) and entry["meta"].get("underlying")
-                }
-                held_option_underlyings = {sym for sym in held_option_underlyings if sym}
-                held_put_underlyings = {
-                    entry["meta"].get("underlying")
-                    for entry in current_positions.values()
-                    if isinstance(entry.get("meta"), dict)
-                    and entry["meta"].get("underlying")
-                    and entry["meta"].get("type") == "put"
-                }
+            current_positions_option = {
+                sym: entry for sym, entry in current_positions_option.items() if sym not in ZOMBIE_POSITIONS
+            }
+            held_option_underlyings = {
+                entry["meta"].get("underlying")
+                for entry in current_positions_option.values()
+                if isinstance(entry.get("meta"), dict) and entry["meta"].get("underlying")
+            }
+            held_option_underlyings = {sym for sym in held_option_underlyings if sym}
+            held_put_underlyings = {
+                entry["meta"].get("underlying")
+                for entry in current_positions_option.values()
+                if isinstance(entry.get("meta"), dict)
+                and entry["meta"].get("underlying")
+                and entry["meta"].get("type") == "put"
+            }
+            current_positions = {}
+            current_positions.update(current_positions_equity)
+            current_positions.update(current_positions_option)
+
+            held_equity_symbols = set(current_positions_equity.keys())
+            held_underlyings = held_equity_symbols | held_option_underlyings
 
             held_and_pending = set(current_positions.keys())
-            pending_underlyings = (
-                set(held_option_underlyings) if asset_class == "option" else set()
-            )
+            pending_underlyings = set(held_underlyings)
             for order in open_orders:
                 try:
                     if str(order.get("side", "")).lower() != "buy":
                         continue
                     order_symbol = str(order.get("symbol", "")).replace(" ", "").upper()
                     asset = str(order.get("asset_class", "")).lower()
-                    if asset_class == "option":
-                        if "option" in asset:
-                            held_and_pending.add(order_symbol)
-                            parsed = parse_option_symbol(order_symbol)
-                            if parsed and parsed.get("underlying"):
-                                pending_underlyings.add(parsed["underlying"])
+                    held_and_pending.add(order_symbol)
+                    if "option" in asset:
+                        parsed = parse_option_symbol(order_symbol)
+                        if parsed and parsed.get("underlying"):
+                            pending_underlyings.add(parsed["underlying"])
                     else:
-                        if asset != "option":
-                            held_and_pending.add(order_symbol)
+                        pending_underlyings.add(order_symbol)
                 except Exception:
                     continue
 
-            min_entry_score = strategy.get("min_score", 3.0)
+            min_entry_score = hybrid.get("min_bullish_score", 3.0)
             bearish_min_score = safe_float(
-                strategy.get("bearish_min_score"), strategy.get("min_score", 3.0)
+                hybrid.get("min_bearish_score"), hybrid.get("min_bullish_score", 3.0)
             )
             logged_candidates: set[str] = set()
 
-            max_positions = max(1, int(strategy.get("max_positions", 5)))
+            max_positions = max(1, int(hybrid.get("max_positions", 5)))
             available_slots = max(0, max_positions - len(current_positions))
-            gross_notional = (
-                gross_option_notional if asset_class == "option" else gross_equity_notional
-            )
+            gross_notional = gross_option_notional + gross_equity_notional
 
             allocation_warning_logged = False
 
@@ -2300,7 +2440,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 reverse=True,
             )
 
-            if asset_class == "option" and not sorted_candidates:
+            if not sorted_candidates:
                 summary_lines.append("No new symbols met entry criteria.")
 
             for candidate in sorted_candidates:
@@ -2312,8 +2452,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
 
                 direction_label = "bullish" if bias == "bullish" else "bearish"
                 reason_label = "pending evaluation"
-                bullish_considered = bias == "bullish"
-                bearish_considered = bias == "bearish"
                 candidate_logged = False
 
                 def log_candidate_outcome(
@@ -2327,14 +2465,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         f"{score:.2f}" if isinstance(score, (int, float)) else "n/a"
                     )
                     logger.info(
-                        "Candidate %s: direction=%s reason=%s score=%s bullish_considered=%s bearish_considered=%s bias=%s",
+                        "Candidate %s: direction=%s reason=%s score=%s bias=%s strategy=%s",
                         symbol,
                         direction_label,
                         reason_label,
                         score_fragment,
-                        bullish_considered,
-                        bearish_considered,
                         bias,
+                        strategy_key,
                     )
                     candidate_logged = True
                     logged_candidates.add(symbol)
@@ -2349,21 +2486,94 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     )
                     continue
 
-                if bias == "bullish" and score < min_entry_score:
+                min_required = min_entry_score if bias == "bullish" else bearish_min_score
+                if score < min_required:
                     log_candidate_outcome(
-                        f"no entry, score {score:.2f} below min {min_entry_score:.2f}",
-                        "none",
-                    )
-                    continue
-                if bias == "bearish" and asset_class == "option" and score < bearish_min_score:
-                    log_candidate_outcome(
-                        f"no entry, bearish score {score:.2f} below min {bearish_min_score:.2f}",
+                        f"no entry, score {score:.2f} below min {min_required:.2f} (strategy={strategy_key})",
                         "none",
                     )
                     continue
 
-                if asset_class == "option":
-                    # Skip underlyings that are in a cooldown window to avoid repeated churn
+                if symbol in pending_underlyings:
+                    log_candidate_outcome(
+                        "no entry, order already pending for underlying", "none"
+                    )
+                    continue
+
+                if symbol in held_underlyings:
+                    log_candidate_outcome(
+                        "no entry, underlying already held", "none"
+                    )
+                    continue
+
+                try:
+                    equity_price = fetch_latest_price(symbol)
+                except Exception as exc:
+                    logger.exception("Autopilot price fetch failed for %s", symbol)
+                    errors.append(f"price {symbol} failed: {exc}")
+                    log_candidate_outcome("price fetch failed", "none")
+                    continue
+
+                option_available = False
+                selection: OptionSelection | None = None
+                selection_diag: dict[str, Any] = {}
+                put_choice: dict[str, Any] | None = None
+                consider_option = bias == "bearish" or hybrid.get("option_bias") != "rare" or score >= (min_required + 0.5)
+
+                if bias == "bearish":
+                    if _option_on_cooldown(symbol, now):
+                        summary_lines.append(
+                            f"Candidate {symbol}: direction=none reason=cooldown in effect bias={bias}"
+                        )
+                        log_candidate_outcome("cooldown", "none")
+                        continue
+                    if symbol in held_put_underlyings:
+                        summary_lines.append(
+                            f"Skip bearish {symbol}; put position already open."
+                        )
+                        log_candidate_outcome(
+                            "bearish entry blocked, already have open position",
+                            "none",
+                        )
+                        continue
+                    put_choice = choose_put_contract(symbol, now) if consider_option else None
+                    option_available = bool(put_choice)
+                else:
+                    if consider_option:
+                        try:
+                            selection = _autopilot_select_option_contract(
+                                symbol,
+                                hybrid,
+                                underlying_price=equity_price,
+                                score=score,
+                            )
+                            selection_diag = selection.diagnostics or {}
+                            option_available = bool(selection.contract and selection.premium and selection.premium > 0)
+                        except PriceDataError as exc:
+                            errors.append(f"options {symbol} chain failed: {exc}")
+                            log_candidate_outcome(
+                                "bullish entry blocked, option chain unavailable",
+                                "none",
+                            )
+                            continue
+
+                decision, decision_reason = choose_instrument_for_candidate(
+                    bias=bias,
+                    hybrid_params=hybrid,
+                    has_option=option_available,
+                    score=safe_float(score, 0.0),
+                    min_score=min_required,
+                    equity_price=equity_price,
+                )
+
+                if decision == "skip":
+                    log_candidate_outcome(
+                        f"no entry, {decision_reason}",
+                        "none",
+                    )
+                    continue
+
+                if decision == "option":
                     if _option_on_cooldown(symbol, now):
                         summary_lines.append(
                             f"Candidate {symbol}: direction=none reason=cooldown in effect bias={bias}"
@@ -2371,28 +2581,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         log_candidate_outcome("cooldown", "none")
                         continue
 
-                    if symbol in pending_underlyings:
-                        log_candidate_outcome(
-                            "no entry, order already pending for underlying", "none"
-                        )
-                        continue
-
                     if bias == "bearish":
-                        logger.info("Candidate %s: evaluating bearish path (puts)", symbol)
-                        if symbol in held_put_underlyings:
-                            summary_lines.append(
-                                f"Skip bearish {symbol}; put position already open."
-                            )
-                            log_candidate_outcome(
-                                "bearish entry blocked, already have open position",
-                                "none",
-                            )
-                            continue
-                        put_choice = choose_put_contract(symbol, now)
                         if not put_choice:
-                            summary_lines.append(
-                                f"Skip bearish {symbol}; no suitable put contract found."
-                            )
                             log_candidate_outcome(
                                 "bearish entry blocked, no suitable put contract",
                                 "none",
@@ -2420,9 +2610,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             continue
                         unit_cost = mid_price * OPTION_CONTRACT_MULTIPLIER
-                        notional_cap_pct = min(max_position_pct, max_total_allocation)
-                        target_notional = max(min_entry_notional, equity * notional_cap_pct)
-                        max_debit = safe_float(strategy.get("max_position_debit"), None)
+                        target_notional = max(min_entry_notional, equity * option_fraction)
+                        max_debit = safe_float(hybrid.get("max_position_debit"), None)
                         if max_debit:
                             target_notional = min(target_notional, max_debit)
                         if PAPER_MAX_POSITION_NOTIONAL:
@@ -2439,7 +2628,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             break
                         qty = int(target_notional // max(unit_cost, 1e-6))
-                        max_contracts = int(safe_float(strategy.get("max_contracts_per_trade"), 0))
+                        max_contracts = int(safe_float(hybrid.get("max_contracts_per_trade"), 0))
                         if max_contracts:
                             qty = min(qty, max_contracts)
                         if qty <= 0:
@@ -2451,6 +2640,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "none",
                             )
                             continue
+                        stop_loss_pct = option_stop_default
+                        take_profit_pct = option_profit_default
                         try:
                             logger.info(
                                 "Placing bearish order: symbol=%s asset_class=option qty=%s side=buy",
@@ -2463,8 +2654,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "buy",
                                 order_type="limit",
                                 limit_price=round(mid_price, 2),
-                                stop_loss_pct=None,
-                                take_profit_pct=None,
+                                stop_loss_pct=stop_loss_pct,
+                                take_profit_pct=take_profit_pct,
                                 time_in_force="day",
                                 asset_class="option",
                                 price_hint=mid_price,
@@ -2475,18 +2666,20 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             available_slots -= 1
                             held_and_pending.add(contract_symbol)
                             pending_underlyings.add(symbol)
+                            _remember_position_params(
+                                contract_symbol,
+                                asset_class="option",
+                                stop_loss_pct=stop_loss_pct,
+                                take_profit_pct=take_profit_pct,
+                                strategy=strategy_key,
+                            )
                             summary_lines.append(
                                 f"Buy {qty} {contract_symbol} ({symbol} put {put_choice.get('strike', 0):.2f} exp {put_choice.get('expiration')}, limit ${mid_price:.2f})"
                             )
-                            logger.info(
-                                "Autopilot bearish entry: %s qty=%d premium=%.2f notional=%.2f",
-                                contract_symbol,
-                                qty,
-                                mid_price,
-                                qty * unit_cost,
-                            )
                             orders_placed += 1
-                            log_candidate_outcome("bearish entry placed")
+                            log_candidate_outcome(
+                                f"bearish entry placed via option ({decision_reason})"
+                            )
                         except Exception as exc:
                             logger.exception("Autopilot put entry failed for %s", contract_symbol)
                             errors.append(f"buy {contract_symbol} failed: {exc}")
@@ -2496,35 +2689,15 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                     "bearish",
                                 )
                     else:
-                        logger.info(
-                            "Candidate %s: evaluating bullish path (calls)",
-                            symbol,
-                        )
-                        try:
-                            spot_price = fetch_latest_price(symbol)
-                        except Exception as exc:
-                            logger.exception("Autopilot price fetch failed for %s", symbol)
-                            errors.append(f"price {symbol} failed: {exc}")
+                        if not selection:
                             log_candidate_outcome(
-                                "bullish entry blocked, price fetch failed",
+                                "bullish entry blocked, option selection unavailable",
                                 "none",
                             )
                             continue
-                        try:
-                            selection = _autopilot_select_option_contract(
-                                symbol,
-                                strategy,
-                                underlying_price=spot_price,
-                                score=score,
-                            )
-                        except PriceDataError as exc:
-                            errors.append(f"options {symbol} chain failed: {exc}")
-                            log_candidate_outcome(
-                                "bullish entry blocked, option chain unavailable",
-                                "none",
-                            )
-                            continue
-                        diag = selection.diagnostics or {}
+                        diag = selection_diag or {}
+                        contract_data = selection.contract
+                        premium = selection.premium
                         if diag:
                             try:
                                 logger.debug(
@@ -2538,9 +2711,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                     symbol.upper(),
                                     diag,
                                 )
-                        contract_data = selection.contract
-                        premium = selection.premium
-                        parsed = selection.meta or {}
                         if not contract_data or premium is None or premium <= 0:
                             reason_bits = []
                             rejection_counts = Counter()
@@ -2606,24 +2776,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "none",
                             )
                             continue
-                        if asset_class == "option" and contract_symbol in held_and_pending:
-                            log_candidate_outcome(
-                                "bullish entry blocked, already have open position or pending order",
-                                "none",
-                            )
-                            continue
-                        stop_loss_pct = abs(
-                            safe_float(strategy.get("options_stop_loss_pct"), 0.45)
-                        )
-                        take_profit_pct = safe_float(
-                            strategy.get("options_take_profit_pct"), 0.8
-                        )
-                        notional_cap_pct = min(max_position_pct, max_total_allocation)
-                        position_mult = risk_cfg.get("position_multiplier", 1.0)
-                        target_notional = (
-                            max(min_entry_notional, equity * notional_cap_pct) * position_mult
-                        )
-                        max_debit = safe_float(strategy.get("max_position_debit"), None)
+                        stop_loss_pct = option_stop_default
+                        take_profit_pct = option_profit_default
+                        target_notional = max(min_entry_notional, equity * option_fraction)
+                        max_debit = safe_float(hybrid.get("max_position_debit"), None)
                         if max_debit:
                             target_notional = min(target_notional, max_debit)
                         if PAPER_MAX_POSITION_NOTIONAL:
@@ -2641,7 +2797,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             break
                         qty = int(target_notional // max(unit_cost, 1e-6))
-                        max_contracts = int(safe_float(strategy.get("max_contracts_per_trade"), 0))
+                        max_contracts = int(safe_float(hybrid.get("max_contracts_per_trade"), 0))
                         if max_contracts:
                             qty = min(qty, max_contracts)
                         if qty <= 0:
@@ -2674,11 +2830,20 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             available_slots -= 1
                             held_and_pending.add(contract_symbol)
                             pending_underlyings.add(symbol)
+                            _remember_position_params(
+                                contract_symbol,
+                                asset_class="option",
+                                stop_loss_pct=stop_loss_pct,
+                                take_profit_pct=take_profit_pct,
+                                strategy=strategy_key,
+                            )
                             summary_lines.append(
                                 f"Buy {qty} {contract_symbol} (score {score:.2f}, premium ${premium:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
                             )
                             orders_placed += 1
-                            log_candidate_outcome("bullish entry placed")
+                            log_candidate_outcome(
+                                f"bullish entry placed via option ({decision_reason})"
+                            )
                         except Exception as exc:
                             logger.exception(
                                 "Autopilot option entry failed for %s", contract_symbol
@@ -2703,39 +2868,23 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     if df is None:
                         log_candidate_outcome("bullish entry blocked, no price history", "none")
                         continue
-                    score, _ = score_stock(df)
-                    if score < min_entry_score:
+                    recalced_score, _ = score_stock(df)
+                    if recalced_score < min_entry_score:
                         log_candidate_outcome(
-                            f"bullish entry blocked, score {score:.2f} below {min_entry_score:.2f}",
+                            f"no entry, refreshed score {recalced_score:.2f} below min {min_entry_score:.2f}",
                             "none",
                         )
                         continue
-                    price = safe_float(df.iloc[-1].get("Close"), 0.0)
-                    if price <= 0:
+                    price = safe_float(df.iloc[-1].get("Close"), equity_price)
+                    if price is None or price <= 0:
                         log_candidate_outcome(
                             "bullish entry blocked, invalid last close",
                             "none",
                         )
                         continue
-                    stop_loss_pct = max(
-                        0.0,
-                        float(
-                            PAPER_DEFAULT_STOP_LOSS_PCT
-                            * risk_cfg.get("stop_loss_multiplier", 1.0)
-                        ),
-                    )
-                    take_profit_pct = max(
-                        0.0,
-                        float(
-                            PAPER_DEFAULT_TAKE_PROFIT_PCT
-                            * risk_cfg.get("take_profit_multiplier", 1.0)
-                        ),
-                    )
-                    notional_cap_pct = min(max_position_pct, max_total_allocation)
-                    position_mult = risk_cfg.get("position_multiplier", 1.0)
-                    target_notional = (
-                        max(min_entry_notional, equity * notional_cap_pct) * position_mult
-                    )
+                    stop_loss_pct = stock_stop_default
+                    take_profit_pct = stock_take_default
+                    target_notional = max(min_entry_notional, equity * stock_fraction)
                     if PAPER_MAX_POSITION_NOTIONAL:
                         target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
                     if gross_notional + target_notional > equity * max_total_allocation:
@@ -2759,8 +2908,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             "none",
                         )
                         continue
-                    if qty > max(1, int(equity * max_position_pct // max(price, 1e-6))):
-                        qty = max(1, int(equity * max_position_pct // max(price, 1e-6)))
                     try:
                         logger.info(
                             "Placing bullish order: symbol=%s asset_class=stock qty=%s side=buy",
@@ -2778,10 +2925,21 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         gross_notional += qty * price
                         available_slots -= 1
                         held_and_pending.add(symbol)
+                        pending_underlyings.add(symbol)
+                        _remember_position_params(
+                            symbol,
+                            asset_class="equity",
+                            stop_loss_pct=stop_loss_pct,
+                            take_profit_pct=take_profit_pct,
+                            strategy=strategy_key,
+                        )
                         summary_lines.append(
                             f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
                         )
                         orders_placed += 1
+                        log_candidate_outcome(
+                            f"bullish entry placed via stock ({decision_reason})"
+                        )
                     except Exception as exc:
                         logger.exception("Autopilot equity entry failed for %s", symbol)
                         errors.append(f"buy {symbol} failed: {exc}")
