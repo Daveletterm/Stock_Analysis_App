@@ -70,6 +70,7 @@ PAPER_MAX_POSITION_PCT = float(os.getenv("PAPER_MAX_POSITION_PCT", "0.1"))
 PAPER_MAX_POSITION_NOTIONAL = float(os.getenv("PAPER_MAX_POSITION_NOTIONAL", "8000"))
 PAPER_DEFAULT_STOP_LOSS_PCT = float(os.getenv("PAPER_STOP_LOSS_PCT", "0.05"))
 PAPER_DEFAULT_TAKE_PROFIT_PCT = float(os.getenv("PAPER_TAKE_PROFIT_PCT", "0.1"))
+ENABLE_ZOMBIE_DELETE = True
 
 # -----------------------------
 # Globals & caches
@@ -1998,11 +1999,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         summary_lines.append(warning)
                         _autopilot_uncovered_exits.add(contract_symbol)
                     except AlpacaAPIError as exc:
-                        message_lower = str(getattr(exc, "api_message", exc)).lower()
-                        if exc.status_code == 403 and (
-                            "insufficient qty available for order" in message_lower
-                            or "account not eligible to trade uncovered option contracts" in message_lower
-                        ):
+                        msg = str(exc).lower()
+                        underlying = parsed.get("underlying") if parsed else None
+                        if exc.status_code == 403 and "insufficient qty available for order" in msg:
                             logger.warning(
                                 "Ignoring stale exit for %s: %s (status=%s)",
                                 contract_symbol,
@@ -2011,19 +2010,50 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             _autopilot_stale_exits.add(contract_symbol)
                             _autopilot_uncovered_exits.discard(contract_symbol)
-                            continue
-                        if "no available bid for symbol" in message_lower:
-                            logger.warning(
-                                "Exit for %s not filled: %s", contract_symbol, exc
-                            )
-                            summary_lines.append(
-                                f"Exit for {contract_symbol} postponed; Alpaca reports no available bid."
-                            )
                             if underlying:
                                 _set_option_cooldown(underlying, now, minutes=60)
-                            _autopilot_stale_exits.add(contract_symbol)
                             continue
-                        logger.exception("Autopilot option exit failed for %s", contract_symbol)
+
+                        if "no available bid for symbol" in msg or (
+                            exc.status_code == 403
+                            and "account not eligible to trade uncovered option contracts" in msg
+                        ):
+                            logger.warning(
+                                "Exit failed for %s due to illiquidity or uncovered rules: %s - attempting hard delete via positions API",
+                                contract_symbol,
+                                exc,
+                            )
+                            if ENABLE_ZOMBIE_DELETE:
+                                try:
+                                    delete_result = paper_broker.delete_position(contract_symbol)
+                                    logger.warning(
+                                        "Hard delete for zombie position %s completed: %s",
+                                        contract_symbol,
+                                        delete_result,
+                                    )
+                                    summary_lines.append(
+                                        f"Hard-deleted zombie position {contract_symbol} via API"
+                                    )
+                                    if underlying:
+                                        _set_option_cooldown(underlying, now, minutes=60)
+                                    _autopilot_stale_exits.add(contract_symbol)
+                                    continue
+                                except AlpacaAPIError as delete_err:
+                                    logger.error(
+                                        "Hard delete for %s failed: %s (status=%s)",
+                                        contract_symbol,
+                                        delete_err,
+                                        getattr(delete_err, "status_code", None),
+                                    )
+                            else:
+                                logger.warning(
+                                    "Zombie delete for %s skipped because ENABLE_ZOMBIE_DELETE is False",
+                                    contract_symbol,
+                                )
+
+                        logger.error(
+                            "Autopilot option exit failed for %s: %s", contract_symbol, exc
+                        )
                         errors.append(f"sell {contract_symbol} failed: {exc}")
                     except Exception as exc:
                         logger.exception("Autopilot option exit failed for %s", contract_symbol)

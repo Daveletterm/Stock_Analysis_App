@@ -35,7 +35,12 @@ DEFAULT_BASE_URL = "https://paper-api.alpaca.markets/v2"
 
 
 class AlpacaPaperBroker:
-    """Small wrapper around the Alpaca paper trading REST API."""
+    """Small wrapper around the Alpaca paper trading REST API.
+
+    This broker is intended for paper trading only and includes helpers
+    specific to paper account cleanup that must not be used for live
+    trading.
+    """
 
     def __init__(
         self,
@@ -170,4 +175,19 @@ class AlpacaPaperBroker:
 
     def close_position(self, symbol: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/positions/{symbol}")
+
+    def delete_position(self, symbol: str) -> dict:
+        """Hard-delete a position from the paper account via Alpaca API.
+
+        This is a last-resort cleanup for zombie positions that cannot be
+        closed with normal orders (no bid, uncovered, etc.). It MUST NOT
+        be used with live trading accounts.
+        """
+        if not symbol:
+            raise ValueError("symbol is required for delete_position")
+
+        path = f"/positions/{symbol}"
+        logger.warning("Attempting hard delete for zombie position %s", symbol)
+        # This uses the underlying _request helper which already wraps errors
+        return self._request("DELETE", path)
 
