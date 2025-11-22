@@ -1,9 +1,20 @@
 """Paper trading integration for Alpaca's paper API."""
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import os
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
+
+import requests
+
+try:  # Python 3.9+; allow backport on older runtimes
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - fallback for Python <3.9
+    try:
+        from backports.zoneinfo import ZoneInfo  # type: ignore
+    except Exception:
+        ZoneInfo = None  # type: ignore
 
 
 class AlpacaAPIError(RuntimeError):
@@ -26,8 +37,6 @@ class OptionCloseRejectedError(AlpacaAPIError):
     """Raised when Alpaca rejects a closing option trade as uncovered."""
 
     code = "option_close_rejected"
-
-import requests
 
 logger = logging.getLogger("paper_trading")
 
@@ -191,3 +200,98 @@ class AlpacaPaperBroker:
         # This uses the underlying _request helper which already wraps errors
         return self._request("DELETE", path)
 
+
+def _resolve_timezone(name: str | None = None) -> _dt.tzinfo:
+    """Resolve the app timezone from env or local settings."""
+
+    tz_name = name or os.getenv("APP_TIMEZONE")
+    if tz_name and ZoneInfo:
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            logger.warning("Falling back to local timezone; invalid APP_TIMEZONE=%s", tz_name)
+    try:
+        local_tz = _dt.datetime.now().astimezone().tzinfo
+        if local_tz:
+            return local_tz
+    except Exception:
+        pass
+    return _dt.timezone.utc
+
+
+def _parse_alpaca_timestamp(value: Any, tz: _dt.tzinfo) -> Optional[_dt.datetime]:
+    """Parse Alpaca timestamp strings into timezone-aware datetimes."""
+
+    if not value:
+        return None
+    if isinstance(value, _dt.datetime):
+        dt_val = value
+    elif isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned.endswith("Z"):
+            cleaned = cleaned.replace("Z", "+00:00")
+        try:
+            dt_val = _dt.datetime.fromisoformat(cleaned)
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt_val.tzinfo is None:
+        dt_val = dt_val.replace(tzinfo=_dt.timezone.utc)
+    return dt_val.astimezone(tz)
+
+
+def get_daily_account_snapshot(
+    broker: AlpacaPaperBroker,
+    target_date: _dt.date | None = None,
+    *,
+    tz: _dt.tzinfo | None = None,
+) -> dict[str, Any]:
+    """Collect account, positions, and orders for the target date."""
+
+    if broker is None:
+        raise ValueError("broker is required for snapshot")
+    if not broker.enabled:
+        raise RuntimeError("Paper trading credentials are not configured")
+
+    tzinfo = tz or _resolve_timezone()
+    snapshot_date = target_date or _dt.datetime.now(tzinfo).date()
+
+    account = broker.get_account()
+    positions = list(broker.get_positions())
+    orders = list(broker.list_orders(status="all", limit=200))
+
+    orders_for_day: list[dict[str, Any]] = []
+    for order in orders:
+        submitted_dt = _parse_alpaca_timestamp(order.get("submitted_at"), tzinfo)
+        filled_dt = _parse_alpaca_timestamp(order.get("filled_at"), tzinfo)
+        reference_dt = filled_dt or submitted_dt
+        if reference_dt and reference_dt.date() == snapshot_date:
+            cloned = dict(order)
+            if submitted_dt:
+                cloned["_submitted_at_local"] = submitted_dt
+            if filled_dt:
+                cloned["_filled_at_local"] = filled_dt
+            orders_for_day.append(cloned)
+
+    orders_for_day.sort(
+        key=lambda o: o.get("_filled_at_local") or o.get("_submitted_at_local") or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc),
+        reverse=True,
+    )
+
+    logger.info(
+        "Daily snapshot %s tz=%s: positions=%d orders=%d",
+        snapshot_date,
+        tzinfo,
+        len(positions),
+        len(orders_for_day),
+    )
+
+    return {
+        "date": snapshot_date,
+        "timezone": tzinfo,
+        "as_of": _dt.datetime.now(tzinfo),
+        "account": account or {},
+        "positions": positions,
+        "orders": orders_for_day,
+    }
