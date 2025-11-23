@@ -6,6 +6,8 @@ import logging
 import os
 from typing import Any, Dict, Iterable, Optional
 
+import pandas as pd
+
 import requests
 
 try:  # Python 3.9+; allow backport on older runtimes
@@ -241,6 +243,39 @@ def _parse_alpaca_timestamp(value: Any, tz: _dt.tzinfo) -> Optional[_dt.datetime
     return dt_val.astimezone(tz)
 
 
+PAPER_TRADES_COLUMNS = [
+    "row_type",
+    "date",
+    "timestamp",
+    "equity",
+    "cash",
+    "buying_power",
+    "portfolio_value",
+    "symbol",
+    "asset_class",
+    "qty",
+    "side",
+    "avg_entry_price",
+    "current_price",
+    "market_value",
+    "unrealized_pl",
+    "unrealized_plpc",
+    "order_type",
+    "time_in_force",
+    "submitted_at",
+    "filled_at",
+    "filled_avg_price",
+    "status",
+    "order_id",
+    "mode_or_strategy",
+    "strategy_name",
+    "underlying_symbol",
+    "notes",
+    "realized_pl",
+    "realized_plpc",
+]
+
+
 def get_daily_account_snapshot(
     broker: AlpacaPaperBroker,
     target_date: _dt.date | None = None,
@@ -295,3 +330,146 @@ def get_daily_account_snapshot(
         "positions": positions,
         "orders": orders_for_day,
     }
+
+
+def _safe_float(val: Any) -> float | None:
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_timestamp(value: Any, tzinfo: _dt.tzinfo) -> tuple[str | None, _dt.datetime | None]:
+    """Return ISO string timestamp and datetime in the configured timezone."""
+
+    if value is None:
+        return None, None
+    if isinstance(value, _dt.datetime):
+        dt_val = value
+    else:
+        dt_val = _parse_alpaca_timestamp(value, tzinfo)
+    if dt_val is None:
+        return str(value), None
+    if dt_val.tzinfo is None:
+        dt_val = dt_val.replace(tzinfo=tzinfo)
+    else:
+        dt_val = dt_val.astimezone(tzinfo)
+    return dt_val.isoformat(), dt_val
+
+
+def _date_string(value: Any, tzinfo: _dt.tzinfo) -> str:
+    if isinstance(value, _dt.datetime):
+        return value.astimezone(tzinfo).date().isoformat()
+    if isinstance(value, _dt.date):
+        return value.isoformat()
+    try:
+        parsed = _parse_alpaca_timestamp(value, tzinfo)
+        if parsed:
+            return parsed.date().isoformat()
+    except Exception:
+        pass
+    return _dt.datetime.now(tzinfo).date().isoformat()
+
+
+def build_paper_trades_export(
+    snapshot: dict,
+    trades: list[dict],
+    *,
+    mode_or_strategy: str | None = None,
+    strategy_name: str | None = None,
+) -> pd.DataFrame:
+    """Construct a normalized export DataFrame for paper trades."""
+
+    tzinfo = snapshot.get("timezone") or _resolve_timezone()
+    as_of = snapshot.get("as_of")
+    as_of_ts_iso, as_of_dt = _normalize_timestamp(as_of or _dt.datetime.now(tzinfo), tzinfo)
+    snapshot_date = snapshot.get("date") or (as_of_dt.date() if as_of_dt else _dt.datetime.now(tzinfo).date())
+    snapshot_date_str = _date_string(snapshot_date, tzinfo)
+
+    rows: list[dict[str, Any]] = []
+    account = snapshot.get("account") or {}
+    account_ts_iso, account_ts = _normalize_timestamp(account.get("updated_at") or as_of_dt, tzinfo)
+    rows.append(
+        {
+            "row_type": "account_summary",
+            "date": snapshot_date_str,
+            "timestamp": account_ts_iso,
+            "equity": _safe_float(account.get("equity")),
+            "cash": _safe_float(account.get("cash")),
+            "buying_power": _safe_float(account.get("buying_power")),
+            "portfolio_value": _safe_float(account.get("portfolio_value")),
+            "mode_or_strategy": mode_or_strategy,
+            "strategy_name": strategy_name,
+        }
+    )
+
+    for pos in snapshot.get("positions") or []:
+        position_ts_iso, position_dt = _normalize_timestamp(as_of_dt, tzinfo)
+        rows.append(
+            {
+                "row_type": "position",
+                "date": _date_string(position_dt or snapshot_date, tzinfo),
+                "timestamp": position_ts_iso,
+                "equity": None,
+                "cash": None,
+                "buying_power": None,
+                "portfolio_value": None,
+                "symbol": pos.get("symbol"),
+                "asset_class": pos.get("asset_class"),
+                "qty": pos.get("qty"),
+                "side": None,
+                "avg_entry_price": pos.get("avg_entry_price"),
+                "current_price": pos.get("current_price"),
+                "market_value": pos.get("market_value"),
+                "unrealized_pl": pos.get("unrealized_pl"),
+                "unrealized_plpc": pos.get("unrealized_plpc"),
+                "underlying_symbol": pos.get("underlying_symbol") if str(pos.get("asset_class", "")).lower() == "option" else None,
+                "mode_or_strategy": mode_or_strategy,
+                "strategy_name": strategy_name,
+            }
+        )
+
+    for order in trades or []:
+        filled_iso, filled_dt = _normalize_timestamp(order.get("_filled_at_local") or order.get("filled_at"), tzinfo)
+        submitted_iso, submitted_dt = _normalize_timestamp(
+            order.get("_submitted_at_local") or order.get("submitted_at"), tzinfo
+        )
+        event_ts = filled_dt or submitted_dt or as_of_dt
+        event_iso = filled_iso or submitted_iso or as_of_ts_iso
+        rows.append(
+            {
+                "row_type": "trade",
+                "date": _date_string(event_ts or snapshot_date, tzinfo),
+                "timestamp": event_iso,
+                "equity": None,
+                "cash": None,
+                "buying_power": None,
+                "portfolio_value": None,
+                "symbol": order.get("symbol"),
+                "asset_class": order.get("asset_class"),
+                "qty": order.get("qty") or order.get("filled_qty"),
+                "side": order.get("side"),
+                "avg_entry_price": order.get("limit_price") or order.get("avg_entry_price"),
+                "current_price": order.get("filled_avg_price") or order.get("current_price"),
+                "market_value": order.get("notional"),
+                "unrealized_pl": None,
+                "unrealized_plpc": None,
+                "order_type": order.get("type"),
+                "time_in_force": order.get("time_in_force"),
+                "submitted_at": submitted_iso,
+                "filled_at": filled_iso,
+                "filled_avg_price": order.get("filled_avg_price"),
+                "status": order.get("status"),
+                "order_id": order.get("id"),
+                "mode_or_strategy": order.get("mode_or_strategy") or mode_or_strategy,
+                "strategy_name": order.get("strategy_name") or strategy_name,
+                "underlying_symbol": order.get("underlying_symbol"),
+                "notes": order.get("order_class"),
+                "realized_pl": order.get("realized_pl"),
+                "realized_plpc": order.get("realized_plpc"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df = df.reindex(columns=PAPER_TRADES_COLUMNS)
+    return df
