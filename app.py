@@ -1,4 +1,3 @@
-import csv
 import math
 import os
 import re
@@ -26,6 +25,8 @@ from dotenv import load_dotenv
 from paper_trading import (
     AlpacaAPIError,
     AlpacaPaperBroker,
+    PAPER_TRADES_COLUMNS,
+    build_paper_trades_export,
     get_daily_account_snapshot,
     NoAvailableBidError,
     OptionCloseRejectedError,
@@ -3768,174 +3769,36 @@ def export_paper_csv():
         except ValueError:
             flash("Invalid date format, expected YYYY-MM-DD. Exporting today's data.")
 
-    def _normalize_ts(val: Any) -> str:
-        if not val:
-            return ""
-        if isinstance(val, datetime):
-            dt_val = val
-        elif isinstance(val, str):
-            cleaned = val.strip()
-            if cleaned.endswith("Z"):
-                cleaned = cleaned.replace("Z", "+00:00")
-            try:
-                dt_val = datetime.fromisoformat(cleaned)
-            except ValueError:
-                return cleaned
-        else:
-            return str(val)
-        if dt_val.tzinfo is None:
-            dt_val = dt_val.replace(tzinfo=timezone.utc)
-        return dt_val.astimezone(tzinfo).isoformat()
+    autopilot_status = get_autopilot_status()
+    autopilot_mode = autopilot_status.get("risk") or autopilot_status.get("strategy")
+    autopilot_strategy = autopilot_status.get("strategy")
 
-    def _safe_float(val: Any) -> Optional[float]:
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return None
-
-    snapshot = {}
-    error_message = None
     try:
         snapshot = get_daily_account_snapshot(paper_broker, target_date, tz=tzinfo)
-    except Exception as exc:
+    except Exception:
         logger.exception("Failed to build paper CSV for %s", target_date)
         snapshot = {
             "date": target_date,
+            "timezone": tzinfo,
             "as_of": datetime.now(tzinfo),
             "account": {},
             "positions": [],
             "orders": [],
         }
-        error_message = str(exc)
 
-    headers = [
-        "row_type",
-        "date",
-        "timestamp",
-        "equity",
-        "cash",
-        "buying_power",
-        "portfolio_value",
-        "symbol",
-        "asset_class",
-        "qty",
-        "side",
-        "avg_entry_price",
-        "current_price",
-        "market_value",
-        "unrealized_pl",
-        "unrealized_plpc",
-        "order_type",
-        "time_in_force",
-        "submitted_at",
-        "filled_at",
-        "filled_avg_price",
-        "status",
-        "order_id",
-        "mode_or_strategy",
-        "strategy_name",
-        "underlying_symbol",
-        "notes",
-    ]
-
-    def add_row(data: dict[str, Any]) -> None:
-        row: list[Any] = []
-        for col in headers:
-            val = data.get(col, "")
-            row.append("" if val is None else val)
-        rows.append(row)
-
-    rows: list[list[Any]] = []
-    account = snapshot.get("account") or {}
-    as_of_ts = snapshot.get("as_of") or datetime.now(tzinfo)
-    equity = _safe_float(account.get("equity"))
-    portfolio_value = _safe_float(account.get("portfolio_value")) or equity
-    add_row(
-        {
-            "row_type": "account_summary",
-            "date": target_date.isoformat(),
-            "timestamp": _normalize_ts(account.get("updated_at") or as_of_ts),
-            "equity": equity,
-            "cash": _safe_float(account.get("cash")),
-            "buying_power": _safe_float(account.get("buying_power")),
-            "portfolio_value": portfolio_value,
-        }
+    df = build_paper_trades_export(
+        snapshot,
+        snapshot.get("orders") or [],
+        mode_or_strategy=autopilot_mode,
+        strategy_name=autopilot_strategy,
     )
+    df = df.reindex(columns=PAPER_TRADES_COLUMNS)
+    csv_data = df.to_csv(index=False)
 
-    for pos in snapshot.get("positions") or []:
-        qty_val = pos.get("qty")
-        qty_float = _safe_float(qty_val)
-        side = pos.get("side")
-        if not side and qty_float is not None:
-            side = "long" if qty_float >= 0 else "short"
-        add_row(
-            {
-                "row_type": "position",
-                "date": target_date.isoformat(),
-                "timestamp": _normalize_ts(pos.get("lastday_price_timestamp") or as_of_ts),
-                "symbol": pos.get("symbol"),
-                "asset_class": pos.get("asset_class"),
-                "qty": qty_val,
-                "side": side,
-                "avg_entry_price": pos.get("avg_entry_price"),
-                "current_price": pos.get("current_price"),
-                "market_value": pos.get("market_value"),
-                "unrealized_pl": pos.get("unrealized_pl"),
-                "unrealized_plpc": pos.get("unrealized_plpc"),
-                "underlying_symbol": pos.get("underlying_symbol"),
-            }
-        )
-
-    for order in snapshot.get("orders") or []:
-        add_row(
-            {
-                "row_type": "trade",
-                "date": target_date.isoformat(),
-                "timestamp": _normalize_ts(
-                    order.get("updated_at")
-                    or order.get("_filled_at_local")
-                    or order.get("_submitted_at_local")
-                    or as_of_ts
-                ),
-                "symbol": order.get("symbol"),
-                "asset_class": order.get("asset_class"),
-                "qty": order.get("qty") or order.get("filled_qty"),
-                "side": order.get("side"),
-                "avg_entry_price": order.get("limit_price") or order.get("avg_entry_price"),
-                "current_price": order.get("filled_avg_price") or order.get("current_price"),
-                "market_value": order.get("notional"),
-                "order_type": order.get("type"),
-                "time_in_force": order.get("time_in_force"),
-                "submitted_at": _normalize_ts(order.get("_submitted_at_local") or order.get("submitted_at")),
-                "filled_at": _normalize_ts(order.get("_filled_at_local") or order.get("filled_at")),
-                "filled_avg_price": order.get("filled_avg_price"),
-                "status": order.get("status"),
-                "order_id": order.get("id"),
-                "underlying_symbol": order.get("underlying_symbol"),
-                "notes": order.get("order_class"),
-            }
-        )
-
-    if error_message:
-        add_row(
-            {
-                "row_type": "error",
-                "date": target_date.isoformat(),
-                "timestamp": _normalize_ts(as_of_ts),
-                "notes": error_message,
-            }
-        )
-
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(headers)
-    writer.writerows(rows)
-    csv_data = output.getvalue()
-
-    logger.info("Exporting CSV for paper account date=%s rows=%d", target_date, len(rows))
+    logger.info("Exporting CSV for paper account date=%s rows=%d", target_date, len(df))
     filename = f'paper_trades_{target_date.isoformat()}.csv'
     response = Response(csv_data, mimetype="text/csv; charset=utf-8")
-    response.headers["Content-Disposition"] = f'attachment; filename=\"{filename}\"'
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
 
 
