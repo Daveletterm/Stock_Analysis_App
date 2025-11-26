@@ -118,6 +118,25 @@ class OptionSelection:
 
 
 # -----------------------------
+# Autopilot risk profiles
+# -----------------------------
+
+
+@dataclass
+class RiskProfile:
+    name: str
+    max_open_positions: int
+    max_new_trades_per_run: int
+    base_position_pct_equity_stock: float
+    base_position_pct_equity_option: float
+    max_pyramids_per_position: int
+    winner_add_threshold_plpc: float
+    loser_cut_threshold_plpc: float
+    idle_cash_target_pct: float
+    min_entry_score: float
+
+
+# -----------------------------
 # Autopilot configuration
 # -----------------------------
 
@@ -196,10 +215,50 @@ HYBRID_STRATEGIES = {
     },
 }
 
+RISK_PROFILES: dict[str, RiskProfile] = {
+    "hybrid_conservative": RiskProfile(
+        name="conservative",
+        max_open_positions=2,
+        max_new_trades_per_run=2,
+        base_position_pct_equity_stock=0.02,
+        base_position_pct_equity_option=0.01,
+        max_pyramids_per_position=0,
+        winner_add_threshold_plpc=0.08,
+        loser_cut_threshold_plpc=-0.08,
+        idle_cash_target_pct=0.6,
+        min_entry_score=5.0,
+    ),
+    "hybrid_balanced": RiskProfile(
+        name="balanced",
+        max_open_positions=4,
+        max_new_trades_per_run=4,
+        base_position_pct_equity_stock=0.02,
+        base_position_pct_equity_option=0.02,
+        max_pyramids_per_position=0,
+        winner_add_threshold_plpc=0.07,
+        loser_cut_threshold_plpc=-0.07,
+        idle_cash_target_pct=0.45,
+        min_entry_score=4.5,
+    ),
+    "hybrid_aggressive": RiskProfile(
+        name="high",
+        max_open_positions=25,
+        max_new_trades_per_run=10,
+        base_position_pct_equity_stock=0.05,
+        base_position_pct_equity_option=0.02,
+        max_pyramids_per_position=3,
+        winner_add_threshold_plpc=0.03,
+        loser_cut_threshold_plpc=-0.04,
+        idle_cash_target_pct=0.20,
+        min_entry_score=4.0,
+    ),
+}
+
 HYBRID_STRATEGY_ALIASES = {
     "conservative": "hybrid_conservative",
     "balanced": "hybrid_balanced",
     "aggressive": "hybrid_aggressive",
+    "high": "hybrid_aggressive",
     "options_momentum": "hybrid_balanced",
 }
 
@@ -226,6 +285,10 @@ AUTOPILOT_RISK_LEVELS = {
     },
 }
 
+WINNER_OPTION_THRESHOLD_MULTIPLIER = 5
+LOSER_OPTION_THRESHOLD_MULTIPLIER = 7
+PYRAMID_POSITION_SCALE = 0.5
+
 AUTOPILOT_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "autopilot_state.json")
 DEFAULT_HYBRID_STRATEGY = "hybrid_balanced"
 
@@ -245,6 +308,7 @@ _autopilot_uncovered_exits: set[str] = set()
 _autopilot_stale_exits: set[str] = set()
 _autopilot_option_cooldowns: dict[str, datetime] = {}
 _autopilot_position_params: dict[str, Any] = {}
+_autopilot_pyramid_counts: dict[str, int] = {}
 ZOMBIE_POSITIONS: set[str] = set()
 
 
@@ -1759,6 +1823,7 @@ def _remember_position_params(
     stop_loss_pct: float | None,
     take_profit_pct: float | None,
     strategy: str,
+    opened_at: datetime | None = None,
 ) -> None:
     """Store stop/take parameters for a position so exits use entry-time values."""
 
@@ -1770,10 +1835,87 @@ def _remember_position_params(
         "take_profit_pct": take_profit_pct,
         "strategy": strategy,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "opened_at": (opened_at or datetime.now(timezone.utc)).isoformat(),
     }
     with _autopilot_lock:
         _autopilot_position_params[symbol.upper()] = payload
     _persist_autopilot_state()
+
+
+def _resolve_risk_profile(strategy_key: str) -> RiskProfile:
+    resolved = _resolve_hybrid_strategy_key(strategy_key)
+    return RISK_PROFILES.get(resolved, RISK_PROFILES[DEFAULT_HYBRID_STRATEGY])
+
+
+def _prune_pyramid_counts(active_symbols: set[str]) -> None:
+    with _autopilot_lock:
+        stale = set(_autopilot_pyramid_counts) - active_symbols
+        for sym in stale:
+            _autopilot_pyramid_counts.pop(sym, None)
+
+
+def _position_unrealized_plpc(pos: dict[str, Any]) -> float | None:
+    plpc = safe_float(pos.get("unrealized_plpc"), None)
+    if plpc is not None:
+        return plpc
+    percent = safe_float(pos.get("unrealized_pl_percent"), None)
+    if percent is not None:
+        return percent / 100.0
+    unrealized_pl = safe_float(pos.get("unrealized_pl"), None)
+    market_value = abs(safe_float(pos.get("market_value"), 0.0))
+    if unrealized_pl is not None and market_value:
+        return unrealized_pl / market_value
+    return None
+
+
+def _position_price(pos: dict[str, Any], asset_class: str) -> float | None:
+    price = safe_float(pos.get("current_price"), None)
+    if price is None:
+        price = safe_float(pos.get("market_price"), None)
+    if price is None:
+        price = safe_float(pos.get("avg_entry_price"), None)
+    if price is None and str(asset_class).lower() == "option":
+        qty = abs(safe_float(pos.get("qty"), 0.0)) or 1.0
+        mv = abs(safe_float(pos.get("market_value"), 0.0))
+        if qty:
+            price = mv / (qty * OPTION_CONTRACT_MULTIPLIER)
+    return price
+
+
+def compute_position_qty(
+    symbol: str,
+    asset_class: str,
+    price: float,
+    account_equity: float,
+    profile: RiskProfile,
+    *,
+    position_multiplier: float = 1.0,
+    min_entry_notional: float | None = None,
+    scale: float = 1.0,
+    contract_multiplier: int | None = None,
+) -> tuple[int, float]:
+    """Return quantity and target notional for an entry based on risk settings."""
+
+    if price is None or price <= 0 or account_equity <= 0:
+        return 0, 0.0
+
+    asset_class_norm = str(asset_class or "").lower()
+    is_option = "option" in asset_class_norm
+    target_pct = (
+        profile.base_position_pct_equity_option
+        if is_option
+        else profile.base_position_pct_equity_stock
+    )
+    target_pct = max(target_pct * position_multiplier, 0.0)
+
+    target_notional = account_equity * target_pct * max(scale, 0.0)
+    if min_entry_notional:
+        target_notional = max(target_notional, min_entry_notional)
+
+    multiplier = contract_multiplier or (OPTION_CONTRACT_MULTIPLIER if is_option else 1)
+    qty = int(target_notional // (price * multiplier)) if price > 0 else 0
+    qty = max(qty, 1) if target_notional > 0 else 0
+    return qty, target_notional
 
 
 def _prune_position_params(active_symbols: set[str]) -> None:
@@ -1853,6 +1995,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 _persist_autopilot_state()
         hybrid = HYBRID_STRATEGIES.get(strategy_key, HYBRID_STRATEGIES[DEFAULT_HYBRID_STRATEGY])
         strategy = hybrid
+        profile = _resolve_risk_profile(strategy_key)
         risk_key = config.get("risk", "medium")
         risk_cfg = AUTOPILOT_RISK_LEVELS.get(risk_key, AUTOPILOT_RISK_LEVELS["medium"])
         logger.info(
@@ -1873,6 +2016,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
             prerequisites_met = False
 
         equity = 0.0
+        cash_balance = 0.0
         positions: list[dict] = []
         open_orders: list[dict] = []
         recs_snapshot: list[dict] = []
@@ -1886,6 +2030,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 prerequisites_met = False
             else:
                 equity = safe_float(account.get("equity"), safe_float(account.get("cash")))
+                cash_balance = safe_float(account.get("cash"), 0.0)
                 if equity <= 0:
                     summary_lines.append("Account equity unavailable; skipping cycle.")
                     prerequisites_met = False
@@ -1945,6 +2090,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 else:
                     held_positions["equity"][symbol] = entry
                     gross_equity_notional += market_value
+
+            _prune_pyramid_counts(active_symbols)
 
             pending_order_symbols = {
                 str(o.get("symbol", "")).replace(" ", "").upper()
@@ -2013,19 +2160,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 0.1, hybrid.get("max_total_allocation", 1.0) * position_multiplier
             )
             min_entry_notional = max(50.0, hybrid.get("min_entry_notional", 200.0))
-            stock_fraction = max(
-                0.001, hybrid.get("stock_position_fraction", 0.02) * position_multiplier
-            )
-            option_fraction = max(
-                0.001, hybrid.get("option_position_fraction", 0.02) * position_multiplier
-            )
 
             exit_threshold = hybrid.get(
                 "exit_score", hybrid.get("min_bullish_score", 3.0) - 1.0
             )
             lookback = hybrid.get("lookback", "1y")
 
-            max_positions = max(1, int(hybrid.get("max_positions", 5)))
+            max_positions = max(1, int(profile.max_open_positions))
             current_positions_equity = held_positions["equity"]
             current_positions_option = {
                 sym: entry for sym, entry in held_positions["option"].items() if sym not in ZOMBIE_POSITIONS
@@ -2129,10 +2270,25 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         percent = safe_float(pos.get("unrealized_pl_percent"), None)
                         if percent is not None:
                             plpc = percent / 100.0
+                    opened_at = None
+                    opened_raw = position_params.get("opened_at") if isinstance(position_params, dict) else None
+                    if opened_raw:
+                        try:
+                            opened_at = datetime.fromisoformat(str(opened_raw))
+                        except Exception:
+                            opened_at = None
                     if plpc is not None and option_profit and plpc >= option_profit:
                         reasons.append(f"profit {plpc*100:.0f}% >= target")
                     if plpc is not None and option_stop and plpc <= -option_stop:
                         reasons.append(f"loss {plpc*100:.0f}% beyond stop")
+                    if (
+                        profile.name == "high"
+                        and plpc is not None
+                        and plpc <= profile.loser_cut_threshold_plpc * LOSER_OPTION_THRESHOLD_MULTIPLIER
+                    ):
+                        reasons.append(
+                            f"loss {plpc*100:.0f}% beyond aggressive stop"
+                        )
                     days_out = option_days_to_expiration(parsed)
                     if days_out is not None and days_out <= expiry_buffer:
                         reasons.append(f"{days_out}d to expiry")
@@ -2144,6 +2300,14 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             underlying_score, _ = score_stock(df)
                             if underlying_score < exit_threshold:
                                 reasons.append(f"score {underlying_score:.2f} < {exit_threshold}")
+                    if (
+                        profile.name == "high"
+                        and opened_at
+                        and plpc is not None
+                        and abs(plpc) < 0.01
+                        and (now - opened_at) > timedelta(days=4)
+                    ):
+                        reasons.append("stagnant option freeing capital")
                     if not reasons:
                         continue
                     open_exit_orders = paper_broker.list_open_orders_for_symbol(
@@ -2360,6 +2524,39 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
                 if qty < 1:
                     continue
+                position_params = _autopilot_position_params.get(symbol.upper(), {})
+                plpc = _position_unrealized_plpc(pos)
+                opened_at = None
+                opened_raw = position_params.get("opened_at") if isinstance(position_params, dict) else None
+                if opened_raw:
+                    try:
+                        opened_at = datetime.fromisoformat(str(opened_raw))
+                    except Exception:
+                        opened_at = None
+                aggressive_exit_reason: str | None = None
+                if profile.name == "high" and plpc is not None:
+                    if plpc <= profile.loser_cut_threshold_plpc:
+                        aggressive_exit_reason = f"loss {plpc*100:.1f}% beyond aggressive stop"
+                    elif opened_at and abs(plpc) < 0.01 and (now - opened_at) > timedelta(days=4):
+                        aggressive_exit_reason = "stagnant trade freeing capital"
+                if aggressive_exit_reason:
+                    if _autopilot_order_blocked(symbol, open_orders):
+                        summary_lines.append(
+                            f"Exit pending for {symbol}; open order detected."
+                        )
+                        continue
+                    qty_int = int(math.floor(qty))
+                    if qty_int > 0:
+                        try:
+                            place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                            summary_lines.append(
+                                f"Exit {qty_int} {symbol} ({aggressive_exit_reason})"
+                            )
+                            orders_placed += 1
+                            continue
+                        except Exception as exc:
+                            logger.exception("Autopilot equity exit failed for %s", symbol)
+                            errors.append(f"sell {symbol} failed: {exc}")
                 df = _autopilot_prepare_dataframe(symbol, lookback)
                 if df is None:
                     errors.append(f"no data for {symbol}; exit review skipped")
@@ -2404,6 +2601,95 @@ def run_autopilot_cycle(force: bool = False) -> None:
             current_positions.update(current_positions_equity)
             current_positions.update(current_positions_option)
 
+            max_positions = max(1, int(profile.max_open_positions))
+            available_slots = max(0, max_positions - len(current_positions))
+            gross_notional = gross_option_notional + gross_equity_notional
+
+            allocation_warning_logged = False
+            max_new_entries = max(1, int(profile.max_new_trades_per_run))
+            entries_placed = 0
+            cash_ratio = (cash_balance / equity) if equity else 1.0
+
+            def _pyramid_for_position(symbol: str, entry: dict[str, Any], asset_class: str) -> None:
+                nonlocal entries_placed, gross_notional, cash_balance, cash_ratio, orders_placed
+
+                if entries_placed >= max_new_entries:
+                    return
+                if profile.max_pyramids_per_position <= 0:
+                    return
+                symbol_key = symbol.upper()
+                pyramid_count = _autopilot_pyramid_counts.get(symbol_key, 0)
+                if pyramid_count >= profile.max_pyramids_per_position:
+                    return
+                pos = entry.get("position", {})
+                plpc = _position_unrealized_plpc(pos)
+                if plpc is None:
+                    return
+                threshold = profile.winner_add_threshold_plpc
+                if "option" in str(asset_class).lower():
+                    threshold *= WINNER_OPTION_THRESHOLD_MULTIPLIER
+                if plpc < threshold:
+                    return
+                open_buy_orders = paper_broker.list_open_orders_for_symbol(
+                    symbol,
+                    asset_class="option" if "option" in str(asset_class).lower() else "us_equity",
+                    side="buy",
+                    orders=open_orders,
+                )
+                if open_buy_orders:
+                    return
+                price = _position_price(pos, asset_class)
+                if price is None or price <= 0:
+                    return
+                qty, target_notional = compute_position_qty(
+                    symbol,
+                    asset_class,
+                    price,
+                    equity,
+                    profile,
+                    position_multiplier=position_multiplier,
+                    min_entry_notional=min_entry_notional,
+                    scale=PYRAMID_POSITION_SCALE,
+                )
+                multiplier = OPTION_CONTRACT_MULTIPLIER if "option" in str(asset_class).lower() else 1
+                order_notional = qty * price * multiplier
+                if qty <= 0:
+                    return
+                if gross_notional + order_notional > equity * max_total_allocation:
+                    return
+                try:
+                    place_guarded_paper_order(
+                        symbol,
+                        qty,
+                        "buy",
+                        asset_class="option" if "option" in str(asset_class).lower() else None,
+                        time_in_force="day",
+                        price_hint=price,
+                        support_brackets=False,
+                    )
+                    gross_notional += order_notional
+                    cash_balance = max(0.0, cash_balance - order_notional)
+                    cash_ratio = (cash_balance / equity) if equity else cash_ratio
+                    entries_placed += 1
+                    orders_placed += 1
+                    _autopilot_pyramid_counts[symbol_key] = pyramid_count + 1
+                    summary_lines.append(
+                        f"Add {qty} to {symbol} (pyramid, PL {plpc*100:.1f}% >= {threshold*100:.1f}%)"
+                    )
+                except Exception as exc:
+                    logger.exception("Autopilot pyramid add failed for %s", symbol)
+                    errors.append(f"pyramid {symbol} failed: {exc}")
+
+            if profile.max_pyramids_per_position > 0 and profile.name == "high":
+                for symbol, entry in current_positions_equity.items():
+                    _pyramid_for_position(symbol, entry, "equity")
+                    if entries_placed >= max_new_entries:
+                        break
+                for symbol, entry in current_positions_option.items():
+                    if entries_placed >= max_new_entries:
+                        break
+                    _pyramid_for_position(symbol, entry, "option")
+
             held_equity_symbols = set(current_positions_equity.keys())
             held_underlyings = held_equity_symbols | held_option_underlyings
 
@@ -2425,17 +2711,11 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 except Exception:
                     continue
 
-            min_entry_score = hybrid.get("min_bullish_score", 3.0)
+            min_entry_score = profile.min_entry_score or hybrid.get("min_bullish_score", 3.0)
             bearish_min_score = safe_float(
                 hybrid.get("min_bearish_score"), hybrid.get("min_bullish_score", 3.0)
             )
             logged_candidates: set[str] = set()
-
-            max_positions = max(1, int(hybrid.get("max_positions", 5)))
-            available_slots = max(0, max_positions - len(current_positions))
-            gross_notional = gross_option_notional + gross_equity_notional
-
-            allocation_warning_logged = False
 
             sorted_candidates = sorted(
                 candidate_entries,
@@ -2447,6 +2727,11 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 summary_lines.append("No new symbols met entry criteria.")
 
             for candidate in sorted_candidates:
+                if entries_placed >= max_new_entries:
+                    summary_lines.append(
+                        f"Entry cap reached ({entries_placed}/{max_new_entries}); skipping remaining candidates."
+                    )
+                    break
                 symbol = candidate.get("symbol", "")
                 score = candidate.get("score")
                 bias = candidate.get("bias") or "bullish"
@@ -2613,13 +2898,28 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             continue
                         unit_cost = mid_price * OPTION_CONTRACT_MULTIPLIER
-                        target_notional = max(min_entry_notional, equity * option_fraction)
+                        qty, target_notional = compute_position_qty(
+                            contract_symbol,
+                            "us_option",
+                            mid_price,
+                            equity,
+                            profile,
+                            position_multiplier=position_multiplier,
+                            min_entry_notional=min_entry_notional,
+                            contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
+                        )
                         max_debit = safe_float(hybrid.get("max_position_debit"), None)
                         if max_debit:
                             target_notional = min(target_notional, max_debit)
                         if PAPER_MAX_POSITION_NOTIONAL:
                             target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
-                        if gross_notional + target_notional > equity * max_total_allocation:
+                        if unit_cost > 0:
+                            qty = max(int(target_notional // unit_cost), qty)
+                        max_contracts = int(safe_float(hybrid.get("max_contracts_per_trade"), 0))
+                        if max_contracts:
+                            qty = min(qty, max_contracts)
+                        order_notional = qty * unit_cost
+                        if gross_notional + order_notional > equity * max_total_allocation:
                             if not allocation_warning_logged:
                                 summary_lines.append(
                                     "Max portfolio allocation reached; skipping new entries."
@@ -2630,10 +2930,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "none",
                             )
                             break
-                        qty = int(target_notional // max(unit_cost, 1e-6))
-                        max_contracts = int(safe_float(hybrid.get("max_contracts_per_trade"), 0))
-                        if max_contracts:
-                            qty = min(qty, max_contracts)
                         if qty <= 0:
                             summary_lines.append(
                                 f"Skip bearish {symbol}; notional ${target_notional:.2f} too small for put cost ${unit_cost:.2f}."
@@ -2665,7 +2961,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 support_brackets=False,
                                 position_effect="open",
                             )
-                            gross_notional += qty * unit_cost
+                            gross_notional += order_notional
+                            cash_balance = max(0.0, cash_balance - order_notional)
+                            cash_ratio = (cash_balance / equity) if equity else cash_ratio
                             available_slots -= 1
                             held_and_pending.add(contract_symbol)
                             pending_underlyings.add(symbol)
@@ -2675,11 +2973,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 stop_loss_pct=stop_loss_pct,
                                 take_profit_pct=take_profit_pct,
                                 strategy=strategy_key,
+                                opened_at=now,
                             )
                             summary_lines.append(
                                 f"Buy {qty} {contract_symbol} ({symbol} put {put_choice.get('strike', 0):.2f} exp {put_choice.get('expiration')}, limit ${mid_price:.2f})"
                             )
                             orders_placed += 1
+                            entries_placed += 1
                             log_candidate_outcome(
                                 f"bearish entry placed via option ({decision_reason})"
                             )
@@ -2781,14 +3081,29 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             continue
                         stop_loss_pct = option_stop_default
                         take_profit_pct = option_profit_default
-                        target_notional = max(min_entry_notional, equity * option_fraction)
+                        qty, target_notional = compute_position_qty(
+                            contract_symbol,
+                            "us_option",
+                            premium,
+                            equity,
+                            profile,
+                            position_multiplier=position_multiplier,
+                            min_entry_notional=min_entry_notional,
+                            contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
+                        )
                         max_debit = safe_float(hybrid.get("max_position_debit"), None)
                         if max_debit:
                             target_notional = min(target_notional, max_debit)
                         if PAPER_MAX_POSITION_NOTIONAL:
                             target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
                         unit_cost = premium * OPTION_CONTRACT_MULTIPLIER
-                        if gross_notional + target_notional > equity * max_total_allocation:
+                        if unit_cost > 0:
+                            qty = max(int(target_notional // unit_cost), qty)
+                        max_contracts = int(safe_float(hybrid.get("max_contracts_per_trade"), 0))
+                        if max_contracts:
+                            qty = min(qty, max_contracts)
+                        order_notional = qty * unit_cost
+                        if gross_notional + order_notional > equity * max_total_allocation:
                             if not allocation_warning_logged:
                                 summary_lines.append(
                                     "Max portfolio allocation reached; skipping new entries."
@@ -2799,10 +3114,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "none",
                             )
                             break
-                        qty = int(target_notional // max(unit_cost, 1e-6))
-                        max_contracts = int(safe_float(hybrid.get("max_contracts_per_trade"), 0))
-                        if max_contracts:
-                            qty = min(qty, max_contracts)
                         if qty <= 0:
                             summary_lines.append(
                                 f"Skip bullish {symbol}; notional ${target_notional:.2f} too small for call cost ${unit_cost:.2f}."
@@ -2829,7 +3140,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 asset_class="option",
                                 price_hint=premium,
                             )
-                            gross_notional += qty * unit_cost
+                            gross_notional += order_notional
+                            cash_balance = max(0.0, cash_balance - order_notional)
+                            cash_ratio = (cash_balance / equity) if equity else cash_ratio
                             available_slots -= 1
                             held_and_pending.add(contract_symbol)
                             pending_underlyings.add(symbol)
@@ -2839,11 +3152,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 stop_loss_pct=stop_loss_pct,
                                 take_profit_pct=take_profit_pct,
                                 strategy=strategy_key,
+                                opened_at=now,
                             )
                             summary_lines.append(
                                 f"Buy {qty} {contract_symbol} (score {score:.2f}, premium ${premium:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
                             )
                             orders_placed += 1
+                            entries_placed += 1
                             log_candidate_outcome(
                                 f"bullish entry placed via option ({decision_reason})"
                             )
@@ -2887,10 +3202,20 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         continue
                     stop_loss_pct = stock_stop_default
                     take_profit_pct = stock_take_default
-                    target_notional = max(min_entry_notional, equity * stock_fraction)
+                    qty, target_notional = compute_position_qty(
+                        symbol,
+                        "equity",
+                        price,
+                        equity,
+                        profile,
+                        position_multiplier=position_multiplier,
+                        min_entry_notional=min_entry_notional,
+                    )
                     if PAPER_MAX_POSITION_NOTIONAL:
                         target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
-                    if gross_notional + target_notional > equity * max_total_allocation:
+                        if price > 0:
+                            qty = max(int(target_notional // price), qty)
+                    if gross_notional + (qty * price) > equity * max_total_allocation:
                         if not allocation_warning_logged:
                             summary_lines.append(
                                 "Max portfolio allocation reached; skipping new entries."
@@ -2901,7 +3226,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             "none",
                         )
                         break
-                    qty = int(target_notional // max(price, 1e-6))
                     if qty <= 0:
                         summary_lines.append(
                             f"Skip {symbol}; notional ${target_notional:.2f} too small for price ${price:.2f}."
@@ -2926,6 +3250,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             time_in_force="gtc",
                         )
                         gross_notional += qty * price
+                        cash_balance = max(0.0, cash_balance - (qty * price))
+                        cash_ratio = (cash_balance / equity) if equity else cash_ratio
                         available_slots -= 1
                         held_and_pending.add(symbol)
                         pending_underlyings.add(symbol)
@@ -2935,11 +3261,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             stop_loss_pct=stop_loss_pct,
                             take_profit_pct=take_profit_pct,
                             strategy=strategy_key,
+                            opened_at=now,
                         )
                         summary_lines.append(
                             f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
                         )
                         orders_placed += 1
+                        entries_placed += 1
                         log_candidate_outcome(
                             f"bullish entry placed via stock ({decision_reason})"
                         )
