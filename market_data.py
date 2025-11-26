@@ -546,8 +546,8 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         )
         return None
 
-    min_expiry = now.date() + timedelta(days=14)
-    max_expiry = now.date() + timedelta(days=75)
+    min_expiry = now.date() + timedelta(days=10)
+    max_expiry = now.date() + timedelta(days=90)
 
     try:
         chain = fetch_option_contracts(
@@ -584,7 +584,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
             strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
             if not strike:
                 continue
-            if strike < spot * 0.90 or strike > spot * 1.10:
+            if strike < spot * 0.85 or strike > spot * 1.15:
                 continue
 
             bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
@@ -598,16 +598,16 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                 continue
 
             # Avoid penny wide ghost quotes
-            if bid < 0.05:
+            if bid < 0.03:
                 continue
 
             spread_pct = (ask - bid) / ask if ask else 1.0
-            if spread_pct > 0.45:
+            if spread_pct > 0.60:
                 continue
 
             open_int = _safe_float(contract.get("open_interest"), 0.0)
             volume = _safe_float(contract.get("volume"), 0.0)
-            if (open_int or 0) < 50 and (volume or 0) < 10:
+            if (open_int or 0) < 20 and (volume or 0) < 5:
                 continue
 
             mid = (bid + ask) / 2.0
@@ -630,6 +630,80 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                 }
         except Exception:
             continue
+
+    if not best:
+        best_relaxed: dict | None = None
+        best_relaxed_sort: tuple[int, float] | None = None
+        for contract in chain:
+            try:
+                raw_exp = contract.get("expiration_date") or contract.get("expiry")
+                expiration = None
+                if isinstance(raw_exp, str):
+                    try:
+                        expiration = datetime.fromisoformat(raw_exp).date()
+                    except ValueError:
+                        expiration = None
+                elif isinstance(raw_exp, date):
+                    expiration = raw_exp
+                if not expiration or expiration < min_expiry or expiration > max_expiry:
+                    continue
+
+                strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
+                if not strike:
+                    continue
+                if strike < spot * 0.85 or strike > spot * 1.15:
+                    continue
+
+                bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
+                ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
+                last = _safe_float(
+                    contract.get("last_price") or contract.get("last_trade_price")
+                )
+
+                if bid is None or ask is None or bid <= 0 or ask <= 0:
+                    continue
+                if bid < 0.01:
+                    continue
+
+                spread_pct = (ask - bid) / ask if ask else 1.0
+                if spread_pct > 0.90:
+                    continue
+
+                open_int = _safe_float(contract.get("open_interest"), 0.0)
+                volume = _safe_float(contract.get("volume"), 0.0)
+                if (open_int or 0) < 1 and (volume or 0) < 1:
+                    continue
+
+                mid = (bid + ask) / 2.0
+                option_symbol = str(contract.get("symbol", "")).strip()
+                if not option_symbol:
+                    continue
+
+                sort_key = ((expiration - min_expiry).days, abs(strike - spot))
+                if best_relaxed_sort is None or sort_key < best_relaxed_sort:
+                    best_relaxed_sort = sort_key
+                    best_relaxed = {
+                        "underlying": symbol.upper(),
+                        "option_symbol": option_symbol,
+                        "strike": strike,
+                        "expiration": expiration,
+                        "bid": bid,
+                        "ask": ask,
+                        "last": last,
+                        "mid": mid,
+                    }
+            except Exception:
+                continue
+
+        if best_relaxed:
+            best = best_relaxed
+            logger.warning(
+                "Using relaxed option filters for %s on %s; selected %s with mid_price=%.2f",
+                kind,
+                symbol.upper(),
+                best["option_symbol"],
+                best.get("mid", 0.0),
+            )
 
     if not best:
         logger.info(

@@ -3826,7 +3826,8 @@ def start_background_jobs():
             seek_recommendations,
             "interval",
             hours=1,
-            next_run_time=datetime.now(),
+            # First run is triggered manually above; schedule subsequent runs for the future
+            next_run_time=datetime.now() + timedelta(hours=1),
             id="seek_recommendations",
             replace_existing=True,
         )
@@ -3834,7 +3835,8 @@ def start_background_jobs():
             run_autopilot_cycle,
             "interval",
             minutes=5,
-            next_run_time=datetime.now(),
+            # Avoid double-run at startup by spacing the first scheduled cycle
+            next_run_time=datetime.now() + timedelta(minutes=5),
             id="run_autopilot_cycle",
             replace_existing=True,
         )
