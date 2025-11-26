@@ -112,6 +112,29 @@ class AlpacaPaperBroker:
         data = self._request("GET", "/orders", params=params)
         return data if isinstance(data, list) else []
 
+    def get_activities(
+        self,
+        activity_types: str | Iterable[str] | None = None,
+        *,
+        date: _dt.date | str | None = None,
+        page_size: int | None = None,
+    ) -> Iterable[Dict[str, Any]]:
+        """Return account activities such as fills for the requested date."""
+
+        params: Dict[str, Any] = {}
+        if activity_types:
+            if isinstance(activity_types, str):
+                params["activity_types"] = activity_types
+            else:
+                params["activity_types"] = ",".join(activity_types)
+        if date:
+            params["date"] = date.isoformat() if isinstance(date, _dt.date) else str(date)
+        if page_size:
+            params["page_size"] = int(page_size)
+
+        data = self._request("GET", "/account/activities", params=params)
+        return data if isinstance(data, list) else []
+
     def list_open_orders_for_symbol(
         self,
         symbol: str,
@@ -243,7 +266,7 @@ def _parse_alpaca_timestamp(value: Any, tz: _dt.tzinfo) -> Optional[_dt.datetime
     return dt_val.astimezone(tz)
 
 
-PAPER_TRADES_COLUMNS = [
+CSV_COLUMNS = [
     "row_type",
     "date",
     "timestamp",
@@ -275,6 +298,9 @@ PAPER_TRADES_COLUMNS = [
     "realized_plpc",
 ]
 
+# Backwards compatibility alias
+PAPER_TRADES_COLUMNS = CSV_COLUMNS
+
 
 def get_daily_account_snapshot(
     broker: AlpacaPaperBroker,
@@ -294,7 +320,8 @@ def get_daily_account_snapshot(
 
     account = broker.get_account()
     positions = list(broker.get_positions())
-    orders = list(broker.list_orders(status="all", limit=200))
+    orders = list(broker.list_orders(status="all", limit=500))
+    order_lookup = {o.get("id"): o for o in orders if o.get("id")}
 
     orders_for_day: list[dict[str, Any]] = []
     for order in orders:
@@ -314,12 +341,66 @@ def get_daily_account_snapshot(
         reverse=True,
     )
 
+    fills_for_day: list[dict[str, Any]] = []
+    try:
+        activities = broker.get_activities(activity_types="FILL", date=snapshot_date)
+    except Exception:
+        logger.exception("Failed to fetch fill activities for %s", snapshot_date)
+        activities = []
+
+    for activity in activities or []:
+        tx_time = _parse_alpaca_timestamp(activity.get("transaction_time"), tzinfo)
+        activity_date = tx_time.date() if tx_time else None
+        if activity_date and activity_date != snapshot_date:
+            continue
+
+        merged: dict[str, Any] = dict(activity)
+        related_order = order_lookup.get(activity.get("order_id"))
+
+        if related_order:
+            merged.setdefault("symbol", related_order.get("symbol"))
+            merged.setdefault("asset_class", related_order.get("asset_class"))
+            merged.setdefault("type", related_order.get("type"))
+            merged.setdefault("time_in_force", related_order.get("time_in_force"))
+            merged.setdefault("submitted_at", related_order.get("submitted_at"))
+            merged.setdefault("side", related_order.get("side"))
+            merged.setdefault("status", related_order.get("status"))
+            merged.setdefault("filled_avg_price", related_order.get("filled_avg_price"))
+            merged.setdefault("qty", related_order.get("qty"))
+            merged.setdefault("filled_qty", related_order.get("filled_qty"))
+            merged.setdefault("order_class", related_order.get("order_class"))
+            merged.setdefault("mode_or_strategy", related_order.get("mode_or_strategy"))
+            merged.setdefault("strategy_name", related_order.get("strategy_name"))
+            merged.setdefault("underlying_symbol", related_order.get("underlying_symbol"))
+            submitted_dt = _parse_alpaca_timestamp(related_order.get("submitted_at"), tzinfo)
+            if submitted_dt:
+                merged["_submitted_at_local"] = submitted_dt
+        merged["_filled_at_local"] = tx_time or _parse_alpaca_timestamp(activity.get("processed_at"), tzinfo)
+
+        merged.setdefault("symbol", activity.get("symbol"))
+        merged.setdefault("qty", activity.get("quantity") or activity.get("cum_qty") or activity.get("qty"))
+        merged.setdefault("side", activity.get("side"))
+        merged.setdefault("filled_avg_price", activity.get("price") or activity.get("price_per_share"))
+
+        if "profit_loss" in activity:
+            merged.setdefault("realized_pl", activity.get("profit_loss"))
+        if "profit_loss_pct" in activity:
+            merged.setdefault("realized_plpc", activity.get("profit_loss_pct"))
+
+        fills_for_day.append(merged)
+
+    fills_for_day.sort(
+        key=lambda o: o.get("_filled_at_local") or o.get("_submitted_at_local") or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc),
+        reverse=True,
+    )
+
     logger.info(
-        "Daily snapshot %s tz=%s: positions=%d orders=%d",
+        "Daily snapshot %s tz=%s: positions=%d orders=%d fills=%d",
         snapshot_date,
         tzinfo,
         len(positions),
         len(orders_for_day),
+        len(fills_for_day),
     )
 
     return {
@@ -328,7 +409,8 @@ def get_daily_account_snapshot(
         "as_of": _dt.datetime.now(tzinfo),
         "account": account or {},
         "positions": positions,
-        "orders": orders_for_day,
+        "orders": fills_for_day or orders_for_day,
+        "fills": fills_for_day,
     }
 
 
@@ -373,7 +455,6 @@ def _date_string(value: Any, tzinfo: _dt.tzinfo) -> str:
 
 def build_paper_trades_export(
     snapshot: dict,
-    trades: list[dict],
     *,
     mode_or_strategy: str | None = None,
     strategy_name: str | None = None,
@@ -381,14 +462,17 @@ def build_paper_trades_export(
     """Construct a normalized export DataFrame for paper trades."""
 
     tzinfo = snapshot.get("timezone") or _resolve_timezone()
-    as_of = snapshot.get("as_of")
-    as_of_ts_iso, as_of_dt = _normalize_timestamp(as_of or _dt.datetime.now(tzinfo), tzinfo)
+    as_of = snapshot.get("as_of") or _dt.datetime.now(tzinfo)
+    as_of_ts_iso, as_of_dt = _normalize_timestamp(as_of, tzinfo)
     snapshot_date = snapshot.get("date") or (as_of_dt.date() if as_of_dt else _dt.datetime.now(tzinfo).date())
     snapshot_date_str = _date_string(snapshot_date, tzinfo)
 
     rows: list[dict[str, Any]] = []
     account = snapshot.get("account") or {}
-    account_ts_iso, account_ts = _normalize_timestamp(account.get("updated_at") or as_of_dt, tzinfo)
+    account_ts_iso, _ = _normalize_timestamp(account.get("updated_at") or as_of_dt, tzinfo)
+    account_strategy_name = (
+        strategy_name or snapshot.get("strategy_name") or snapshot.get("profile")
+    )
     rows.append(
         {
             "row_type": "account_summary",
@@ -398,78 +482,140 @@ def build_paper_trades_export(
             "cash": _safe_float(account.get("cash")),
             "buying_power": _safe_float(account.get("buying_power")),
             "portfolio_value": _safe_float(account.get("portfolio_value")),
+            "symbol": None,
+            "asset_class": None,
+            "qty": None,
+            "side": None,
+            "avg_entry_price": None,
+            "current_price": None,
+            "market_value": None,
+            "unrealized_pl": None,
+            "unrealized_plpc": None,
+            "order_type": None,
+            "time_in_force": None,
+            "submitted_at": None,
+            "filled_at": None,
+            "filled_avg_price": None,
+            "status": None,
+            "order_id": None,
             "mode_or_strategy": mode_or_strategy,
-            "strategy_name": strategy_name,
+            "strategy_name": account_strategy_name,
+            "underlying_symbol": None,
+            "notes": None,
+            "realized_pl": None,
+            "realized_plpc": None,
         }
     )
 
     for pos in snapshot.get("positions") or []:
-        position_ts_iso, position_dt = _normalize_timestamp(as_of_dt, tzinfo)
         rows.append(
             {
                 "row_type": "position",
-                "date": _date_string(position_dt or snapshot_date, tzinfo),
-                "timestamp": position_ts_iso,
+                "date": snapshot_date_str,
+                "timestamp": account_ts_iso,
                 "equity": None,
                 "cash": None,
                 "buying_power": None,
                 "portfolio_value": None,
                 "symbol": pos.get("symbol"),
                 "asset_class": pos.get("asset_class"),
-                "qty": pos.get("qty"),
+                "qty": _safe_float(pos.get("qty")),
                 "side": None,
-                "avg_entry_price": pos.get("avg_entry_price"),
-                "current_price": pos.get("current_price"),
-                "market_value": pos.get("market_value"),
-                "unrealized_pl": pos.get("unrealized_pl"),
-                "unrealized_plpc": pos.get("unrealized_plpc"),
-                "underlying_symbol": pos.get("underlying_symbol") if str(pos.get("asset_class", "")).lower() == "option" else None,
+                "avg_entry_price": _safe_float(pos.get("avg_entry_price")),
+                "current_price": _safe_float(pos.get("current_price")),
+                "market_value": _safe_float(pos.get("market_value")),
+                "unrealized_pl": _safe_float(pos.get("unrealized_pl")),
+                "unrealized_plpc": _safe_float(pos.get("unrealized_plpc")),
+                "order_type": None,
+                "time_in_force": None,
+                "submitted_at": None,
+                "filled_at": None,
+                "filled_avg_price": None,
+                "status": None,
+                "order_id": None,
                 "mode_or_strategy": mode_or_strategy,
-                "strategy_name": strategy_name,
+                "strategy_name": pos.get("strategy_name") or account_strategy_name,
+                "underlying_symbol": pos.get("underlying_symbol") if str(pos.get("asset_class", "")).lower() == "option" else None,
+                "notes": None,
+                "realized_pl": None,
+                "realized_plpc": None,
             }
         )
 
-    for order in trades or []:
-        filled_iso, filled_dt = _normalize_timestamp(order.get("_filled_at_local") or order.get("filled_at"), tzinfo)
+    trades_source = []
+    fills_list = snapshot.get("fills")
+    orders_list = snapshot.get("orders")
+    if fills_list:
+        trades_source.extend(fills_list)
+    if orders_list and orders_list is not fills_list:
+        seen_ids = {
+            t.get("id") or t.get("order_id") or t.get("activity_id")
+            for t in trades_source
+            if isinstance(t, dict)
+        }
+        for order in orders_list:
+            identifier = order.get("id") or order.get("order_id") or order.get("activity_id")
+            if identifier and identifier in seen_ids:
+                continue
+            trades_source.append(order)
+
+    for order in trades_source:
+        if not isinstance(order, dict):
+            continue
+        filled_iso, filled_dt = _normalize_timestamp(
+            order.get("_filled_at_local")
+            or order.get("filled_at")
+            or order.get("transaction_time")
+            or order.get("processed_at"),
+            tzinfo,
+        )
         submitted_iso, submitted_dt = _normalize_timestamp(
             order.get("_submitted_at_local") or order.get("submitted_at"), tzinfo
         )
-        event_ts = filled_dt or submitted_dt or as_of_dt
+        event_dt = filled_dt or submitted_dt or as_of_dt
         event_iso = filled_iso or submitted_iso or as_of_ts_iso
-        rows.append(
-            {
-                "row_type": "trade",
-                "date": _date_string(event_ts or snapshot_date, tzinfo),
-                "timestamp": event_iso,
-                "equity": None,
-                "cash": None,
-                "buying_power": None,
-                "portfolio_value": None,
-                "symbol": order.get("symbol"),
-                "asset_class": order.get("asset_class"),
-                "qty": order.get("qty") or order.get("filled_qty"),
-                "side": order.get("side"),
-                "avg_entry_price": order.get("limit_price") or order.get("avg_entry_price"),
-                "current_price": order.get("filled_avg_price") or order.get("current_price"),
-                "market_value": order.get("notional"),
-                "unrealized_pl": None,
-                "unrealized_plpc": None,
-                "order_type": order.get("type"),
-                "time_in_force": order.get("time_in_force"),
-                "submitted_at": submitted_iso,
-                "filled_at": filled_iso,
-                "filled_avg_price": order.get("filled_avg_price"),
-                "status": order.get("status"),
-                "order_id": order.get("id"),
-                "mode_or_strategy": order.get("mode_or_strategy") or mode_or_strategy,
-                "strategy_name": order.get("strategy_name") or strategy_name,
-                "underlying_symbol": order.get("underlying_symbol"),
-                "notes": order.get("order_class"),
-                "realized_pl": order.get("realized_pl"),
-                "realized_plpc": order.get("realized_plpc"),
-            }
-        )
+        row_strategy_name = order.get("strategy_name") or account_strategy_name
+        qty_val = order.get("filled_qty") or order.get("qty") or order.get("quantity") or order.get("cum_qty")
+        realized_pl = order.get("realized_pl")
+        realized_plpc = order.get("realized_plpc")
+        if realized_pl is None:
+            realized_pl = order.get("profit_loss")
+        if realized_plpc is None:
+            realized_plpc = order.get("profit_loss_pct")
+        row = {
+            "row_type": "trade",
+            "date": _date_string(event_dt or snapshot_date, tzinfo),
+            "timestamp": event_iso,
+            "equity": None,
+            "cash": None,
+            "buying_power": None,
+            "portfolio_value": None,
+            "symbol": order.get("symbol"),
+            "asset_class": order.get("asset_class") or order.get("class"),
+            "qty": _safe_float(qty_val),
+            "side": order.get("side"),
+            "avg_entry_price": None,
+            "current_price": None,
+            "market_value": None,
+            "unrealized_pl": None,
+            "unrealized_plpc": None,
+            "order_type": order.get("type"),
+            "time_in_force": order.get("time_in_force"),
+            "submitted_at": submitted_iso,
+            "filled_at": filled_iso,
+            "filled_avg_price": _safe_float(order.get("filled_avg_price") or order.get("price")),
+            "status": order.get("status") or order.get("type"),
+            "order_id": order.get("id") or order.get("order_id") or order.get("activity_id"),
+            "mode_or_strategy": order.get("mode_or_strategy") or mode_or_strategy,
+            "strategy_name": row_strategy_name,
+            "underlying_symbol": order.get("underlying_symbol"),
+            "notes": order.get("order_class"),
+            "realized_pl": _safe_float(realized_pl),
+            "realized_plpc": _safe_float(realized_plpc),
+        }
+
+        rows.append(row)
 
     df = pd.DataFrame(rows)
-    df = df.reindex(columns=PAPER_TRADES_COLUMNS)
+    df = df.reindex(columns=CSV_COLUMNS)
     return df

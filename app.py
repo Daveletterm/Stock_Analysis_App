@@ -4116,7 +4116,6 @@ def export_paper_csv():
 
     df = build_paper_trades_export(
         snapshot,
-        snapshot.get("orders") or [],
         mode_or_strategy=autopilot_mode,
         strategy_name=autopilot_strategy,
     )
