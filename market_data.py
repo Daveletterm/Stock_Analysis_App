@@ -546,8 +546,8 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         )
         return None
 
-    min_expiry = now.date() + timedelta(days=10)
-    max_expiry = now.date() + timedelta(days=90)
+    min_expiry = now.date() + timedelta(days=7)
+    max_expiry = now.date() + timedelta(days=120)
 
     try:
         chain = fetch_option_contracts(
@@ -598,16 +598,16 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                 continue
 
             # Avoid penny wide ghost quotes
-            if bid < 0.03:
+            if bid < 0.02:
                 continue
 
             spread_pct = (ask - bid) / ask if ask else 1.0
-            if spread_pct > 0.60:
+            if spread_pct > 0.75:
                 continue
 
             open_int = _safe_float(contract.get("open_interest"), 0.0)
             volume = _safe_float(contract.get("volume"), 0.0)
-            if (open_int or 0) < 20 and (volume or 0) < 5:
+            if (open_int or 0) < 10 and (volume or 0) < 2:
                 continue
 
             mid = (bid + ask) / 2.0

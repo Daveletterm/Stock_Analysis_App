@@ -112,6 +112,40 @@ class AlpacaPaperBroker:
         data = self._request("GET", "/orders", params=params)
         return data if isinstance(data, list) else []
 
+    def get_portfolio_history(
+        self,
+        period: str = "1D",
+        timeframe: str = "15Min",
+        extended_hours: bool = False,
+    ) -> Dict[str, Any]:
+        """Return account equity history for the requested window."""
+
+        params = {
+            "period": period,
+            "timeframe": timeframe,
+            "extended_hours": str(bool(extended_hours)).lower(),
+        }
+        data = self._request("GET", "/account/portfolio/history", params=params)
+        return data if isinstance(data, dict) else {}
+
+    def list_trade_activities(
+        self,
+        activity_types: str = "FILL",
+        date: _dt.date | None = None,
+        page_size: int = 100,
+    ) -> Iterable[Dict[str, Any]]:
+        """Return trade activities (fills) for the given date from Alpaca.
+
+        This is used to compute realized P/L per fill.
+        """
+        params: Dict[str, Any] = {"activity_types": activity_types, "page_size": page_size}
+        if date is not None:
+            # Alpaca expects YYYY-MM-DD in local account timezone
+            params["date"] = date.isoformat()
+
+        data = self._request("GET", "/account/activities", params=params)
+        return data if isinstance(data, list) else []
+
     def get_activities(
         self,
         activity_types: str | Iterable[str] | None = None,
@@ -302,6 +336,80 @@ CSV_COLUMNS = [
 PAPER_TRADES_COLUMNS = CSV_COLUMNS
 
 
+def _build_realized_pnl_map(
+    broker: AlpacaPaperBroker,
+    snapshot_date: _dt.date,
+    tzinfo: _dt.tzinfo,
+) -> dict[str, dict[str, Any]]:
+    """Return a mapping from Alpaca activity id or order id to realized P/L info."""
+
+    activities = broker.list_trade_activities(date=snapshot_date)
+    result: dict[str, dict[str, Any]] = {}
+    if not isinstance(activities, list):
+        return result
+
+    for act in activities:
+        if not isinstance(act, dict):
+            continue
+        activity_type = str(act.get("activity_type") or "").lower()
+        if activity_type not in ("fill", "trade"):
+            continue
+
+        raw_pl = act.get("profit_loss")
+        raw_plpc = act.get("profit_loss_pct")
+
+        realized_pl = None
+        if raw_pl is not None:
+            try:
+                realized_pl = float(raw_pl)
+            except Exception:
+                realized_pl = None
+
+        if realized_pl is None:
+            net_amount = act.get("net_amount")
+            side = str(act.get("side") or "").lower()
+            qty = act.get("qty") or act.get("quantity")
+            price = act.get("price")
+            try:
+                qty_f = float(qty) if qty is not None else None
+                price_f = float(price) if price is not None else None
+                if qty_f and price_f:
+                    realized_pl = float(net_amount) if net_amount is not None else None
+            except Exception:
+                realized_pl = None
+
+        realized_plpc = None
+        if raw_plpc is not None:
+            try:
+                realized_plpc = float(raw_plpc)
+            except Exception:
+                realized_plpc = None
+
+        if realized_pl is not None and realized_plpc is None:
+            qty = act.get("qty") or act.get("quantity")
+            price = act.get("price")
+            try:
+                qty_f = float(qty) if qty is not None else None
+                price_f = float(price) if price is not None else None
+                notional = (qty_f or 0.0) * (price_f or 0.0)
+                if notional:
+                    realized_plpc = realized_pl / notional
+            except Exception:
+                realized_plpc = None
+
+        key = str(act.get("order_id") or act.get("id") or "").strip()
+        if not key:
+            continue
+
+        result[key] = {
+            "realized_pl": realized_pl,
+            "realized_plpc": realized_plpc,
+            "symbol": act.get("symbol"),
+        }
+
+    return result
+
+
 def get_daily_account_snapshot(
     broker: AlpacaPaperBroker,
     target_date: _dt.date | None = None,
@@ -323,6 +431,8 @@ def get_daily_account_snapshot(
     orders = list(broker.list_orders(status="all", limit=500))
     order_lookup = {o.get("id"): o for o in orders if o.get("id")}
 
+    realized_pnl_map = _build_realized_pnl_map(broker, snapshot_date, tzinfo)
+
     orders_for_day: list[dict[str, Any]] = []
     for order in orders:
         submitted_dt = _parse_alpaca_timestamp(order.get("submitted_at"), tzinfo)
@@ -334,6 +444,11 @@ def get_daily_account_snapshot(
                 cloned["_submitted_at_local"] = submitted_dt
             if filled_dt:
                 cloned["_filled_at_local"] = filled_dt
+            order_id = str(order.get("id") or "").strip()
+            if order_id and order_id in realized_pnl_map:
+                rp = realized_pnl_map[order_id]
+                cloned["realized_pl"] = rp.get("realized_pl")
+                cloned["realized_plpc"] = rp.get("realized_plpc")
             orders_for_day.append(cloned)
 
     orders_for_day.sort(
@@ -386,6 +501,11 @@ def get_daily_account_snapshot(
             merged.setdefault("realized_pl", activity.get("profit_loss"))
         if "profit_loss_pct" in activity:
             merged.setdefault("realized_plpc", activity.get("profit_loss_pct"))
+        order_id_key = str(activity.get("order_id") or "").strip()
+        if order_id_key and order_id_key in realized_pnl_map:
+            rp = realized_pnl_map[order_id_key]
+            merged.setdefault("realized_pl", rp.get("realized_pl"))
+            merged.setdefault("realized_plpc", rp.get("realized_plpc"))
 
         fills_for_day.append(merged)
 
@@ -411,6 +531,7 @@ def get_daily_account_snapshot(
         "positions": positions,
         "orders": fills_for_day or orders_for_day,
         "fills": fills_for_day,
+        "realized_pnl_map": realized_pnl_map,
     }
 
 

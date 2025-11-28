@@ -17,6 +17,14 @@ from typing import Any, Dict, List, Tuple, Optional, Literal
 import requests
 
 import pandas as pd
+try:
+    import plotly.express as px  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    px = None
+    logging.getLogger("stockapp").warning(
+        "plotly not installed; dashboard charts will be unavailable. "
+        "Install with 'pip install plotly'."
+    )
 import numpy as np
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, Response
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -142,13 +150,13 @@ class RiskProfile:
 
 OPTION_MOMENTUM_DEFAULTS = {
     "options_expiry_buffer": 5,
-    "options_expiry_window": (21, 45),
-    "min_open_interest": 75,
-    "min_volume": 10,
+    "options_expiry_window": (14, 60),
+    "min_open_interest": 25,
+    "min_volume": 2,
     "target_delta": 0.4,
     "min_delta": 0.25,
     "max_delta": 0.65,
-    "max_spread_pct": 0.45,
+    "max_spread_pct": 0.65,
     "max_implied_volatility": 3.0,
     "max_premium_pct_of_spot": 0.35,
     "contract_type": "auto",
@@ -195,21 +203,23 @@ HYBRID_STRATEGIES = {
         "min_entry_notional": 200.0,
         "exit_score": 2.0,
     },
+    # Options-forward with capped portfolio allocation and tighter default stops
     "hybrid_aggressive": {
         **OPTION_MOMENTUM_DEFAULTS,
         "label": "Aggressive (hybrid)",
         "description": "Prefer options when available; fall back to shares when needed.",
-        "max_positions": 6,
-        "stock_position_fraction": 0.03,
-        "option_position_fraction": 0.03,
-        "min_bullish_score": 4.0,
-        "min_bearish_score": 2.5,
+        "max_positions": 5,
+        "stock_position_fraction": 0.02,
+        "option_position_fraction": 0.05,
+        "min_bullish_score": 3.8,
+        "min_bearish_score": 2.3,
         "option_bias": "prefer_options",
-        "option_stop_loss_pct": 0.50,
-        "option_take_profit_pct": 1.10,
+        "contract_type": "call",
+        "option_stop_loss_pct": 0.45,
+        "option_take_profit_pct": 1.20,
         "stock_stop_loss_pct": 0.08,
-        "stock_take_profit_pct": 0.20,
-        "max_total_allocation": 1.05,
+        "stock_take_profit_pct": 0.22,
+        "max_total_allocation": 0.95,
         "min_entry_notional": 150.0,
         "exit_score": 1.6,
     },
@@ -250,7 +260,7 @@ RISK_PROFILES: dict[str, RiskProfile] = {
         winner_add_threshold_plpc=0.03,
         loser_cut_threshold_plpc=-0.04,
         idle_cash_target_pct=0.20,
-        min_entry_score=4.0,
+        min_entry_score=3.8,
     ),
 }
 
@@ -267,9 +277,9 @@ AUTOPILOT_STRATEGIES = HYBRID_STRATEGIES
 AUTOPILOT_RISK_LEVELS = {
     "low": {
         "label": "Low",
-        "position_multiplier": 0.65,
-        "stop_loss_multiplier": 0.75,
-        "take_profit_multiplier": 0.85,
+        "position_multiplier": 0.7,
+        "stop_loss_multiplier": 0.9,
+        "take_profit_multiplier": 0.9,
     },
     "medium": {
         "label": "Medium",
@@ -279,9 +289,9 @@ AUTOPILOT_RISK_LEVELS = {
     },
     "high": {
         "label": "High",
-        "position_multiplier": 1.3,
-        "stop_loss_multiplier": 1.35,
-        "take_profit_multiplier": 1.2,
+        "position_multiplier": 1.25,
+        "stop_loss_multiplier": 1.0,
+        "take_profit_multiplier": 1.35,
     },
 }
 
@@ -1274,13 +1284,18 @@ def update_autopilot_config(
 
 
 def _autopilot_order_blocked(symbol: str, open_orders: list[dict]) -> bool:
+    active_status = {"new", "accepted", "open", "pending_new", "partially_filled"}
+    active_buy = 0
     for order in open_orders:
         try:
             if str(order.get("symbol", "")).upper() != symbol.upper():
                 continue
             status = str(order.get("status", "")).lower()
-            if status in {"new", "accepted", "open", "pending_new", "partially_filled"}:
-                return True
+            side = str(order.get("side", "")).lower()
+            if status in active_status and side == "buy":
+                active_buy += 1
+                if active_buy >= 1:
+                    return True
         except Exception:
             continue
     return False
@@ -1906,6 +1921,8 @@ def compute_position_qty(
         if is_option
         else profile.base_position_pct_equity_stock
     )
+    # stock_position_fraction and option_position_fraction define the target equity fraction
+    # for new entries; risk multipliers adjust them by position_multiplier.
     target_pct = max(target_pct * position_multiplier, 0.0)
 
     target_notional = account_equity * target_pct * max(scale, 0.0)
@@ -3894,6 +3911,318 @@ def scheduler_status():
 
 
 # -----------------------------
+# CSV dashboard helpers
+# -----------------------------
+
+
+def classify_dataset(df: pd.DataFrame) -> str:
+    """Classify the uploaded dataset so we can toggle trading-aware views."""
+
+    cols = {c.lower() for c in df.columns}
+
+    trading_core = {
+        "row_type",
+        "symbol",
+        "side",
+        "order_type",
+        "status",
+        "order_id",
+        "mode_or_strategy",
+        "strategy_name",
+    }
+    trading_optional = {
+        "realized_pl",
+        "realized_plpc",
+        "unrealized_pl",
+        "unrealized_plpc",
+        "portfolio_value",
+        "equity",
+    }
+
+    if trading_core.issubset(cols):
+        return "trading_paper_trades"
+    if "row_type" in cols and "symbol" in cols and ("realized_pl" in cols or "unrealized_pl" in cols):
+        return "trading_like"
+
+    return "generic"
+
+
+def _build_trading_charts(df: pd.DataFrame) -> dict[str, str]:
+    """Build trading-specific charts when the CSV comes from the stock app."""
+
+    charts: dict[str, str] = {}
+    if px is None:
+        return charts
+
+    cols = {c.lower(): c for c in df.columns}
+
+    def col(name: str) -> str | None:
+        return cols.get(name.lower())
+
+    row_type_col = col("row_type")
+    if not row_type_col:
+        return charts
+
+    account_df = df[df[row_type_col] == "account_summary"].copy()
+    positions_df = df[df[row_type_col] == "position"].copy()
+    trades_df = df[df[row_type_col] == "trade"].copy()
+
+    ts_col = col("timestamp")
+    equity_col = col("equity") or col("portfolio_value")
+    if not account_df.empty and ts_col and equity_col:
+        try:
+            account_df[ts_col] = pd.to_datetime(account_df[ts_col], errors="coerce")
+            account_df = account_df.dropna(subset=[ts_col])
+            account_df = account_df.sort_values(by=ts_col)
+
+            fig_equity = px.line(
+                account_df,
+                x=ts_col,
+                y=equity_col,
+                title="Equity over time",
+                labels={ts_col: "Time", equity_col: "Equity"},
+            )
+            charts["equity_curve"] = fig_equity.to_html(full_html=False)
+        except Exception:
+            pass
+
+    realized_col = col("realized_pl")
+    mode_col = col("mode_or_strategy")
+    strat_col = col("strategy_name")
+
+    trade_pl = trades_df.copy()
+    if realized_col and realized_col in trade_pl.columns:
+        trade_pl = trade_pl[pd.to_numeric(trade_pl[realized_col], errors="coerce").notna()]
+        if not trade_pl.empty:
+            trade_pl[realized_col] = pd.to_numeric(trade_pl[realized_col], errors="coerce")
+
+            strategy_key = strat_col or mode_col
+            if strategy_key and strategy_key in trade_pl.columns:
+                group = (
+                    trade_pl.groupby(strategy_key)[realized_col]
+                    .sum()
+                    .reset_index()
+                    .sort_values(by=realized_col, ascending=False)
+                )
+                if not group.empty:
+                    fig_strat = px.bar(
+                        group,
+                        x=strategy_key,
+                        y=realized_col,
+                        title="Realized P/L by strategy",
+                        labels={strategy_key: "Strategy", realized_col: "Realized P/L"},
+                    )
+                    charts["strategy_performance"] = fig_strat.to_html(full_html=False)
+
+            sym_col = col("symbol")
+            if sym_col and sym_col in trade_pl.columns:
+                sym_group = (
+                    trade_pl.groupby(sym_col)[realized_col]
+                    .sum()
+                    .reset_index()
+                    .sort_values(by=realized_col, ascending=False)
+                )
+                sym_group["abs_pl"] = sym_group[realized_col].abs()
+                sym_group = sym_group.sort_values(by="abs_pl", ascending=False).head(20)
+
+                if not sym_group.empty:
+                    fig_sym = px.bar(
+                        sym_group,
+                        x=sym_col,
+                        y=realized_col,
+                        title="Realized P/L by symbol (top 20)",
+                        labels={sym_col: "Symbol", realized_col: "Realized P/L"},
+                    )
+                    charts["symbol_performance"] = fig_sym.to_html(full_html=False)
+
+    if not trades_df.empty and ts_col:
+        price_col = col("filled_avg_price") or col("avg_entry_price") or col("current_price")
+        side_col = col("side")
+        sym_col = col("symbol")
+
+        if price_col and price_col in trades_df.columns:
+            try:
+                trades_copy = trades_df.copy()
+                trades_copy[ts_col] = pd.to_datetime(trades_copy[ts_col], errors="coerce")
+                trades_copy = trades_copy.dropna(subset=[ts_col])
+                trades_copy[price_col] = pd.to_numeric(trades_copy[price_col], errors="coerce")
+                trades_copy = trades_copy.dropna(subset=[price_col])
+
+                fig_timeline = px.scatter(
+                    trades_copy,
+                    x=ts_col,
+                    y=price_col,
+                    color=side_col if side_col in trades_copy.columns else None,
+                    hover_data=[sym_col] if sym_col in trades_copy.columns else None,
+                    title="Trade timeline",
+                    labels={ts_col: "Time", price_col: "Price"},
+                )
+                charts["trade_timeline"] = fig_timeline.to_html(full_html=False)
+            except Exception:
+                pass
+
+    unreal_col = col("unrealized_pl")
+    sym_col = col("symbol")
+    if unreal_col and sym_col and not positions_df.empty:
+        try:
+            pos_copy = positions_df.copy()
+            pos_copy[unreal_col] = pd.to_numeric(pos_copy[unreal_col], errors="coerce")
+            pos_copy = pos_copy.dropna(subset=[unreal_col])
+
+            if not pos_copy.empty:
+                fig_unreal = px.bar(
+                    pos_copy.sort_values(by=unreal_col, ascending=False),
+                    x=sym_col,
+                    y=unreal_col,
+                    title="Unrealized P/L by open position",
+                )
+                charts["unrealized_positions"] = fig_unreal.to_html(full_html=False)
+        except Exception:
+            pass
+
+    return charts
+
+
+def _render_csv_preview(df: pd.DataFrame, max_rows: int = 50) -> str:
+    """Return a small HTML preview table for the uploaded CSV."""
+
+    try:
+        return (
+            df.head(max_rows)
+            .to_html(classes="table table-sm table-striped mb-0", index=False, border=0)
+        )
+    except Exception:
+        return ""
+
+
+def _build_paper_dashboard_charts(
+    account: dict[str, Any] | None,
+    positions: list[dict[str, Any]] | None,
+    portfolio_history: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Visual summaries for the paper trading desk."""
+
+    charts: dict[str, str] = {}
+    if px is None:
+        return charts
+
+    positions = positions or []
+    positions_df = pd.DataFrame(positions)
+
+    cash = safe_float(account.get("cash")) if account else None
+    equity = safe_float(account.get("equity")) if account else None
+    portfolio_value = safe_float(account.get("portfolio_value")) if account else None
+    buying_power = safe_float(account.get("buying_power")) if account else None
+    last_equity = safe_float(account.get("last_equity")) if account else None
+
+    # Allocation pie
+    positions_value = 0.0
+    if not positions_df.empty and "market_value" in positions_df.columns:
+        positions_df["market_value"] = pd.to_numeric(positions_df["market_value"], errors="coerce")
+        positions_value = positions_df["market_value"].dropna().sum()
+
+    allocation_parts = []
+    if cash is not None and cash >= 0:
+        allocation_parts.append(("Cash", cash))
+    if positions_value and positions_value > 0:
+        allocation_parts.append(("Positions", positions_value))
+    if buying_power is not None and buying_power > 0:
+        allocation_parts.append(("Buying Power", buying_power))
+
+    if allocation_parts:
+        try:
+            alloc_df = pd.DataFrame(allocation_parts, columns=["label", "value"])
+            fig_alloc = px.pie(
+                alloc_df,
+                names="label",
+                values="value",
+                title="Account allocation",
+                hole=0.35,
+            )
+            charts["allocation"] = fig_alloc.to_html(full_html=False)
+        except Exception:
+            pass
+
+    # Market value by symbol
+    if not positions_df.empty and "symbol" in positions_df.columns and "market_value" in positions_df.columns:
+        try:
+            positions_df["market_value"] = pd.to_numeric(positions_df["market_value"], errors="coerce")
+            mv_df = positions_df.dropna(subset=["market_value"])
+            mv_df = mv_df.sort_values(by="market_value", ascending=False)
+            if not mv_df.empty:
+                fig_mv = px.bar(
+                    mv_df.head(25),
+                    x="symbol",
+                    y="market_value",
+                    title="Market value by position",
+                    labels={"symbol": "Symbol", "market_value": "Market Value"},
+                )
+                charts["positions_value"] = fig_mv.to_html(full_html=False)
+        except Exception:
+            pass
+
+    # Unrealized P/L by symbol
+    if not positions_df.empty and "unrealized_pl" in positions_df.columns and "symbol" in positions_df.columns:
+        try:
+            positions_df["unrealized_pl"] = pd.to_numeric(positions_df["unrealized_pl"], errors="coerce")
+            pl_df = positions_df.dropna(subset=["unrealized_pl"])
+            pl_df = pl_df.sort_values(by="unrealized_pl", ascending=False)
+            if not pl_df.empty:
+                fig_unreal = px.bar(
+                    pl_df.head(25),
+                    x="symbol",
+                    y="unrealized_pl",
+                    title="Unrealized P/L by position",
+                    labels={"symbol": "Symbol", "unrealized_pl": "Unrealized P/L"},
+                    color="unrealized_pl",
+                    color_continuous_scale="RdYlGn",
+                )
+                charts["unrealized_positions"] = fig_unreal.to_html(full_html=False)
+        except Exception:
+            pass
+
+    # Intraday equity curve if available
+    if portfolio_history and isinstance(portfolio_history, dict):
+        timestamps = portfolio_history.get("timestamp") or []
+        equity_points = portfolio_history.get("equity") or portfolio_history.get("equity") or []
+        try:
+            if timestamps and equity_points and len(timestamps) == len(equity_points):
+                hist_df = pd.DataFrame({"timestamp": timestamps, "equity": equity_points})
+                hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"], unit="s", errors="coerce")
+                hist_df = hist_df.dropna(subset=["timestamp", "equity"])
+                if not hist_df.empty:
+                    fig_equity = px.area(
+                        hist_df,
+                        x="timestamp",
+                        y="equity",
+                        title="Equity (intraday)",
+                        labels={"timestamp": "Time", "equity": "Equity"},
+                    )
+                    fig_equity.update_traces(line_color="#f0b400", fill="tozeroy")
+                    charts["todays_pl"] = fig_equity.to_html(full_html=False)
+        except Exception:
+            pass
+    # Fallback: today's P/L as a bar if history unavailable
+    if "todays_pl" not in charts and equity is not None and last_equity is not None:
+        try:
+            todays_pl = equity - last_equity
+            fig_day = px.bar(
+                pd.DataFrame({"metric": ["Today's P/L"], "value": [todays_pl]}),
+                x="metric",
+                y="value",
+                title="Today's P/L",
+                labels={"value": "P/L"},
+                color="value",
+                color_continuous_scale="RdYlGn",
+            )
+            charts["todays_pl"] = fig_day.to_html(full_html=False)
+        except Exception:
+            pass
+
+    return charts
+
+
+# -----------------------------
 # Routes
 # -----------------------------
 
@@ -4041,14 +4370,16 @@ def api_analyze(ticker: str):
         return jsonify({"ok": False, "error": str(e)}), 400
 
 
-@app.route("/paper", methods=["GET"])
+@app.route("/paper", methods=["GET", "POST"])
 def paper_dashboard():
     account = None
     positions = []
     orders = []
     broker_error = None
     todays_pl = None
+    dashboard_charts: dict[str, str] = {}
     autopilot_status = get_autopilot_status()
+    portfolio_history: dict[str, Any] | None = None
     if not paper_broker.enabled:
         broker_error = "Set ALPACA_PAPER_KEY_ID and ALPACA_PAPER_SECRET_KEY to enable paper trading."
     else:
@@ -4056,6 +4387,10 @@ def paper_dashboard():
             account = paper_broker.get_account()
             positions = list(paper_broker.get_positions())
             orders = list(paper_broker.list_orders(status="all", limit=25))
+            try:
+                portfolio_history = paper_broker.get_portfolio_history(period="1D", timeframe="5Min")
+            except Exception:
+                logger.warning("Portfolio history unavailable for intraday chart")
             if account:
                 try:
                     equity = float(account.get("equity") or 0.0)
@@ -4063,6 +4398,7 @@ def paper_dashboard():
                     todays_pl = equity - last_equity
                 except Exception:
                     todays_pl = None
+            dashboard_charts = _build_paper_dashboard_charts(account, positions, portfolio_history)
         except Exception as exc:
             broker_error = str(exc)
             logger.exception("Failed to load paper trading data")
@@ -4081,6 +4417,7 @@ def paper_dashboard():
         autopilot=autopilot_status,
         autopilot_strategies=AUTOPILOT_STRATEGIES,
         autopilot_risks=AUTOPILOT_RISK_LEVELS,
+        dashboard_charts=dashboard_charts,
     )
 
 
