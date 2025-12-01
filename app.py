@@ -1527,15 +1527,12 @@ def _autopilot_select_option_contract(
             bid, ask = option_bid_ask(contract)
             bid_val = safe_float(bid, None)
             ask_val = safe_float(ask, None)
-            if bid_val is None or ask_val is None or bid_val <= 0 or ask_val <= 0:
-                filtered_out += 1
-                continue
-            oi = safe_float(contract.get("open_interest"), None)
-            volume = safe_float(contract.get("volume"), None)
-            if volume is not None and volume < 1:
-                filtered_out += 1
-                continue
-            if oi is not None and oi < 1:
+            price, has_price_fields = _derive_option_price(
+                contract,
+                bid=bid_val,
+                ask=ask_val,
+            )
+            if not has_price_fields or price is None or price <= 0:
                 filtered_out += 1
                 continue
             filtered_chain.append(contract)
