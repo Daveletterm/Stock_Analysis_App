@@ -2539,7 +2539,69 @@ def run_autopilot_cycle(force: bool = False) -> None:
             for symbol, entry in current_positions_equity.items():
                 pos = entry["position"]
                 qty = abs(safe_float(pos.get("qty"), safe_float(pos.get("quantity"))))
-                if qty < 1:
+                available_qty = qty
+                if available_qty < 1:
+                    refreshed = None
+                    for candidate in positions:
+                        try:
+                            if str(candidate.get("symbol", "")).replace(" ", "").upper() != symbol.upper():
+                                continue
+                            asset_class = str(candidate.get("asset_class", "")).lower()
+                            if "option" in asset_class:
+                                continue
+                            refreshed = candidate
+                            break
+                        except Exception:
+                            continue
+                    if refreshed is None:
+                        try:
+                            positions = list(paper_broker.get_positions())
+                        except Exception as refresh_exc:
+                            logger.warning(
+                                "Skip exit for %s: failed to refresh positions (%s)", symbol, refresh_exc
+                            )
+                            summary_lines.append(
+                                f"Skip exit for {symbol}; unable to confirm position."
+                            )
+                            continue
+                        for candidate in positions:
+                            try:
+                                if str(candidate.get("symbol", "")).replace(" ", "").upper() != symbol.upper():
+                                    continue
+                                asset_class = str(candidate.get("asset_class", "")).lower()
+                                if "option" in asset_class:
+                                    continue
+                                refreshed = candidate
+                                break
+                            except Exception:
+                                continue
+                    if refreshed:
+                        entry["position"] = refreshed
+                        pos = refreshed
+                        available_qty = abs(
+                            safe_float(pos.get("qty"), safe_float(pos.get("quantity")))
+                        )
+                        entry["qty"] = available_qty
+                    else:
+                        logger.info("Skip exit for %s: no matching position found", symbol)
+                        summary_lines.append(
+                            f"Skip exit for {symbol}; no matching position found."
+                        )
+                        continue
+                pos = entry["position"]
+                if available_qty <= 0:
+                    logger.info("Skip exit for %s: no available quantity", symbol)
+                    summary_lines.append(f"Skip exit for {symbol}; no available quantity.")
+                    continue
+                if qty <= 0:
+                    qty = available_qty
+                if qty > available_qty:
+                    logger.info(
+                        "Clamping exit qty for %s to %s from %s", symbol, available_qty, qty
+                    )
+                    qty = available_qty
+                qty_int = int(math.floor(qty))
+                if qty_int <= 0:
                     continue
                 position_params = _autopilot_position_params.get(symbol.upper(), {})
                 plpc = _position_unrealized_plpc(pos)
@@ -2571,6 +2633,18 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             orders_placed += 1
                             continue
+                        except AlpacaAPIError as exc:
+                            message = (getattr(exc, "api_message", "") or str(exc)).lower()
+                            if exc.status_code == 403 and "insufficient qty available for order" in message:
+                                logger.warning(
+                                    "Skip equity exit for %s: Alpaca insufficient qty (%s)", symbol, exc
+                                )
+                                summary_lines.append(
+                                    f"Skip exit for {symbol}; insufficient qty (stale position)."
+                                )
+                                continue
+                            logger.exception("Autopilot equity exit failed for %s", symbol)
+                            errors.append(f"sell {symbol} failed: {exc}")
                         except Exception as exc:
                             logger.exception("Autopilot equity exit failed for %s", symbol)
                             errors.append(f"sell {symbol} failed: {exc}")
@@ -2594,6 +2668,18 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             f"Exit {qty_int} {symbol} (score {score:.2f} < {exit_threshold})"
                         )
                         orders_placed += 1
+                    except AlpacaAPIError as exc:
+                        message = (getattr(exc, "api_message", "") or str(exc)).lower()
+                        if exc.status_code == 403 and "insufficient qty available for order" in message:
+                            logger.warning(
+                                "Skip equity exit for %s: Alpaca insufficient qty (%s)", symbol, exc
+                            )
+                            summary_lines.append(
+                                f"Skip exit for {symbol}; insufficient qty (stale position)."
+                            )
+                            continue
+                        logger.exception("Autopilot equity exit failed for %s", symbol)
+                        errors.append(f"sell {symbol} failed: {exc}")
                     except Exception as exc:
                         logger.exception("Autopilot equity exit failed for %s", symbol)
                         errors.append(f"sell {symbol} failed: {exc}")
