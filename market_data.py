@@ -546,7 +546,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         )
         return None
 
-    min_expiry = now.date() + timedelta(days=7)
+    min_expiry = now.date() + timedelta(days=3)
     max_expiry = now.date() + timedelta(days=120)
 
     try:
@@ -584,7 +584,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
             strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
             if not strike:
                 continue
-            if strike < spot * 0.85 or strike > spot * 1.15:
+            if strike < spot * 0.75 or strike > spot * 1.25:
                 continue
 
             bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
@@ -607,7 +607,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
 
             open_int = _safe_float(contract.get("open_interest"), 0.0)
             volume = _safe_float(contract.get("volume"), 0.0)
-            if (open_int or 0) < 10 and (volume or 0) < 2:
+            if (open_int or 0) < 5 and (volume or 0) < 1:
                 continue
 
             mid = (bid + ask) / 2.0
@@ -651,7 +651,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                 strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
                 if not strike:
                     continue
-                if strike < spot * 0.85 or strike > spot * 1.15:
+                if strike < spot * 0.75 or strike > spot * 1.25:
                     continue
 
                 bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
@@ -669,10 +669,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                 if spread_pct > 0.90:
                     continue
 
-                open_int = _safe_float(contract.get("open_interest"), 0.0)
-                volume = _safe_float(contract.get("volume"), 0.0)
-                if (open_int or 0) < 1 and (volume or 0) < 1:
-                    continue
+                # In relaxed mode, rely primarily on live quotes and spread; ignore weak OI/volume.
 
                 mid = (bid + ask) / 2.0
                 option_symbol = str(contract.get("symbol", "")).strip()

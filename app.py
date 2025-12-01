@@ -2797,10 +2797,14 @@ def run_autopilot_cycle(force: bool = False) -> None:
             held_underlyings = held_equity_symbols | held_option_underlyings
 
             held_and_pending = set(current_positions.keys())
-            pending_underlyings = set(held_underlyings)
+            pending_underlyings: set[str] = set()
+            active_statuses = {"new", "accepted", "partially_filled", "open", "pending_new"}
             for order in open_orders:
                 try:
                     if str(order.get("side", "")).lower() != "buy":
+                        continue
+                    status = str(order.get("status", "")).lower()
+                    if status and status not in active_statuses:
                         continue
                     order_symbol = str(order.get("symbol", "")).replace(" ", "").upper()
                     asset = str(order.get("asset_class", "")).lower()
@@ -2888,12 +2892,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 if symbol in pending_underlyings:
                     log_candidate_outcome(
                         "no entry, order already pending for underlying", "none"
-                    )
-                    continue
-
-                if symbol in held_underlyings:
-                    log_candidate_outcome(
-                        "no entry, underlying already held", "none"
                     )
                     continue
 
