@@ -1,17 +1,20 @@
 import math
 import os
 import re
+import csv
 import json
 import random
 import threading
 import logging
 import sqlite3
+import statistics
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from io import StringIO
+from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Literal
 
 import requests
@@ -107,6 +110,34 @@ MAX_OPTION_NOTIONAL_FRACTION = 0.05  # 5 percent of equity per option trade
 MAX_OPTION_CONTRACTS_PER_TRADE = 10  # hard cap on single-trade contract count
 OPTION_STOP_LOSS_PCT = 0.5  # close if price falls to 50 percent of entry
 OPTION_TAKE_PROFIT_PCT = 1.5  # close if price reaches 150 percent of entry
+VOL_RETURN_WINDOW = 10  # number of cycles to use for rolling volatility
+VOL_BASELINE_STD = 0.01  # target daily return std for scaling
+VOL_POSITION_SCALE_MIN = 0.6  # floor for position scale when volatility spikes
+VOL_POSITION_SCALE_MAX = 1.4  # ceiling for position scale when volatility is calm
+AI_LOG_PATH = Path("data/ai_training_log.csv")
+AI_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+AI_LOG_COLUMNS = [
+    "timestamp",
+    "symbol",
+    "asset_class",
+    "strategy_key",
+    "contract_symbol",
+    "direction",
+    "score",
+    "spot_price",
+    "entry_price",
+    "rsi",
+    "macd",
+    "volatility_20d",
+    "volume_rel_20d",
+    "sector_strength",
+    "market_trend",
+    "congress_score",
+    "news_sentiment",
+    "decision",
+    "label_good_trade",
+    "realized_return_5d",
+]
 FALLBACK_TICKERS = [
     "AAPL",
     "MSFT",
@@ -323,6 +354,8 @@ _autopilot_stale_exits: set[str] = set()
 _autopilot_option_cooldowns: dict[str, datetime] = {}
 _autopilot_position_params: dict[str, Any] = {}
 _autopilot_pyramid_counts: dict[str, int] = {}
+_autopilot_return_history: list[float] = []
+_autopilot_last_equity: float | None = None
 ZOMBIE_POSITIONS: set[str] = set()
 
 
@@ -498,6 +531,14 @@ def _load_autopilot_state() -> None:
         if "position_params" in saved and isinstance(saved.get("position_params"), dict):
             _autopilot_position_params.clear()
             _autopilot_position_params.update(saved.get("position_params"))
+        if "return_history" in saved and isinstance(saved.get("return_history"), list):
+            _autopilot_return_history.clear()
+            for val in saved.get("return_history"):
+                val_float = safe_float(val, None)
+                if val_float is not None:
+                    _autopilot_return_history.append(val_float)
+        if "last_equity" in saved:
+            _autopilot_last_equity = safe_float(saved.get("last_equity"), None)
 
 
 def _persist_autopilot_state() -> None:
@@ -510,6 +551,8 @@ def _persist_autopilot_state() -> None:
             "strategy": _autopilot_state.get("strategy"),
             "risk": _autopilot_state.get("risk"),
             "position_params": _autopilot_position_params,
+            "return_history": _autopilot_return_history,
+            "last_equity": _autopilot_last_equity,
         }
 
     try:  # pragma: no cover - minimal persistence wrapper
@@ -1388,6 +1431,89 @@ def _option_on_cooldown(underlying: str, now: datetime) -> bool:
     return True
 
 
+def is_recently_traded(symbol: str) -> bool:
+    """Return True if the account traded *symbol* during the current day."""
+
+    symbol_cmp = symbol.replace(" ", "").upper()
+    try:
+        activities = list(paper_broker.get_activities(activity_types="FILL", date=date.today()))
+    except Exception as exc:
+        logger.debug("recent trade check failed for %s: %s", symbol_cmp, exc)
+        return False
+    for act in activities or []:
+        try:
+            act_symbol = str(act.get("symbol", "")).replace(" ", "").upper()
+            if act_symbol != symbol_cmp:
+                continue
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _recently_closed_symbols() -> set[str]:
+    """Best-effort detection of symbols closed earlier today to avoid wash trades."""
+
+    closed: set[str] = set()
+    try:
+        activities = list(paper_broker.get_activities(activity_types="FILL", date=date.today()))
+    except Exception as exc:
+        logger.debug("recent close lookup failed: %s", exc)
+        return closed
+    for act in activities or []:
+        try:
+            act_symbol = str(act.get("symbol", "")).replace(" ", "").upper()
+            side = str(act.get("side", "")).lower()
+            qty = safe_float(act.get("qty"), None)
+            if not act_symbol:
+                continue
+            if side.startswith("sell") or (qty is not None and qty < 0):
+                closed.add(act_symbol)
+        except Exception:
+            continue
+    return closed
+
+
+def _option_trade_block_reason(
+    contract_symbol: str,
+    positions_snapshot: list[dict[str, Any]],
+    open_orders: list[dict[str, Any]],
+    closed_today: set[str],
+    *,
+    now: datetime,
+) -> str | None:
+    """Return reason string if a trade should be blocked for wash/zombie protection."""
+
+    symbol_cmp = contract_symbol.replace(" ", "").upper()
+    if symbol_cmp in ZOMBIE_POSITIONS:
+        return "zombie contract flagged"
+
+    for pos in positions_snapshot:
+        try:
+            if str(pos.get("symbol", "")).replace(" ", "").upper() != symbol_cmp:
+                continue
+            qty = _option_position_quantity(pos)
+            status = str(pos.get("status", "")).lower()
+            if qty > 0:
+                return "position already open"
+            if qty == 0 and status and status != "closed":
+                ZOMBIE_POSITIONS.add(symbol_cmp)
+                return "alpaca reports zero qty but position not closed"
+        except Exception:
+            continue
+
+    active_orders = paper_broker.list_open_orders_for_symbol(
+        symbol_cmp, asset_class="option", orders=open_orders
+    )
+    if active_orders:
+        return "pending order already exists"
+    if symbol_cmp in closed_today:
+        return "closed earlier today"
+    if is_recently_traded(symbol_cmp):
+        return "recently traded today"
+    return None
+
+
 def _mark_zombie_position(
     symbol: str, *, reason: str | None = None, summary_lines: list[str] | None = None
 ) -> None:
@@ -1898,6 +2024,143 @@ def _position_price(pos: dict[str, Any], asset_class: str) -> float | None:
     return price
 
 
+def _update_return_history(current_equity: float) -> float | None:
+    """Track rolling equity returns for volatility-aware sizing."""
+
+    global _autopilot_last_equity
+    prev = _autopilot_last_equity
+    ret = None
+    if prev and prev > 0 and current_equity > 0:
+        ret = (current_equity - prev) / prev
+    with _autopilot_lock:
+        _autopilot_last_equity = current_equity
+        if ret is not None:
+            _autopilot_return_history.append(ret)
+            if len(_autopilot_return_history) > VOL_RETURN_WINDOW:
+                _autopilot_return_history[:] = _autopilot_return_history[-VOL_RETURN_WINDOW:]
+        _autopilot_state["last_equity"] = current_equity
+        _autopilot_state["return_history"] = list(_autopilot_return_history)
+    _persist_autopilot_state()
+    return ret
+
+
+def _volatility_position_scale() -> float:
+    """Return a multiplier for sizing based on recent return volatility."""
+
+    with _autopilot_lock:
+        history = list(_autopilot_return_history)
+    if len(history) < 2:
+        return 1.0
+    if np is not None:
+        std_dev = float(np.std(history))
+    else:
+        std_dev = float(statistics.pstdev(history))
+    baseline = VOL_BASELINE_STD or 0.01
+    scale = 1.0 + (baseline - std_dev) / max(baseline, 1e-6) * 0.5
+    return max(VOL_POSITION_SCALE_MIN, min(VOL_POSITION_SCALE_MAX, scale))
+
+
+def _extract_indicator_features(df: pd.DataFrame | None) -> dict[str, float | None]:
+    """Return a best-effort snapshot of indicators for AI logging."""
+
+    features: dict[str, float | None] = {
+        "rsi": None,
+        "macd": None,
+        "volatility_20d": None,
+        "volume_rel_20d": None,
+    }
+    if df is None or df.empty:
+        return features
+    try:
+        if "rsi_14" in df.columns:
+            features["rsi"] = safe_float(df["rsi_14"].iloc[-1], None)
+        if "macd" in df.columns:
+            features["macd"] = safe_float(df["macd"].iloc[-1], None)
+        close_col = "close" if "close" in df.columns else ("Close" if "Close" in df.columns else None)
+        volume_col = "volume" if "volume" in df.columns else ("Volume" if "Volume" in df.columns else None)
+        if close_col:
+            close_series = df[close_col]
+            if len(close_series) >= 20:
+                features["volatility_20d"] = safe_float(
+                    close_series.pct_change().rolling(20).std().iloc[-1],
+                    None,
+                )
+        if volume_col:
+            volume_series = df[volume_col]
+            if len(volume_series) >= 20:
+                rolling_mean = volume_series.rolling(20).mean().iloc[-1]
+                if rolling_mean and rolling_mean != 0:
+                    features["volume_rel_20d"] = safe_float(
+                        volume_series.iloc[-1] / rolling_mean,
+                        None,
+                    )
+    except Exception:
+        logger.debug("Failed to extract indicator features", exc_info=True)
+    return features
+
+
+def log_ai_snapshot(
+    *,
+    symbol: str,
+    asset_class: str,
+    strategy_key: str,
+    contract_symbol: str | None,
+    direction: str,
+    score: float,
+    spot_price: float | None,
+    entry_price: float | None,
+    rsi: float | None = None,
+    macd: float | None = None,
+    volatility_20d: float | None = None,
+    volume_rel_20d: float | None = None,
+    sector_strength: float | None = None,
+    market_trend: str | None = None,
+    congress_score: float | None = None,
+    news_sentiment: float | None = None,
+    decision: str = "enter",
+    label_good_trade: str | None = "",
+    realized_return_5d: str | None = "",
+) -> None:
+    """
+    Append one training example row for the future AI portfolio model.
+
+    This must never raise uncaught exceptions. If logging fails, write a warning
+    to the existing logger and continue.
+    """
+
+    try:
+        new_file = not AI_LOG_PATH.exists()
+        with AI_LOG_PATH.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=AI_LOG_COLUMNS)
+            if new_file:
+                writer.writeheader()
+            writer.writerow(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "symbol": symbol,
+                    "asset_class": asset_class,
+                    "strategy_key": strategy_key,
+                    "contract_symbol": contract_symbol or "",
+                    "direction": direction,
+                    "score": float(score),
+                    "spot_price": "" if spot_price is None else float(spot_price),
+                    "entry_price": "" if entry_price is None else float(entry_price),
+                    "rsi": "" if rsi is None else float(rsi),
+                    "macd": "" if macd is None else float(macd),
+                    "volatility_20d": "" if volatility_20d is None else float(volatility_20d),
+                    "volume_rel_20d": "" if volume_rel_20d is None else float(volume_rel_20d),
+                    "sector_strength": "" if sector_strength is None else float(sector_strength),
+                    "market_trend": market_trend or "",
+                    "congress_score": "" if congress_score is None else float(congress_score),
+                    "news_sentiment": "" if news_sentiment is None else float(news_sentiment),
+                    "decision": decision,
+                    "label_good_trade": label_good_trade or "",
+                    "realized_return_5d": realized_return_5d or "",
+                }
+            )
+    except Exception:
+        logger.exception("Failed to log AI snapshot for %s", symbol)
+
 def compute_position_qty(
     symbol: str,
     asset_class: str,
@@ -2001,6 +2264,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
     errors: list[str] = []
     orders_placed = 0
     candidate_count = 0
+    vol_position_scale = 1.0
     try:
         with _autopilot_lock:
             config = dict(_autopilot_state)
@@ -2052,6 +2316,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 if equity <= 0:
                     summary_lines.append("Account equity unavailable; skipping cycle.")
                     prerequisites_met = False
+                else:
+                    _update_return_history(equity)
+                    vol_position_scale = _volatility_position_scale()
 
         if prerequisites_met:
             try:
@@ -2067,6 +2334,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 logger.exception("Autopilot failed to fetch open orders")
                 errors.append(f"orders error: {exc}")
                 open_orders = []
+            closed_today_symbols = _recently_closed_symbols()
 
             held_positions: dict[str, dict[str, dict[str, Any]]] = {"equity": {}, "option": {}}
             gross_equity_notional = 0.0
@@ -2171,6 +2439,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
             )
 
             position_multiplier = max(risk_cfg.get("position_multiplier", 1.0), 0.25)
+            position_multiplier = max(position_multiplier * max(vol_position_scale, 0.1), 0.25)
             stop_loss_multiplier = max(risk_cfg.get("stop_loss_multiplier", 1.0), 0.25)
             take_profit_multiplier = max(risk_cfg.get("take_profit_multiplier", 1.0), 0.25)
 
@@ -3013,6 +3282,24 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "none",
                             )
                             continue
+                        block_reason = _option_trade_block_reason(
+                            contract_symbol,
+                            positions,
+                            open_orders,
+                            closed_today_symbols,
+                            now=now,
+                        )
+                        if block_reason:
+                            reason_msg = (
+                                f"Skip bearish {symbol}; {contract_symbol} blocked ({block_reason})."
+                            )
+                            logger.info(reason_msg)
+                            summary_lines.append(reason_msg)
+                            log_candidate_outcome(
+                                "bearish entry blocked: " + block_reason,
+                                "none",
+                            )
+                            continue
                         bid = safe_float(put_choice.get("bid"))
                         ask = safe_float(put_choice.get("ask"))
                         mid_price = safe_float(put_choice.get("mid"), 0.0)
@@ -3039,7 +3326,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
                         )
                         if mid_price > 0 and equity > 0:
-                            max_notional = equity * MAX_OPTION_NOTIONAL_FRACTION
+                            scaled_fraction = MAX_OPTION_NOTIONAL_FRACTION * vol_position_scale
+                            max_notional = equity * scaled_fraction
                             cap_qty = max(1, int(math.floor(max_notional / mid_price)))
                             cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
                             qty = cap_qty if qty <= 0 else min(qty, cap_qty)
@@ -3081,6 +3369,20 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "Placing bearish order: symbol=%s asset_class=option qty=%s side=buy",
                                 contract_symbol,
                                 qty,
+                            )
+                            log_ai_snapshot(
+                                symbol=symbol,
+                                asset_class="option",
+                                strategy_key=strategy_key,
+                                contract_symbol=contract_symbol,
+                                direction="buy",
+                                score=safe_float(score, 0.0) or 0.0,
+                                spot_price=equity_price,
+                                entry_price=mid_price * OPTION_CONTRACT_MULTIPLIER if mid_price else None,
+                                sector_strength=None,
+                                market_trend=None,
+                                congress_score=None,
+                                news_sentiment=None,
                             )
                             place_guarded_paper_order(
                                 contract_symbol,
@@ -3214,6 +3516,24 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "none",
                             )
                             continue
+                        block_reason = _option_trade_block_reason(
+                            contract_symbol,
+                            positions,
+                            open_orders,
+                            closed_today_symbols,
+                            now=now,
+                        )
+                        if block_reason:
+                            reason_msg = (
+                                f"Skip bullish {symbol}; {contract_symbol} blocked ({block_reason})."
+                            )
+                            logger.info(reason_msg)
+                            summary_lines.append(reason_msg)
+                            log_candidate_outcome(
+                                "bullish entry blocked: " + block_reason,
+                                "none",
+                            )
+                            continue
                         stop_loss_pct = option_stop_default
                         take_profit_pct = option_profit_default
                         qty, target_notional = compute_position_qty(
@@ -3227,7 +3547,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
                         )
                         if premium > 0 and equity > 0:
-                            max_notional = equity * MAX_OPTION_NOTIONAL_FRACTION
+                            scaled_fraction = MAX_OPTION_NOTIONAL_FRACTION * vol_position_scale
+                            max_notional = equity * scaled_fraction
                             cap_qty = max(1, int(math.floor(max_notional / premium)))
                             cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
                             qty = cap_qty if qty <= 0 else min(qty, cap_qty)
@@ -3268,6 +3589,20 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "Placing bullish order: symbol=%s asset_class=option qty=%s side=buy",
                                 contract_symbol,
                                 qty,
+                            )
+                            log_ai_snapshot(
+                                symbol=symbol,
+                                asset_class="option",
+                                strategy_key=strategy_key,
+                                contract_symbol=contract_symbol,
+                                direction="buy",
+                                score=safe_float(score, 0.0) or 0.0,
+                                spot_price=equity_price,
+                                entry_price=premium * OPTION_CONTRACT_MULTIPLIER if premium else None,
+                                sector_strength=None,
+                                market_trend=None,
+                                congress_score=None,
+                                news_sentiment=None,
                             )
                             place_guarded_paper_order(
                                 contract_symbol,
@@ -3342,6 +3677,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         continue
                     stop_loss_pct = stock_stop_default
                     take_profit_pct = stock_take_default
+                    indicators = _extract_indicator_features(df)
                     qty, target_notional = compute_position_qty(
                         symbol,
                         "equity",
@@ -3380,6 +3716,24 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             "Placing bullish order: symbol=%s asset_class=stock qty=%s side=buy",
                             symbol,
                             qty,
+                        )
+                        log_ai_snapshot(
+                            symbol=symbol,
+                            asset_class="equity",
+                            strategy_key=strategy_key,
+                            contract_symbol="",
+                            direction="buy",
+                            score=safe_float(score, 0.0) or 0.0,
+                            spot_price=price,
+                            entry_price=price,
+                            rsi=indicators.get("rsi"),
+                            macd=indicators.get("macd"),
+                            volatility_20d=indicators.get("volatility_20d"),
+                            volume_rel_20d=indicators.get("volume_rel_20d"),
+                            sector_strength=None,
+                            market_trend=None,
+                            congress_score=None,
+                            news_sentiment=None,
                         )
                         place_guarded_paper_order(
                             symbol,
