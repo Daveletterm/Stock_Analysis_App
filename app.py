@@ -103,6 +103,10 @@ _scheduler: BackgroundScheduler | None = None
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
+MAX_OPTION_NOTIONAL_FRACTION = 0.05  # 5 percent of equity per option trade
+MAX_OPTION_CONTRACTS_PER_TRADE = 10  # hard cap on single-trade contract count
+OPTION_STOP_LOSS_PCT = 0.5  # close if price falls to 50 percent of entry
+OPTION_TAKE_PROFIT_PCT = 1.5  # close if price reaches 150 percent of entry
 FALLBACK_TICKERS = [
     "AAPL",
     "MSFT",
@@ -2278,7 +2282,36 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             option_stop_default,
                         )
                     )
+                    avg_entry_price = safe_float(pos.get("avg_entry_price"), None)
+                    price_snapshot = dict(pos) if isinstance(pos, dict) else {}
+                    if avg_entry_price is not None:
+                        price_snapshot.setdefault("last_price", avg_entry_price)
+                        price_snapshot.setdefault("mark_price", avg_entry_price)
+                    last_hint = safe_float(
+                        pos.get("current_price"), safe_float(pos.get("market_price"), None)
+                    )
+                    if last_hint is not None:
+                        price_snapshot["last_price"] = last_hint
+                        price_snapshot.setdefault("mark_price", last_hint)
+                    bid_hint = safe_float(pos.get("bid_price"), None)
+                    ask_hint = safe_float(pos.get("ask_price"), None)
+                    if bid_hint is not None:
+                        price_snapshot.setdefault("bid_price", bid_hint)
+                    if ask_hint is not None:
+                        price_snapshot.setdefault("ask_price", ask_hint)
+                    current_price, _ = _derive_option_price(price_snapshot)
+                    stop_price = avg_entry_price * OPTION_STOP_LOSS_PCT if avg_entry_price else None
+                    take_price = avg_entry_price * OPTION_TAKE_PROFIT_PCT if avg_entry_price else None
                     reasons: list[str] = []
+                    if current_price is not None:
+                        if stop_price is not None and current_price <= stop_price:
+                            reasons.append(
+                                f"stop hit ${current_price:.2f} <= ${stop_price:.2f}"
+                            )
+                        elif take_price is not None and current_price >= take_price:
+                            reasons.append(
+                                f"target hit ${current_price:.2f} >= ${take_price:.2f}"
+                            )
                     plpc = safe_float(pos.get("unrealized_plpc"), None)
                     if plpc is None:
                         percent = safe_float(pos.get("unrealized_pl_percent"), None)
@@ -2320,7 +2353,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         and plpc is not None
                         and abs(plpc) < 0.01
                         and (now - opened_at) > timedelta(days=4)
-                    ):
+                        ):
                         reasons.append("stagnant option freeing capital")
                     if not reasons:
                         continue
@@ -2335,10 +2368,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             f"Exit pending for {contract_symbol}; open exit order already open."
                         )
                         continue
-                    market_price = safe_float(
+                    market_price = current_price or safe_float(
                         pos.get("current_price"), safe_float(pos.get("market_price"), None)
                     )
-                    avg_entry_price = safe_float(pos.get("avg_entry_price"), None)
                     # Alpaca's paper API rejects market exits when no NBBO quote exists,
                     # so synthesize a conservative limit using whatever reference price
                     # we have to keep the order accepted and resting on the book.
@@ -3006,6 +3038,11 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             min_entry_notional=min_entry_notional,
                             contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
                         )
+                        if mid_price > 0 and equity > 0:
+                            max_notional = equity * MAX_OPTION_NOTIONAL_FRACTION
+                            cap_qty = max(1, int(math.floor(max_notional / mid_price)))
+                            cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
+                            qty = cap_qty if qty <= 0 else min(qty, cap_qty)
                         max_debit = safe_float(hybrid.get("max_position_debit"), None)
                         if max_debit:
                             target_notional = min(target_notional, max_debit)
@@ -3189,6 +3226,11 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             min_entry_notional=min_entry_notional,
                             contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
                         )
+                        if premium > 0 and equity > 0:
+                            max_notional = equity * MAX_OPTION_NOTIONAL_FRACTION
+                            cap_qty = max(1, int(math.floor(max_notional / premium)))
+                            cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
+                            qty = cap_qty if qty <= 0 else min(qty, cap_qty)
                         max_debit = safe_float(hybrid.get("max_position_debit"), None)
                         if max_debit:
                             target_notional = min(target_notional, max_debit)

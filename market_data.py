@@ -22,6 +22,15 @@ except Exception:  # pragma: no cover - fallback when module layout changes
 
 logger = logging.getLogger("market_data")
 
+# Option liquidity and pricing guards
+MIN_OPTION_PRICE = 0.20  # minimum acceptable option price in dollars
+MIN_OPTION_BID = 0.15  # minimum bid required
+MAX_OPTION_SPREAD_PCT = 0.60  # max (ask - bid) / ask for normal pass
+MIN_OPTION_OI = 10  # minimum open interest for preferred contracts
+MIN_OPTION_VOLUME = 5  # minimum volume for preferred contracts
+MIN_OPTION_DTE = 10  # minimum days to expiration
+MAX_OPTION_DTE = 90  # maximum days to expiration
+
 
 def _safe_float(value):
     try:
@@ -533,6 +542,27 @@ def _latest_spot_price(symbol: str, as_of: datetime) -> Optional[float]:
     return price if price and price > 0 else None
 
 
+def _derive_option_price(contract: dict, *, bid: float | None = None, ask: float | None = None) -> float | None:
+    last = _safe_float(contract.get("last_price") or contract.get("last_trade_price"))
+    mark = _safe_float(contract.get("mark_price") or contract.get("mark"))
+    local_bid = bid if bid is not None else _safe_float(contract.get("bid_price") or contract.get("bid"))
+    local_ask = ask if ask is not None else _safe_float(contract.get("ask_price") or contract.get("ask"))
+
+    price: float | None = None
+    if last is not None and last > 0:
+        price = last
+    elif local_bid is not None and local_bid > 0 and local_ask is not None and local_ask > 0:
+        price = (local_bid + local_ask) / 2.0
+    elif mark is not None and mark > 0:
+        price = mark
+
+    if price is not None and price > 0:
+        contract["price"] = price
+    else:
+        contract.pop("price", None)
+    return contract.get("price")
+
+
 def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Optional[dict]:
     """Internal helper to select a reasonably liquid contract near the money."""
 
@@ -546,8 +576,8 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         )
         return None
 
-    min_expiry = now.date() + timedelta(days=3)
-    max_expiry = now.date() + timedelta(days=120)
+    min_expiry = now.date() + timedelta(days=MIN_OPTION_DTE)
+    max_expiry = now.date() + timedelta(days=MAX_OPTION_DTE)
 
     try:
         chain = fetch_option_contracts(
@@ -567,8 +597,15 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
 
     best: dict | None = None
     best_sort: tuple[int, float] | None = None
+    total = len(chain)
+    rejected = 0
     for contract in chain:
         try:
+            status = str(contract.get("status", "")).lower()
+            if status and status != "active":
+                rejected += 1
+                continue
+
             raw_exp = contract.get("expiration_date") or contract.get("expiry")
             expiration = None
             if isinstance(raw_exp, str):
@@ -578,44 +615,61 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                     expiration = None
             elif isinstance(raw_exp, date):
                 expiration = raw_exp
-            if not expiration or expiration < min_expiry or expiration > max_expiry:
+            if not expiration:
+                rejected += 1
+                continue
+            days_out = (expiration - now.date()).days
+            if days_out < MIN_OPTION_DTE or days_out > MAX_OPTION_DTE:
+                rejected += 1
+                continue
+            if expiration < min_expiry or expiration > max_expiry:
+                rejected += 1
                 continue
 
             strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
             if not strike:
+                rejected += 1
                 continue
             if strike < spot * 0.75 or strike > spot * 1.25:
+                rejected += 1
                 continue
 
             bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
             ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
-            last = _safe_float(
-                contract.get("last_price") or contract.get("last_trade_price")
-            )
 
-            # Require a real, non zero market
             if bid is None or ask is None or bid <= 0 or ask <= 0:
+                rejected += 1
                 continue
-
-            # Avoid penny wide ghost quotes
-            if bid < 0.02:
+            if bid < MIN_OPTION_BID:
+                rejected += 1
                 continue
 
             spread_pct = (ask - bid) / ask if ask else 1.0
-            if spread_pct > 0.75:
+            if spread_pct > MAX_OPTION_SPREAD_PCT:
+                rejected += 1
                 continue
 
-            open_int = _safe_float(contract.get("open_interest"), 0.0)
-            volume = _safe_float(contract.get("volume"), 0.0)
-            if (open_int or 0) < 5 and (volume or 0) < 1:
+            open_int = _safe_float(contract.get("open_interest"))
+            volume = _safe_float(contract.get("volume"))
+            if open_int is not None and volume is not None and open_int == 0 and volume == 0:
+                rejected += 1
+                continue
+            if (open_int or 0) < MIN_OPTION_OI and (volume or 0) < MIN_OPTION_VOLUME:
+                # Prefer contracts with some participation but do not hard fail unless both zero
+                pass
+
+            price = _derive_option_price(contract, bid=bid, ask=ask)
+            if price is None or price <= 0 or price < MIN_OPTION_PRICE:
+                rejected += 1
                 continue
 
-            mid = (bid + ask) / 2.0
+            mid = (bid + ask) / 2.0 if bid and ask else price
             option_symbol = str(contract.get("symbol", "")).strip()
             if not option_symbol:
+                rejected += 1
                 continue
 
-            sort_key = ((expiration - min_expiry).days, abs(strike - spot))
+            sort_key = (days_out, abs(strike - spot))
             if best_sort is None or sort_key < best_sort:
                 best_sort = sort_key
                 best = {
@@ -625,82 +679,21 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                     "expiration": expiration,
                     "bid": bid,
                     "ask": ask,
-                    "last": last,
+                    "last": _safe_float(contract.get("last_price") or contract.get("last_trade_price")),
                     "mid": mid,
+                    "price": price,
                 }
         except Exception:
+            rejected += 1
             continue
 
-    if not best:
-        best_relaxed: dict | None = None
-        best_relaxed_sort: tuple[int, float] | None = None
-        for contract in chain:
-            try:
-                raw_exp = contract.get("expiration_date") or contract.get("expiry")
-                expiration = None
-                if isinstance(raw_exp, str):
-                    try:
-                        expiration = datetime.fromisoformat(raw_exp).date()
-                    except ValueError:
-                        expiration = None
-                elif isinstance(raw_exp, date):
-                    expiration = raw_exp
-                if not expiration or expiration < min_expiry or expiration > max_expiry:
-                    continue
-
-                strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
-                if not strike:
-                    continue
-                if strike < spot * 0.75 or strike > spot * 1.25:
-                    continue
-
-                bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
-                ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
-                last = _safe_float(
-                    contract.get("last_price") or contract.get("last_trade_price")
-                )
-
-                if bid is None or ask is None or bid <= 0 or ask <= 0:
-                    continue
-                if bid < 0.01:
-                    continue
-
-                spread_pct = (ask - bid) / ask if ask else 1.0
-                if spread_pct > 0.90:
-                    continue
-
-                # In relaxed mode, rely primarily on live quotes and spread; ignore weak OI/volume.
-
-                mid = (bid + ask) / 2.0
-                option_symbol = str(contract.get("symbol", "")).strip()
-                if not option_symbol:
-                    continue
-
-                sort_key = ((expiration - min_expiry).days, abs(strike - spot))
-                if best_relaxed_sort is None or sort_key < best_relaxed_sort:
-                    best_relaxed_sort = sort_key
-                    best_relaxed = {
-                        "underlying": symbol.upper(),
-                        "option_symbol": option_symbol,
-                        "strike": strike,
-                        "expiration": expiration,
-                        "bid": bid,
-                        "ask": ask,
-                        "last": last,
-                        "mid": mid,
-                    }
-            except Exception:
-                continue
-
-        if best_relaxed:
-            best = best_relaxed
-            logger.warning(
-                "Using relaxed option filters for %s on %s; selected %s with mid_price=%.2f",
-                kind,
-                symbol.upper(),
-                best["option_symbol"],
-                best.get("mid", 0.0),
-            )
+    logger.info(
+        "Option chain filtered %d/%d %s contracts for %s due to quote/liquidity rules",
+        rejected,
+        total,
+        kind,
+        symbol.upper(),
+    )
 
     if not best:
         logger.info(
