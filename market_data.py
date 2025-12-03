@@ -568,6 +568,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
 
     kind = option_type.lower()
     logger.info("Choosing %s contract for %s", kind, symbol.upper())
+    # Run base and relaxed option filters while tracking rejection reasons for transparency.
 
     spot = _latest_spot_price(symbol, now)
     if not spot:
@@ -661,26 +662,31 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
 
                 bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
                 ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
-
-                if bid is None or ask is None or bid <= 0 or ask <= 0:
+                mark_price = _safe_float(
+                    contract.get("mark_price")
+                    or contract.get("mark")
+                    or contract.get("mid_price")
+                )
+                if (bid is None or ask is None or bid <= 0 or ask <= 0) and not mark_price:
                     rejected_counts["missing_quote"] += 1
                     if track_rejections:
                         rejected_missing_quote += 1
                     continue
 
-                price = _derive_option_price(contract, bid=bid, ask=ask)
-                if price is None or price <= 0:
+                if mark_price is None:
+                    mark_price = (bid + ask) / 2.0 if bid and ask else None
+                if mark_price is None or mark_price <= 0:
                     rejected_counts["missing_quote"] += 1
                     if track_rejections:
                         rejected_missing_quote += 1
                     continue
-                if price < 0.10:
+                if mark_price < 0.10:
                     rejected_counts["mark_price"] += 1
                     if track_rejections:
                         rejected_mark_price += 1
                     continue
 
-                spread_limit = max(max_spread_floor, max_spread_factor * price)
+                spread_limit = max(max_spread_floor, max_spread_factor * mark_price)
                 spread_abs = (ask - bid) if (ask is not None and bid is not None) else float("inf")
                 if spread_abs > spread_limit:
                     rejected_counts["spread"] += 1
@@ -705,7 +711,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                 if not option_symbol:
                     continue
 
-                mid = (bid + ask) / 2.0 if bid and ask else price
+                mid = (bid + ask) / 2.0 if bid and ask else mark_price
                 delta_val = _safe_float(
                     contract.get("delta")
                     or (contract.get("greeks") or {}).get("delta")  # type: ignore[index]
@@ -720,7 +726,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                         "ask": ask,
                         "last": _safe_float(contract.get("last_price") or contract.get("last_trade_price")),
                         "mid": mid,
-                        "price": price,
+                        "price": mark_price,
                         "days_out": days_out,
                         "spread_abs": spread_abs,
                         "delta": delta_val,
