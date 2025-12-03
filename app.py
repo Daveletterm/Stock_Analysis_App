@@ -2581,6 +2581,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             reasons.append(
                                 f"target hit ${current_price:.2f} >= ${take_price:.2f}"
                             )
+                    loss_reason_added = False
+                    loss_pct = None
+                    if avg_entry_price and current_price is not None and avg_entry_price > 0:
+                        loss_pct = ((current_price - avg_entry_price) / avg_entry_price) * 100.0
+                        if loss_pct <= -50.0:
+                            reasons.insert(0, f"max_loss_exit {loss_pct:.1f}%")
+                            loss_reason_added = True
                     plpc = safe_float(pos.get("unrealized_plpc"), None)
                     if plpc is None:
                         percent = safe_float(pos.get("unrealized_pl_percent"), None)
@@ -2608,6 +2615,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     days_out = option_days_to_expiration(parsed)
                     if days_out is not None and days_out <= expiry_buffer:
                         reasons.append(f"{days_out}d to expiry")
+                    if days_out is not None and days_out <= 5:
+                        reasons.insert(0, f"expiry_safety_exit DTE={days_out} days")
                     if underlying:
                         df = _autopilot_prepare_dataframe(underlying, lookback)
                         if df is None:

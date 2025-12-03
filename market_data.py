@@ -595,90 +595,139 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         logger.info("No %s contracts available for %s", kind, symbol.upper())
         return None
 
-    candidates: list[dict[str, object]] = []
+    def _filter_chain(
+        contracts: list[dict],
+        *,
+        min_oi: float,
+        min_volume: float | None,
+        max_spread_factor: float,
+        max_spread_floor: float,
+    ) -> tuple[list[dict[str, object]], dict[str, int]]:
+        rejected_counts = {
+            "missing_quote": 0,
+            "spread": 0,
+            "open_interest": 0,
+            "volume": 0,
+            "mark_price": 0,
+            "dte": 0,
+        }
+        candidates_local: list[dict[str, object]] = []
+        for contract in contracts:
+            try:
+                status = str(contract.get("status", "")).lower()
+                if status and status != "active":
+                    continue
+
+                raw_exp = contract.get("expiration_date") or contract.get("expiry")
+                expiration = None
+                if isinstance(raw_exp, str):
+                    try:
+                        expiration = datetime.fromisoformat(raw_exp).date()
+                    except ValueError:
+                        expiration = None
+                elif isinstance(raw_exp, date):
+                    expiration = raw_exp
+                if not expiration:
+                    rejected_counts["dte"] += 1
+                    continue
+                days_out = (expiration - now.date()).days
+                if days_out < 20 or days_out > 90:
+                    rejected_counts["dte"] += 1
+                    continue
+                if expiration < min_expiry or expiration > max_expiry:
+                    rejected_counts["dte"] += 1
+                    continue
+
+                strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
+                if not strike:
+                    continue
+                if strike < spot * 0.75 or strike > spot * 1.25:
+                    continue
+
+                bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
+                ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
+
+                if bid is None or ask is None or bid <= 0 or ask <= 0:
+                    rejected_counts["missing_quote"] += 1
+                    continue
+
+                price = _derive_option_price(contract, bid=bid, ask=ask)
+                if price is None or price <= 0:
+                    rejected_counts["mark_price"] += 1
+                    continue
+                if price < 0.10:
+                    rejected_counts["mark_price"] += 1
+                    continue
+
+                spread_limit = max(max_spread_floor, max_spread_factor * price)
+                spread_abs = (ask - bid) if (ask is not None and bid is not None) else float("inf")
+                if spread_abs > spread_limit:
+                    rejected_counts["spread"] += 1
+                    continue
+
+                open_int = _safe_float(contract.get("open_interest"))
+                volume = _safe_float(contract.get("volume"))
+                if open_int is None or open_int < min_oi:
+                    rejected_counts["open_interest"] += 1
+                    continue
+                if min_volume is not None and (volume is None or volume < min_volume):
+                    rejected_counts["volume"] += 1
+                    continue
+
+                option_symbol = str(contract.get("symbol", "")).strip()
+                if not option_symbol:
+                    continue
+
+                mid = (bid + ask) / 2.0 if bid and ask else price
+                delta_val = _safe_float(
+                    contract.get("delta")
+                    or (contract.get("greeks") or {}).get("delta")  # type: ignore[index]
+                )
+                candidates_local.append(
+                    {
+                        "underlying": symbol.upper(),
+                        "option_symbol": option_symbol,
+                        "strike": strike,
+                        "expiration": expiration,
+                        "bid": bid,
+                        "ask": ask,
+                        "last": _safe_float(contract.get("last_price") or contract.get("last_trade_price")),
+                        "mid": mid,
+                        "price": price,
+                        "days_out": days_out,
+                        "spread_abs": spread_abs,
+                        "delta": delta_val,
+                        "open_interest": open_int,
+                    }
+                )
+            except Exception:
+                continue
+        return candidates_local, rejected_counts
+
     total = len(chain)
-    for contract in chain:
-        try:
-            status = str(contract.get("status", "")).lower()
-            if status and status != "active":
-                continue
+    candidates, rejected_counts = _filter_chain(
+        chain,
+        min_oi=50,
+        min_volume=1,
+        max_spread_factor=0.30,
+        max_spread_floor=0.20,
+    )
 
-            raw_exp = contract.get("expiration_date") or contract.get("expiry")
-            expiration = None
-            if isinstance(raw_exp, str):
-                try:
-                    expiration = datetime.fromisoformat(raw_exp).date()
-                except ValueError:
-                    expiration = None
-            elif isinstance(raw_exp, date):
-                expiration = raw_exp
-            if not expiration:
-                continue
-            days_out = (expiration - now.date()).days
-            if days_out < MIN_OPTION_DTE or days_out > MAX_OPTION_DTE:
-                continue
-            if expiration < min_expiry or expiration > max_expiry:
-                continue
-
-            strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
-            if not strike:
-                continue
-            if strike < spot * 0.75 or strike > spot * 1.25:
-                continue
-
-            bid = _safe_float(contract.get("bid_price") or contract.get("bid"))
-            ask = _safe_float(contract.get("ask_price") or contract.get("ask"))
-
-            if bid is None or ask is None or bid <= 0 or ask <= 0:
-                continue
-            if bid < MIN_OPTION_BID:
-                continue
-
-            spread_pct = (ask - bid) / ask if ask else 1.0
-            if spread_pct > MAX_OPTION_SPREAD_PCT:
-                continue
-
-            open_int = _safe_float(contract.get("open_interest"))
-            volume = _safe_float(contract.get("volume"))
-            if open_int is not None and volume is not None and open_int == 0 and volume == 0:
-                continue
-            if (open_int or 0) < MIN_OPTION_OI and (volume or 0) < MIN_OPTION_VOLUME:
-                # Prefer contracts with some participation but do not hard fail unless both zero
-                pass
-
-            price = _derive_option_price(contract, bid=bid, ask=ask)
-            if price is None or price <= 0 or price < MIN_OPTION_PRICE:
-                continue
-
-            option_symbol = str(contract.get("symbol", "")).strip()
-            if not option_symbol:
-                continue
-
-            mid = (bid + ask) / 2.0 if bid and ask else price
-            spread_abs = (ask - bid) if (ask is not None and bid is not None) else float("inf")
-            delta_val = _safe_float(
-                contract.get("delta")
-                or (contract.get("greeks") or {}).get("delta")  # type: ignore[index]
-            )
-            candidates.append(
-                {
-                    "underlying": symbol.upper(),
-                    "option_symbol": option_symbol,
-                    "strike": strike,
-                    "expiration": expiration,
-                    "bid": bid,
-                    "ask": ask,
-                    "last": _safe_float(contract.get("last_price") or contract.get("last_trade_price")),
-                    "mid": mid,
-                    "price": price,
-                    "days_out": days_out,
-                    "spread_abs": spread_abs,
-                    "delta": delta_val,
-                    "open_interest": open_int,
-                }
-            )
-        except Exception:
-            continue
+    if not candidates and total >= 20:
+        relaxed_candidates, _ = _filter_chain(
+            chain,
+            min_oi=10,
+            min_volume=None,
+            max_spread_factor=0.50,
+            max_spread_floor=0.40,
+        )
+        logger.info(
+            "Option chain relaxed filters for %s: first pass %d candidates, second pass %d candidates",
+            symbol.upper(),
+            len(candidates),
+            len(relaxed_candidates),
+        )
+        candidates = relaxed_candidates
 
     rejected = total - len(candidates)
     logger.info(
@@ -694,6 +743,16 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
             "No suitable %s contract for %s (filtered out by liquidity or strike rules)",
             kind,
             symbol.upper(),
+        )
+        logger.info(
+            "Option chain rejection breakdown for %s: missing_quote=%d spread=%d open_interest=%d volume=%d mark_price=%d dte=%d",
+            symbol.upper(),
+            rejected_counts["missing_quote"],
+            rejected_counts["spread"],
+            rejected_counts["open_interest"],
+            rejected_counts["volume"],
+            rejected_counts["mark_price"],
+            rejected_counts["dte"],
         )
         return None
 
