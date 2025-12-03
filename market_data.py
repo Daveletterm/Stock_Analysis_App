@@ -595,6 +595,13 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         logger.info("No %s contracts available for %s", kind, symbol.upper())
         return None
 
+    rejected_missing_quote = 0
+    rejected_spread = 0
+    rejected_open_interest = 0
+    rejected_volume = 0
+    rejected_mark_price = 0
+    rejected_dte = 0
+
     def _filter_chain(
         contracts: list[dict],
         *,
@@ -602,7 +609,9 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         min_volume: float | None,
         max_spread_factor: float,
         max_spread_floor: float,
+        track_rejections: bool = False,
     ) -> tuple[list[dict[str, object]], dict[str, int]]:
+        nonlocal rejected_missing_quote, rejected_spread, rejected_open_interest, rejected_volume, rejected_mark_price, rejected_dte
         rejected_counts = {
             "missing_quote": 0,
             "spread": 0,
@@ -629,13 +638,19 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                     expiration = raw_exp
                 if not expiration:
                     rejected_counts["dte"] += 1
+                    if track_rejections:
+                        rejected_dte += 1
                     continue
                 days_out = (expiration - now.date()).days
                 if days_out < 20 or days_out > 90:
                     rejected_counts["dte"] += 1
+                    if track_rejections:
+                        rejected_dte += 1
                     continue
                 if expiration < min_expiry or expiration > max_expiry:
                     rejected_counts["dte"] += 1
+                    if track_rejections:
+                        rejected_dte += 1
                     continue
 
                 strike = _safe_float(contract.get("strike_price") or contract.get("strike"))
@@ -649,29 +664,41 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
 
                 if bid is None or ask is None or bid <= 0 or ask <= 0:
                     rejected_counts["missing_quote"] += 1
+                    if track_rejections:
+                        rejected_missing_quote += 1
                     continue
 
                 price = _derive_option_price(contract, bid=bid, ask=ask)
                 if price is None or price <= 0:
-                    rejected_counts["mark_price"] += 1
+                    rejected_counts["missing_quote"] += 1
+                    if track_rejections:
+                        rejected_missing_quote += 1
                     continue
                 if price < 0.10:
                     rejected_counts["mark_price"] += 1
+                    if track_rejections:
+                        rejected_mark_price += 1
                     continue
 
                 spread_limit = max(max_spread_floor, max_spread_factor * price)
                 spread_abs = (ask - bid) if (ask is not None and bid is not None) else float("inf")
                 if spread_abs > spread_limit:
                     rejected_counts["spread"] += 1
+                    if track_rejections:
+                        rejected_spread += 1
                     continue
 
                 open_int = _safe_float(contract.get("open_interest"))
                 volume = _safe_float(contract.get("volume"))
                 if open_int is None or open_int < min_oi:
                     rejected_counts["open_interest"] += 1
+                    if track_rejections:
+                        rejected_open_interest += 1
                     continue
                 if min_volume is not None and (volume is None or volume < min_volume):
                     rejected_counts["volume"] += 1
+                    if track_rejections:
+                        rejected_volume += 1
                     continue
 
                 option_symbol = str(contract.get("symbol", "")).strip()
@@ -711,6 +738,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         min_volume=1,
         max_spread_factor=0.30,
         max_spread_floor=0.20,
+        track_rejections=True,
     )
 
     if not candidates and total >= 20:
@@ -721,13 +749,13 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
             max_spread_factor=0.50,
             max_spread_floor=0.40,
         )
-        logger.info(
-            "Option chain relaxed filters for %s: first pass %d candidates, second pass %d candidates",
-            symbol.upper(),
-            len(candidates),
-            len(relaxed_candidates),
-        )
-        candidates = relaxed_candidates
+        if relaxed_candidates:
+            logger.info(
+                "Option chain relaxed filters for %s: first pass 0 candidates, second pass %d candidates",
+                symbol.upper(),
+                len(relaxed_candidates),
+            )
+            candidates = relaxed_candidates
 
     rejected = total - len(candidates)
     logger.info(
@@ -747,12 +775,12 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         logger.info(
             "Option chain rejection breakdown for %s: missing_quote=%d spread=%d open_interest=%d volume=%d mark_price=%d dte=%d",
             symbol.upper(),
-            rejected_counts["missing_quote"],
-            rejected_counts["spread"],
-            rejected_counts["open_interest"],
-            rejected_counts["volume"],
-            rejected_counts["mark_price"],
-            rejected_counts["dte"],
+            rejected_missing_quote,
+            rejected_spread,
+            rejected_open_interest,
+            rejected_volume,
+            rejected_mark_price,
+            rejected_dte,
         )
         return None
 
