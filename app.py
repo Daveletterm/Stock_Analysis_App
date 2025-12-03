@@ -41,6 +41,7 @@ from paper_trading import (
     get_daily_account_snapshot,
     NoAvailableBidError,
     OptionCloseRejectedError,
+    option_pnl_percent,
 )
 from market_data import PriceDataError
 from market_data import choose_put_contract, fetch_option_contracts
@@ -138,6 +139,7 @@ AI_LOG_COLUMNS = [
     "label_good_trade",
     "realized_return_5d",
 ]
+# AI training log captures entry snapshots for future model training.
 FALLBACK_TICKERS = [
     "AAPL",
     "MSFT",
@@ -2122,10 +2124,10 @@ def log_ai_snapshot(
     realized_return_5d: str | None = "",
 ) -> None:
     """
-    Append one training example row for the future AI portfolio model.
+    Append one training example row for a future AI portfolio model.
 
-    This must never raise uncaught exceptions. If logging fails, write a warning
-    to the existing logger and continue.
+    This must never raise uncaught exceptions. If logging fails, log a warning
+    and continue normal execution.
     """
 
     try:
@@ -2486,6 +2488,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
             )
 
             if current_positions_option:
+                # Option exits now enforce hard max-loss and expiry safety nets.
                 for contract_symbol, entry in current_positions_option.items():
                     if contract_symbol in ZOMBIE_POSITIONS:
                         logger.debug("Skipping zombie contract %s during exit review", contract_symbol)
@@ -2582,12 +2585,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 f"target hit ${current_price:.2f} >= ${take_price:.2f}"
                             )
                     loss_reason_added = False
-                    loss_pct = None
-                    if avg_entry_price and current_price is not None and avg_entry_price > 0:
-                        loss_pct = ((current_price - avg_entry_price) / avg_entry_price) * 100.0
-                        if loss_pct <= -50.0:
-                            reasons.insert(0, f"max_loss_exit {loss_pct:.1f}%")
-                            loss_reason_added = True
+                    loss_pct = option_pnl_percent(avg_entry_price, current_price)
+                    if loss_pct is not None and loss_pct <= -50.0:
+                        reasons.insert(0, f"max_loss_exit {loss_pct:.1f}%")
+                        loss_reason_added = True
                     plpc = safe_float(pos.get("unrealized_plpc"), None)
                     if plpc is None:
                         percent = safe_float(pos.get("unrealized_pl_percent"), None)
@@ -3373,6 +3374,15 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             continue
                         stop_loss_pct = option_stop_default
                         take_profit_pct = option_profit_default
+                        indicator_df = None
+                        try:
+                            indicator_df = _autopilot_prepare_dataframe(symbol, lookback)
+                        except PriceDataError:
+                            indicator_df = None
+                        except Exception:
+                            logger.debug("Indicator prep failed for %s during option log", symbol, exc_info=True)
+                            indicator_df = None
+                        indicator_features = _extract_indicator_features(indicator_df)
                         try:
                             logger.info(
                                 "Placing bearish order: symbol=%s asset_class=option qty=%s side=buy",
@@ -3388,6 +3398,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 score=safe_float(score, 0.0) or 0.0,
                                 spot_price=equity_price,
                                 entry_price=mid_price * OPTION_CONTRACT_MULTIPLIER if mid_price else None,
+                                rsi=indicator_features.get("rsi"),
+                                macd=indicator_features.get("macd"),
+                                volatility_20d=indicator_features.get("volatility_20d"),
+                                volume_rel_20d=indicator_features.get("volume_rel_20d"),
                                 sector_strength=None,
                                 market_trend=None,
                                 congress_score=None,
@@ -3593,6 +3607,15 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "none",
                             )
                             continue
+                        indicator_df = None
+                        try:
+                            indicator_df = _autopilot_prepare_dataframe(symbol, lookback)
+                        except PriceDataError:
+                            indicator_df = None
+                        except Exception:
+                            logger.debug("Indicator prep failed for %s during option log", symbol, exc_info=True)
+                            indicator_df = None
+                        indicator_features = _extract_indicator_features(indicator_df)
                         try:
                             logger.info(
                                 "Placing bullish order: symbol=%s asset_class=option qty=%s side=buy",
@@ -3608,6 +3631,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 score=safe_float(score, 0.0) or 0.0,
                                 spot_price=equity_price,
                                 entry_price=premium * OPTION_CONTRACT_MULTIPLIER if premium else None,
+                                rsi=indicator_features.get("rsi"),
+                                macd=indicator_features.get("macd"),
+                                volatility_20d=indicator_features.get("volatility_20d"),
+                                volume_rel_20d=indicator_features.get("volume_rel_20d"),
                                 sector_strength=None,
                                 market_trend=None,
                                 congress_score=None,

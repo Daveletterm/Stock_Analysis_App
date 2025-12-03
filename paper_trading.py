@@ -542,6 +542,15 @@ def _safe_float(val: Any) -> float | None:
         return None
 
 
+# Safety helper to keep option exits anchored to premium-based losses.
+def option_pnl_percent(avg_entry_price: float | None, current_price: float | None) -> float | None:
+    """Return percent change for an option premium for safety exits."""
+
+    if avg_entry_price is None or avg_entry_price <= 0 or current_price is None:
+        return None
+    return ((current_price - avg_entry_price) / avg_entry_price) * 100.0
+
+
 def _normalize_timestamp(value: Any, tzinfo: _dt.tzinfo) -> tuple[str | None, _dt.datetime | None]:
     """Return ISO string timestamp and datetime in the configured timezone."""
 
