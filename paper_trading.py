@@ -42,6 +42,26 @@ class OptionCloseRejectedError(AlpacaAPIError):
 
 logger = logging.getLogger("paper_trading")
 
+
+def is_regular_options_trading_hours(now: _dt.datetime | None = None) -> bool:
+    """
+    Returns True if it is regular US options trading hours:
+    Monday to Friday, 09:30 to 16:00 America/New_York.
+    """
+
+    try:
+        tz = ZoneInfo("America/New_York") if ZoneInfo is not None else None
+    except Exception:
+        tz = None
+    if now is None:
+        now = _dt.datetime.now(tz or _dt.timezone.utc)
+        if tz is None:
+            now = now.astimezone(_dt.timezone(_dt.timedelta(hours=-5)))
+    if now.weekday() >= 5:
+        return False
+    current_time = now.timetz() if hasattr(now, "timetz") else now.time()
+    return (_dt.time(9, 30) <= current_time < _dt.time(16, 0))
+
 DEFAULT_BASE_URL = "https://paper-api.alpaca.markets/v2"
 
 
@@ -199,6 +219,16 @@ class AlpacaPaperBroker:
         return matches
 
     def submit_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        asset_class = str(payload.get("asset_class", "")).lower()
+        order_type = str(payload.get("type", "")).lower()
+        if asset_class == "option" and order_type == "market" and not is_regular_options_trading_hours():
+            logger.warning(
+                "Skip option market order for %s %s: options market not in regular hours",
+                payload.get("symbol"),
+                payload.get("side"),
+            )
+            return {"status": "skipped_market_closed", "symbol": payload.get("symbol")}
+
         logger.info("Submitting paper order: %s", payload)
         try:
             return self._request("POST", "/orders", json=payload)

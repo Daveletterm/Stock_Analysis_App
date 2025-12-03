@@ -610,6 +610,9 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         min_volume: float | None,
         max_spread_factor: float,
         max_spread_floor: float,
+        min_price: float,
+        min_dte: int,
+        max_dte: int,
         track_rejections: bool = False,
     ) -> tuple[list[dict[str, object]], dict[str, int]]:
         nonlocal rejected_missing_quote, rejected_spread, rejected_open_interest, rejected_volume, rejected_mark_price, rejected_dte
@@ -643,7 +646,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                         rejected_dte += 1
                     continue
                 days_out = (expiration - now.date()).days
-                if days_out < 20 or days_out > 90:
+                if days_out < min_dte or days_out > max_dte:
                     rejected_counts["dte"] += 1
                     if track_rejections:
                         rejected_dte += 1
@@ -680,7 +683,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                     if track_rejections:
                         rejected_missing_quote += 1
                     continue
-                if mark_price < 0.10:
+                if mark_price < min_price:
                     rejected_counts["mark_price"] += 1
                     if track_rejections:
                         rejected_mark_price += 1
@@ -740,20 +743,27 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
     total = len(chain)
     candidates, rejected_counts = _filter_chain(
         chain,
-        min_oi=50,
-        min_volume=1,
-        max_spread_factor=0.30,
-        max_spread_floor=0.20,
+        min_oi=20,
+        min_volume=None,
+        max_spread_factor=0.50,
+        max_spread_floor=0.50,
+        min_price=0.10,
+        min_dte=10,
+        max_dte=120,
         track_rejections=True,
     )
 
     if not candidates and total >= 20:
         relaxed_candidates, _ = _filter_chain(
             chain,
-            min_oi=10,
+            min_oi=5,
             min_volume=None,
-            max_spread_factor=0.50,
-            max_spread_floor=0.40,
+            max_spread_factor=0.75,
+            max_spread_floor=0.75,
+            min_price=0.05,
+            min_dte=5,
+            max_dte=180,
+            track_rejections=False,
         )
         if relaxed_candidates:
             logger.info(

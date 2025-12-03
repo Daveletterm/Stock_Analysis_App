@@ -445,6 +445,13 @@ def _record_recommendations_snapshot(recs: dict[str, Any]) -> None:
         logger.exception("Failed to persist recommendation snapshot")
 
 
+def safe_float(value, default=None):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 def _load_last_autopilot_run() -> None:
     global _autopilot_last_run
     try:

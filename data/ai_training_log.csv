@@ -1,0 +1,11 @@
+timestamp,symbol,asset_class,strategy_key,contract_symbol,direction,score,spot_price,entry_price,rsi,macd,volatility_20d,volume_rel_20d,sector_strength,market_trend,congress_score,news_sentiment,decision,label_good_trade,realized_return_5d
+2025-12-03T13:11:47.968769+00:00,WBD,option,hybrid_aggressive,WBD260109C00030000,buy,5.5,24.53,16.0,,,0.021316776410662264,,,,,,enter,,
+2025-12-03T13:11:51.229426+00:00,AAPL,option,hybrid_aggressive,AAPL260109C00200000,buy,5.0,286.09,7755.0,,,0.009858183503355726,,,,,,enter,,
+2025-12-03T13:11:54.249996+00:00,CSCO,option,hybrid_aggressive,CSCO260109C00078000,buy,5.0,76.85,129.0,,,0.018361361816657294,,,,,,enter,,
+2025-12-03T13:11:57.241056+00:00,GOOGL,option,hybrid_aggressive,GOOGL260109C00355000,buy,5.0,315.74,239.0,,,0.02452602053406532,,,,,,enter,,
+2025-12-03T13:12:00.398116+00:00,BAC,option,hybrid_aggressive,BAC260109C00054000,buy,4.5,53.17,107.0,,,0.012231690636606904,,,,,,enter,,
+2025-12-03T13:16:46.475338+00:00,WBD,option,hybrid_aggressive,WBD260109C00030000,buy,5.5,24.53,16.0,,,0.021316776410662264,,,,,,enter,,
+2025-12-03T13:16:47.562426+00:00,AAPL,option,hybrid_aggressive,AAPL260109C00200000,buy,5.0,286.09,7755.0,,,0.009858183503355726,,,,,,enter,,
+2025-12-03T13:16:48.630870+00:00,CSCO,option,hybrid_aggressive,CSCO260109C00078000,buy,5.0,76.85,129.0,,,0.018361361816657294,,,,,,enter,,
+2025-12-03T13:16:49.809628+00:00,GOOGL,option,hybrid_aggressive,GOOGL260109C00355000,buy,5.0,315.74,239.0,,,0.02452602053406532,,,,,,enter,,
+2025-12-03T13:16:50.913026+00:00,BAC,option,hybrid_aggressive,BAC260109C00054000,buy,4.5,53.17,107.0,,,0.012231690636606904,,,,,,enter,,
