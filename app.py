@@ -3552,6 +3552,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     continue
 
                 mid_price: float | None = None
+                contract_symbol: str | None = None
                 if decision == "option":
                     if _option_on_cooldown(symbol, now):
                         summary_lines.append(
@@ -3667,257 +3668,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             logger.debug("Indicator prep failed for %s during option log", symbol, exc_info=True)
                             indicator_df = None
                         indicator_features = _extract_indicator_features(indicator_df)
-                    if mid_price is None or mid_price <= 0:
-                        summary_lines.append(
-                            f"Skip bearish {symbol}; invalid quote for {contract_symbol}."
-                        )
-                        log_candidate_outcome(
-                            "bearish entry blocked, invalid option quote",
-                            "none",
-                        )
-                        continue
-                    try:
-                        logger.info(
-                            "Placing bearish order: symbol=%s asset_class=option qty=%s side=buy",
-                            contract_symbol,
-                            qty,
-                        )
-                        log_ai_snapshot(
-                            symbol=symbol,
-                            asset_class="option",
-                            strategy_key=strategy_key,
-                            contract_symbol=contract_symbol,
-                            direction="buy",
-                            score=safe_float(score, 0.0) or 0.0,
-                            spot_price=equity_price,
-                            entry_price=mid_price * OPTION_CONTRACT_MULTIPLIER if mid_price else None,
-                            rsi=indicator_features.get("rsi"),
-                            macd=indicator_features.get("macd"),
-                            volatility_20d=indicator_features.get("volatility_20d"),
-                            volume_rel_20d=indicator_features.get("volume_rel_20d"),
-                            sector_strength=None,
-                            market_trend=None,
-                            congress_score=None,
-                            news_sentiment=None,
-                        )
-                        place_guarded_paper_order(
-                            contract_symbol,
-                            qty,
-                            "buy",
-                            order_type="limit",
-                            limit_price=round(mid_price, 2),
-                            stop_loss_pct=stop_loss_pct,
-                            take_profit_pct=take_profit_pct,
-                            time_in_force="day",
-                            asset_class="option",
-                            price_hint=mid_price,
-                            support_brackets=False,
-                            position_effect="open",
-                        )
-                        gross_notional += order_notional
-                        cash_balance = max(0.0, cash_balance - order_notional)
-                        cash_ratio = (cash_balance / equity) if equity else cash_ratio
-                        available_slots -= 1
-                        held_and_pending.add(contract_symbol)
-                        pending_underlyings.add(symbol)
-                        _remember_position_params(
-                            contract_symbol,
-                            asset_class="option",
-                            stop_loss_pct=stop_loss_pct,
-                            take_profit_pct=take_profit_pct,
-                            strategy=strategy_key,
-                            opened_at=now,
-                        )
-                        summary_lines.append(
-                            f"Buy {qty} {contract_symbol} ({symbol} put {put_choice.get('strike', 0):.2f} exp {put_choice.get('expiration')}, limit ${mid_price:.2f})"
-                        )
-                        orders_placed += 1
-                        entries_placed += 1
-                        gross_option_notional += order_notional
-                        options_budget_remaining = max(
-                            0.0, options_budget_limit - gross_option_notional
-                        )
-                        log_candidate_outcome(
-                            f"bearish entry placed via option ({decision_reason})"
-                        )
-                    except Exception as exc:
-                        logger.exception("Autopilot put entry failed for %s", contract_symbol)
-                        errors.append(f"buy {contract_symbol} failed: {exc}")
-                        if not candidate_logged:
-                            log_candidate_outcome(
-                                "bearish entry failed during order placement",
-                                "bearish",
-                            )
-                    else:
-                        if not selection:
-                            log_candidate_outcome(
-                                "bullish entry blocked, option selection unavailable",
-                                "none",
-                            )
-                            continue
-                        diag = selection_diag or {}
-                        contract_data = selection.contract
-                        premium = selection.premium
-                        if diag:
-                            try:
-                                logger.debug(
-                                    "Option selection diagnostics for %s: %s",
-                                    symbol.upper(),
-                                    json.dumps(to_plain(diag)),
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "Option selection diagnostics for %s: %s",
-                                    symbol.upper(),
-                                    diag,
-                                )
-                        if not contract_data or premium is None or premium <= 0:
-                            reason_bits = []
-                            rejection_counts = Counter()
-                            base_rejects = (
-                                diag.get("base_rejections")
-                                if isinstance(diag.get("base_rejections"), dict)
-                                else {}
-                            )
-                            final_rejects = (
-                                diag.get("final_rejections")
-                                if isinstance(diag.get("final_rejections"), dict)
-                                else {}
-                            )
-                            try:
-                                rejection_counts.update(Counter(base_rejects))
-                                rejection_counts.update(Counter(final_rejects))
-                            except Exception:
-                                rejection_counts = Counter()
-                            chain_errors = (
-                                diag.get("chain_errors")
-                                if isinstance(diag.get("chain_errors"), dict)
-                                else {}
-                            )
-                            for chain_type, message in chain_errors.items():
-                                if not message:
-                                    continue
-                                reason_bits.append(
-                                    f"{chain_type}_chain:{str(message).strip()[:80]}"
-                                )
-                            if rejection_counts:
-                                for reason, count in rejection_counts.most_common(3):
-                                    reason_bits.append(f"{reason}:{count}")
-                            if reason_bits:
-                                logger.warning(
-                                    "Option selection rejected %s: %s",
-                                    symbol.upper(),
-                                    ", ".join(reason_bits),
-                                )
-                            else:
-                                logger.warning(
-                                    "Option selection rejected %s: no priced contracts",
-                                    symbol.upper(),
-                                )
-                            summary_lines.append(
-                                "No option contracts matched filters for {}.{}".format(
-                                    symbol,
-                                    f" ({', '.join(reason_bits)})" if reason_bits else "",
-                                )
-                            )
-                            log_candidate_outcome(
-                                "bullish entry blocked, no suitable call contract",
-                                "none",
-                            )
-                            continue
-                        contract_symbol = (
-                            str(contract_data.get("symbol", "")).replace(" ", "").upper()
-                            if isinstance(contract_data, dict)
-                            else ""
-                        )
-                        if not contract_symbol or contract_symbol in held_and_pending:
-                            log_candidate_outcome(
-                                "bullish entry blocked, order already pending",
-                                "none",
-                            )
-                            continue
-                        block_reason = _option_trade_block_reason(
-                            contract_symbol,
-                            positions,
-                            open_orders,
-                            closed_today_symbols,
-                            now=now,
-                        )
-                        if block_reason:
-                            reason_msg = (
-                                f"Skip bullish {symbol}; {contract_symbol} blocked ({block_reason})."
-                            )
-                            logger.info(reason_msg)
-                            summary_lines.append(reason_msg)
-                            log_candidate_outcome(
-                                "bullish entry blocked: " + block_reason,
-                                "none",
-                            )
-                            continue
-                        stop_loss_pct = option_stop_default
-                        take_profit_pct = option_profit_default
-                        qty, target_notional = compute_position_qty(
-                            contract_symbol,
-                            "us_option",
-                            premium,
-                            equity,
-                            profile,
-                            position_multiplier=position_multiplier,
-                            min_entry_notional=min_entry_notional,
-                            contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
-                        )
-                        if premium > 0 and equity > 0:
-                            scaled_fraction = BALANCED_GROWTH_CONFIG["max_options_notional_pct"] * vol_position_scale
-                            max_notional = equity * scaled_fraction
-                            if options_budget_remaining:
-                                max_notional = min(max_notional, options_budget_remaining)
-                            cap_qty = max(1, int(math.floor(max_notional / premium)))
-                            cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
-                            qty = cap_qty if qty <= 0 else min(qty, cap_qty)
-                        max_debit = safe_float(hybrid.get("max_position_debit"), None)
-                        if max_debit:
-                            target_notional = min(target_notional, max_debit)
-                        if PAPER_MAX_POSITION_NOTIONAL:
-                            target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
-                        unit_cost = premium * OPTION_CONTRACT_MULTIPLIER
-                        if unit_cost > 0:
-                            qty = max(int(target_notional // unit_cost), qty)
-                        max_contracts = int(safe_float(hybrid.get("max_contracts_per_trade"), 0))
-                        if max_contracts:
-                            qty = min(qty, max_contracts)
-                        order_notional = qty * unit_cost
-                        if gross_notional + order_notional > equity * max_total_allocation:
-                            if not allocation_warning_logged:
-                                summary_lines.append(
-                                    "Max portfolio allocation reached; skipping new entries."
-                                )
-                                allocation_warning_logged = True
-                            log_candidate_outcome(
-                                "bullish entry blocked by portfolio allocation",
-                                "none",
-                            )
-                            break
-                        if qty <= 0:
-                            summary_lines.append(
-                                f"Skip bullish {symbol}; notional ${target_notional:.2f} too small for call cost ${unit_cost:.2f}."
-                            )
-                            log_candidate_outcome(
-                                "bullish entry blocked by sizing rules",
-                                "none",
-                            )
-                            continue
-                        indicator_df = None
-                        try:
-                            indicator_df = _autopilot_prepare_dataframe(symbol, lookback)
-                        except PriceDataError:
-                            indicator_df = None
-                        except Exception:
-                            logger.debug("Indicator prep failed for %s during option log", symbol, exc_info=True)
-                            indicator_df = None
-                        indicator_features = _extract_indicator_features(indicator_df)
+                    if bias == "bearish":
                         try:
                             logger.info(
-                                "Placing bullish order: symbol=%s asset_class=option qty=%s side=buy",
+                                "Placing bearish order: symbol=%s asset_class=option qty=%s side=buy",
                                 contract_symbol,
                                 qty,
                             )
@@ -3929,7 +3683,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 direction="buy",
                                 score=safe_float(score, 0.0) or 0.0,
                                 spot_price=equity_price,
-                                entry_price=premium * OPTION_CONTRACT_MULTIPLIER if premium else None,
+                                entry_price=mid_price * OPTION_CONTRACT_MULTIPLIER if mid_price else None,
                                 rsi=indicator_features.get("rsi"),
                                 macd=indicator_features.get("macd"),
                                 volatility_20d=indicator_features.get("volatility_20d"),
@@ -3943,12 +3697,15 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 contract_symbol,
                                 qty,
                                 "buy",
-                                order_type="market",
+                                order_type="limit",
+                                limit_price=round(mid_price, 2),
                                 stop_loss_pct=stop_loss_pct,
                                 take_profit_pct=take_profit_pct,
                                 time_in_force="day",
                                 asset_class="option",
-                                price_hint=premium,
+                                price_hint=mid_price,
+                                support_brackets=False,
+                                position_effect="open",
                             )
                             gross_notional += order_notional
                             cash_balance = max(0.0, cash_balance - order_notional)
@@ -3965,7 +3722,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 opened_at=now,
                             )
                             summary_lines.append(
-                                f"Buy {qty} {contract_symbol} (score {score:.2f}, premium ${premium:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
+                                f"Buy {qty} {contract_symbol} ({symbol} put {put_choice.get('strike', 0):.2f} exp {put_choice.get('expiration')}, limit ${mid_price:.2f})"
                             )
                             orders_placed += 1
                             entries_placed += 1
@@ -3974,18 +3731,256 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 0.0, options_budget_limit - gross_option_notional
                             )
                             log_candidate_outcome(
-                                f"bullish entry placed via option ({decision_reason})"
+                                f"bearish entry placed via option ({decision_reason})"
                             )
                         except Exception as exc:
-                            logger.exception(
-                                "Autopilot option entry failed for %s", contract_symbol
-                            )
-                            errors.append(f"buy {contract_symbol} failed: {exc}")
+                            logger.exception("Autopilot put entry failed for %s", contract_symbol or symbol)
+                            errors.append(f"buy {contract_symbol or symbol} failed: {exc}")
                             if not candidate_logged:
                                 log_candidate_outcome(
-                                    "bullish entry failed during order placement",
-                                    "bullish",
+                                    "bearish entry failed during order placement",
+                                    "bearish",
                                 )
+                        continue
+                    # Bullish option path
+                    if not selection:
+                        log_candidate_outcome(
+                            "bullish entry blocked, option selection unavailable",
+                            "none",
+                        )
+                        continue
+                    diag = selection_diag or {}
+                    contract_data = selection.contract
+                    premium = selection.premium
+                    if diag:
+                        try:
+                            logger.debug(
+                                "Option selection diagnostics for %s: %s",
+                                symbol.upper(),
+                                json.dumps(to_plain(diag)),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Option selection diagnostics for %s: %s",
+                                symbol.upper(),
+                                diag,
+                            )
+                    if not contract_data or premium is None or premium <= 0:
+                        reason_bits = []
+                        rejection_counts = Counter()
+                        base_rejects = (
+                            diag.get("base_rejections")
+                            if isinstance(diag.get("base_rejections"), dict)
+                            else {}
+                        )
+                        final_rejects = (
+                            diag.get("final_rejections")
+                            if isinstance(diag.get("final_rejections"), dict)
+                            else {}
+                        )
+                        try:
+                            rejection_counts.update(Counter(base_rejects))
+                            rejection_counts.update(Counter(final_rejects))
+                        except Exception:
+                            rejection_counts = Counter()
+                        chain_errors = (
+                            diag.get("chain_errors")
+                            if isinstance(diag.get("chain_errors"), dict)
+                            else {}
+                        )
+                        for chain_type, message in chain_errors.items():
+                            if not message:
+                                continue
+                            reason_bits.append(
+                                f"{chain_type}_chain:{str(message).strip()[:80]}"
+                            )
+                        if rejection_counts:
+                            for reason, count in rejection_counts.most_common(3):
+                                reason_bits.append(f"{reason}:{count}")
+                        if reason_bits:
+                            logger.warning(
+                                "Option selection rejected %s: %s",
+                                symbol.upper(),
+                                ", ".join(reason_bits),
+                            )
+                        else:
+                            logger.warning(
+                                "Option selection rejected %s: no priced contracts",
+                                symbol.upper(),
+                            )
+                        summary_lines.append(
+                            "No option contracts matched filters for {}.{}".format(
+                                symbol,
+                                f" ({', '.join(reason_bits)})" if reason_bits else "",
+                            )
+                        )
+                        log_candidate_outcome(
+                            "bullish entry blocked, no suitable call contract",
+                            "none",
+                        )
+                        continue
+                    contract_symbol = (
+                        str(contract_data.get("symbol", "")).replace(" ", "").upper()
+                        if isinstance(contract_data, dict)
+                        else ""
+                    )
+                    if not contract_symbol or contract_symbol in held_and_pending:
+                        log_candidate_outcome(
+                            "bullish entry blocked, order already pending",
+                            "none",
+                        )
+                        continue
+                    block_reason = _option_trade_block_reason(
+                        contract_symbol,
+                        positions,
+                        open_orders,
+                        closed_today_symbols,
+                        now=now,
+                    )
+                    if block_reason:
+                        reason_msg = (
+                            f"Skip bullish {symbol}; {contract_symbol} blocked ({block_reason})."
+                        )
+                        logger.info(reason_msg)
+                        summary_lines.append(reason_msg)
+                        log_candidate_outcome(
+                            "bullish entry blocked: " + block_reason,
+                            "none",
+                        )
+                        continue
+                    stop_loss_pct = option_stop_default
+                    take_profit_pct = option_profit_default
+                    qty, target_notional = compute_position_qty(
+                        contract_symbol,
+                        "us_option",
+                        premium,
+                        equity,
+                        profile,
+                        position_multiplier=position_multiplier,
+                        min_entry_notional=min_entry_notional,
+                        contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
+                    )
+                    if premium > 0 and equity > 0:
+                        scaled_fraction = BALANCED_GROWTH_CONFIG["max_options_notional_pct"] * vol_position_scale
+                        max_notional = equity * scaled_fraction
+                        if options_budget_remaining:
+                            max_notional = min(max_notional, options_budget_remaining)
+                        cap_qty = max(1, int(math.floor(max_notional / premium)))
+                        cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
+                        qty = cap_qty if qty <= 0 else min(qty, cap_qty)
+                    max_debit = safe_float(hybrid.get("max_position_debit"), None)
+                    if max_debit:
+                        target_notional = min(target_notional, max_debit)
+                    if PAPER_MAX_POSITION_NOTIONAL:
+                        target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
+                    unit_cost = premium * OPTION_CONTRACT_MULTIPLIER
+                    if unit_cost > 0:
+                        qty = max(int(target_notional // unit_cost), qty)
+                    max_contracts = int(safe_float(hybrid.get("max_contracts_per_trade"), 0))
+                    if max_contracts:
+                        qty = min(qty, max_contracts)
+                    order_notional = qty * unit_cost
+                    if gross_notional + order_notional > equity * max_total_allocation:
+                        if not allocation_warning_logged:
+                            summary_lines.append(
+                                "Max portfolio allocation reached; skipping new entries."
+                            )
+                            allocation_warning_logged = True
+                        log_candidate_outcome(
+                            "bullish entry blocked by portfolio allocation",
+                            "none",
+                        )
+                        break
+                    if qty <= 0:
+                        summary_lines.append(
+                            f"Skip bullish {symbol}; notional ${target_notional:.2f} too small for call cost ${unit_cost:.2f}."
+                        )
+                        log_candidate_outcome(
+                            "bullish entry blocked by sizing rules",
+                            "none",
+                        )
+                        continue
+                    indicator_df = None
+                    try:
+                        indicator_df = _autopilot_prepare_dataframe(symbol, lookback)
+                    except PriceDataError:
+                        indicator_df = None
+                    except Exception:
+                        logger.debug("Indicator prep failed for %s during option log", symbol, exc_info=True)
+                        indicator_df = None
+                    indicator_features = _extract_indicator_features(indicator_df)
+                    try:
+                        logger.info(
+                            "Placing bullish order: symbol=%s asset_class=option qty=%s side=buy",
+                            contract_symbol,
+                            qty,
+                        )
+                        log_ai_snapshot(
+                            symbol=symbol,
+                            asset_class="option",
+                            strategy_key=strategy_key,
+                            contract_symbol=contract_symbol,
+                            direction="buy",
+                            score=safe_float(score, 0.0) or 0.0,
+                            spot_price=equity_price,
+                            entry_price=premium * OPTION_CONTRACT_MULTIPLIER if premium else None,
+                            rsi=indicator_features.get("rsi"),
+                            macd=indicator_features.get("macd"),
+                            volatility_20d=indicator_features.get("volatility_20d"),
+                            volume_rel_20d=indicator_features.get("volume_rel_20d"),
+                            sector_strength=None,
+                            market_trend=None,
+                            congress_score=None,
+                            news_sentiment=None,
+                        )
+                        place_guarded_paper_order(
+                            contract_symbol,
+                            qty,
+                            "buy",
+                            order_type="market",
+                            stop_loss_pct=stop_loss_pct,
+                            take_profit_pct=take_profit_pct,
+                            time_in_force="day",
+                            asset_class="option",
+                            price_hint=premium,
+                        )
+                        gross_notional += order_notional
+                        cash_balance = max(0.0, cash_balance - order_notional)
+                        cash_ratio = (cash_balance / equity) if equity else cash_ratio
+                        available_slots -= 1
+                        held_and_pending.add(contract_symbol)
+                        pending_underlyings.add(symbol)
+                        _remember_position_params(
+                            contract_symbol,
+                            asset_class="option",
+                            stop_loss_pct=stop_loss_pct,
+                            take_profit_pct=take_profit_pct,
+                            strategy=strategy_key,
+                            opened_at=now,
+                        )
+                        summary_lines.append(
+                            f"Buy {qty} {contract_symbol} (score {score:.2f}, premium ${premium:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
+                        )
+                        orders_placed += 1
+                        entries_placed += 1
+                        gross_option_notional += order_notional
+                        options_budget_remaining = max(
+                            0.0, options_budget_limit - gross_option_notional
+                        )
+                        log_candidate_outcome(
+                            f"bullish entry placed via option ({decision_reason})"
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "Autopilot option entry failed for %s", contract_symbol
+                        )
+                        errors.append(f"buy {contract_symbol} failed: {exc}")
+                        if not candidate_logged:
+                            log_candidate_outcome(
+                                "bullish entry failed during order placement",
+                                "bullish",
+                            )
+                    continue
                 else:
                     try:
                         df = _autopilot_prepare_dataframe(symbol, lookback)
