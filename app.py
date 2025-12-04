@@ -115,6 +115,19 @@ VOL_RETURN_WINDOW = 10  # number of cycles to use for rolling volatility
 VOL_BASELINE_STD = 0.01  # target daily return std for scaling
 VOL_POSITION_SCALE_MIN = 0.6  # floor for position scale when volatility spikes
 VOL_POSITION_SCALE_MAX = 1.4  # ceiling for position scale when volatility is calm
+BALANCED_GROWTH_CONFIG = {
+    "max_equity_position_pct": 0.10,
+    "max_options_notional_pct": 0.03,
+    "max_total_options_pct": 0.25,
+    "target_num_equity_positions": 10,
+    "equity_trend_lookback": 50,
+    "equity_min_relative_strength": 0.0,
+    "equity_stop_loss_pct": 0.12,
+    "equity_trailing_stop_pct": 0.15,
+    "option_max_loss_pct": 0.50,
+    "option_min_dte": 20,
+    "option_max_dte": 90,
+}
 AI_LOG_PATH = Path("data/ai_training_log.csv")
 AI_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 AI_LOG_COLUMNS = [
@@ -1161,6 +1174,142 @@ def score_stock(df: pd.DataFrame) -> tuple[float, list[str]]:
     return round(float(score), 2), reasons
 
 
+def score_equity_growth(symbol: str, df: pd.DataFrame, *, benchmark: pd.DataFrame | None = None) -> tuple[float, list[str]]:
+    """Growth-oriented equity score emphasizing trend, RS, and sane volatility."""
+
+    reasons: list[str] = []
+    if df is None or df.empty or "Close" not in df.columns:
+        return 0.0, ["insufficient data"]
+    df_local = df.copy()
+    lookback = max(10, int(BALANCED_GROWTH_CONFIG.get("equity_trend_lookback", 50)))
+    df_local["ma_trend"] = df_local["Close"].rolling(lookback).mean()
+    price = safe_float(df_local["Close"].iloc[-1], None)
+    ma = safe_float(df_local["ma_trend"].iloc[-1], None)
+    score = 0.0
+
+    if price and ma and price > ma:
+        score += 2.0
+        reasons.append("above trend")
+    else:
+        reasons.append("below trend")
+
+    if len(df_local) > lookback + 5 and ma:
+        prev_ma = safe_float(df_local["ma_trend"].iloc[-5], None)
+        if prev_ma and ma > prev_ma:
+            score += 1.0
+            reasons.append("trend rising")
+        else:
+            reasons.append("trend flat/declining")
+
+    rs_contrib = 0.0
+    if benchmark is not None and not benchmark.empty and "Close" in benchmark.columns:
+        try:
+            span = min(len(df_local), 90)
+            rs_window = min(span, 60)
+            sym_ret = df_local["Close"].pct_change(rs_window).iloc[-1]
+            bench_ret = benchmark["Close"].pct_change(rs_window).iloc[-1]
+            rel = sym_ret - bench_ret
+            if rel > BALANCED_GROWTH_CONFIG.get("equity_min_relative_strength", 0.0):
+                score += 1.0
+                reasons.append(f"rs positive {rel:.2%}")
+            else:
+                reasons.append(f"rs weak {rel:.2%}")
+            rs_contrib = rel * 10
+        except Exception:
+            reasons.append("rs unavailable")
+    score += rs_contrib
+
+    if len(df_local) >= 30:
+        vol30 = df_local["Close"].pct_change().rolling(30).std().iloc[-1]
+        if vol30 and vol30 > 0.07:
+            score -= 2.0
+            reasons.append("volatility high")
+        else:
+            reasons.append("volatility acceptable")
+
+    vol_col = "Volume" if "Volume" in df_local.columns else ("volume" if "volume" in df_local.columns else None)
+    if vol_col and len(df_local) >= 20:
+        try:
+            vol_rel = df_local[vol_col].iloc[-1] / df_local[vol_col].rolling(20).mean().iloc[-1]
+            if vol_rel < 0.8:
+                score -= 0.5
+                reasons.append("volume light")
+            else:
+                reasons.append("volume healthy")
+        except Exception:
+            reasons.append("volume check failed")
+
+    return round(float(score), 2), reasons
+
+
+def score_equity_growth(symbol: str, df: pd.DataFrame, *, benchmark: pd.DataFrame | None = None) -> tuple[float, list[str]]:
+    """Growth-oriented equity score emphasizing trend, RS, and sane volatility."""
+
+    reasons: list[str] = []
+    if df is None or df.empty or "Close" not in df.columns:
+        return 0.0, ["insufficient data"]
+    df_local = df.copy()
+    lookback = max(10, int(BALANCED_GROWTH_CONFIG.get("equity_trend_lookback", 50)))
+    df_local["ma_trend"] = df_local["Close"].rolling(lookback).mean()
+    price = safe_float(df_local["Close"].iloc[-1], None)
+    ma = safe_float(df_local["ma_trend"].iloc[-1], None)
+    score = 0.0
+
+    if price and ma and price > ma:
+        score += 2.0
+        reasons.append("above trend")
+    else:
+        reasons.append("below trend")
+
+    if len(df_local) > lookback + 5 and ma:
+        prev_ma = safe_float(df_local["ma_trend"].iloc[-5], None)
+        if prev_ma and ma > prev_ma:
+            score += 1.0
+            reasons.append("trend rising")
+        else:
+            reasons.append("trend flat/declining")
+
+    rs_contrib = 0.0
+    if benchmark is not None and not benchmark.empty and "Close" in benchmark.columns:
+        try:
+            span = min(len(df_local), 90)
+            rs_window = min(span, 60)
+            sym_ret = df_local["Close"].pct_change(rs_window).iloc[-1]
+            bench_ret = benchmark["Close"].pct_change(rs_window).iloc[-1]
+            rel = sym_ret - bench_ret
+            if rel > BALANCED_GROWTH_CONFIG.get("equity_min_relative_strength", 0.0):
+                score += 1.0
+                reasons.append(f"rs positive {rel:.2%}")
+            else:
+                reasons.append(f"rs weak {rel:.2%}")
+            rs_contrib = rel * 10
+        except Exception:
+            reasons.append("rs unavailable")
+    score += rs_contrib
+
+    if len(df_local) >= 30:
+        vol30 = df_local["Close"].pct_change().rolling(30).std().iloc[-1]
+        if vol30 and vol30 > 0.07:
+            score -= 2.0
+            reasons.append("volatility high")
+        else:
+            reasons.append("volatility acceptable")
+
+    vol_col = "Volume" if "Volume" in df_local.columns else ("volume" if "volume" in df_local.columns else None)
+    if vol_col and len(df_local) >= 20:
+        try:
+            vol_rel = df_local[vol_col].iloc[-1] / df_local[vol_col].rolling(20).mean().iloc[-1]
+            if vol_rel < 0.8:
+                score -= 0.5
+                reasons.append("volume light")
+            else:
+                reasons.append("volume healthy")
+        except Exception:
+            reasons.append("volume check failed")
+
+    return round(float(score), 2), reasons
+
+
 def score_bearish(df: pd.DataFrame) -> tuple[float, list[str]]:
     """Return a bearish bias score using the same core indicators."""
 
@@ -1975,6 +2124,7 @@ def _remember_position_params(
     take_profit_pct: float | None,
     strategy: str,
     opened_at: datetime | None = None,
+    highest_price: float | None = None,
 ) -> None:
     """Store stop/take parameters for a position so exits use entry-time values."""
 
@@ -1988,6 +2138,8 @@ def _remember_position_params(
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "opened_at": (opened_at or datetime.now(timezone.utc)).isoformat(),
     }
+    if highest_price is not None:
+        payload["highest_price"] = highest_price
     with _autopilot_lock:
         _autopilot_position_params[symbol.upper()] = payload
     _persist_autopilot_state()
@@ -2387,6 +2539,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     gross_equity_notional += market_value
 
             _prune_pyramid_counts(active_symbols)
+            options_budget_limit = equity * BALANCED_GROWTH_CONFIG["max_total_options_pct"] if equity else 0.0
+            options_budget_remaining = max(0.0, options_budget_limit - gross_option_notional)
 
             pending_order_symbols = {
                 str(o.get("symbol", "")).replace(" ", "").upper()
@@ -2461,6 +2615,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 "exit_score", hybrid.get("min_bullish_score", 3.0) - 1.0
             )
             lookback = hybrid.get("lookback", "1y")
+            benchmark_df = _autopilot_prepare_dataframe("SPY", lookback)
 
             max_positions = max(1, int(profile.max_open_positions))
             current_positions_equity = held_positions["equity"]
@@ -2474,10 +2629,15 @@ def run_autopilot_cycle(force: bool = False) -> None:
             current_positions.update(current_positions_equity)
             current_positions.update(current_positions_option)
             available_slots = max(0, max_positions - len(current_positions))
+            current_equity_positions = len(current_positions_equity)
 
             option_profit_default = safe_float(hybrid.get("option_take_profit_pct"), 0.8)
             option_stop_default = abs(
                 safe_float(hybrid.get("option_stop_loss_pct"), 0.45) * stop_loss_multiplier
+            )
+            option_stop_default = min(
+                option_stop_default,
+                BALANCED_GROWTH_CONFIG.get("option_max_loss_pct", option_stop_default),
             )
             option_profit_default = (
                 option_profit_default * take_profit_multiplier if option_profit_default is not None else None
@@ -2514,7 +2674,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         continue
                     pos = entry.get("position")
                     qty = int(abs(entry.get("qty", 0)))
-                    available_qty = max(qty, _option_position_quantity(pos))
+                    available_qty = _option_position_quantity(pos)
                     if available_qty <= 0:
                         refreshed = _find_option_position(contract_symbol, positions)
                         if not refreshed:
@@ -2536,9 +2696,9 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             available_qty = _option_position_quantity(refreshed)
                             entry["qty"] = available_qty
                     if available_qty <= 0:
-                        logger.warning("Skip exit for %s: no matching position found", contract_symbol)
+                        logger.info("No open quantity for %s; skipping option close.", contract_symbol)
                         summary_lines.append(
-                            f"Skip exit for {contract_symbol}; no matching position found."
+                            f"No open quantity for {contract_symbol}; skipping exit."
                         )
                         continue
                     if qty <= 0:
@@ -2548,6 +2708,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             "Clamping exit qty for %s to %d from %d", contract_symbol, available_qty, qty
                         )
                         qty = available_qty
+                    current_position_qty = available_qty
+                    exit_qty = min(current_position_qty, qty)
+                    if current_position_qty <= 0 or exit_qty <= 0:
+                        logger.info("No open quantity for %s; skipping option close.", contract_symbol)
+                        summary_lines.append(f"No open quantity for {contract_symbol}; skipping exit.")
+                        continue
+                    qty = exit_qty
                     pos = entry.get("position") or {}
                     parsed = entry.get("meta") or parse_option_symbol(contract_symbol)
                     underlying = parsed.get("underlying") if parsed else None
@@ -2710,12 +2877,19 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                     _autopilot_stale_exits.add(contract_symbol)
                                     continue
                                 except AlpacaAPIError as delete_err:
-                                    logger.error(
-                                        "Hard delete for %s failed after uncovered rejection: %s (status=%s)",
-                                        contract_symbol,
-                                        delete_err,
-                                        getattr(delete_err, "status_code", None),
-                                    )
+                                    msg_lower = str(getattr(delete_err, "api_message", "") or delete_err).lower()
+                                    if getattr(delete_err, "status_code", None) == 422 or "options market orders are only allowed during market hours" in msg_lower:
+                                        logger.warning(
+                                            "Hard delete for %s failed due to market hours; leaving zombie flag in place.",
+                                            contract_symbol,
+                                        )
+                                    else:
+                                        logger.error(
+                                            "Hard delete for %s failed after uncovered rejection: %s (status=%s)",
+                                            contract_symbol,
+                                            delete_err,
+                                            getattr(delete_err, "status_code", None),
+                                        )
                             else:
                                 logger.warning(
                                     "Zombie delete for %s skipped because ENABLE_ZOMBIE_DELETE is False",
@@ -2764,12 +2938,19 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 _autopilot_stale_exits.add(contract_symbol)
                                 continue
                             except AlpacaAPIError as delete_err:
-                                logger.error(
-                                    "Hard delete for %s failed after close rejection: %s (status=%s)",
-                                    contract_symbol,
-                                    delete_err,
-                                    getattr(delete_err, "status_code", None),
-                                )
+                                msg_lower = str(getattr(delete_err, "api_message", "") or delete_err).lower()
+                                if getattr(delete_err, "status_code", None) == 422 or "options market orders are only allowed during market hours" in msg_lower:
+                                    logger.warning(
+                                        "Hard delete for %s failed due to market hours; leaving zombie flag in place.",
+                                        contract_symbol,
+                                    )
+                                else:
+                                    logger.error(
+                                        "Hard delete for %s failed after close rejection: %s (status=%s)",
+                                        contract_symbol,
+                                        delete_err,
+                                        getattr(delete_err, "status_code", None),
+                                    )
                         else:
                             logger.warning(
                                 "Zombie delete for %s skipped because ENABLE_ZOMBIE_DELETE is False",
@@ -2832,12 +3013,19 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                     _autopilot_stale_exits.add(contract_symbol)
                                     continue
                                 except AlpacaAPIError as delete_err:
-                                    logger.error(
-                                        "Hard delete for %s failed: %s (status=%s)",
-                                        contract_symbol,
-                                        delete_err,
-                                        getattr(delete_err, "status_code", None),
-                                    )
+                                    msg_lower = str(getattr(delete_err, "api_message", "") or delete_err).lower()
+                                    if getattr(delete_err, "status_code", None) == 422 or "options market orders are only allowed during market hours" in msg_lower:
+                                        logger.warning(
+                                            "Hard delete for %s failed due to market hours; leaving zombie flag in place.",
+                                            contract_symbol,
+                                        )
+                                    else:
+                                        logger.error(
+                                            "Hard delete for %s failed: %s (status=%s)",
+                                            contract_symbol,
+                                            delete_err,
+                                            getattr(delete_err, "status_code", None),
+                                        )
                             else:
                                 logger.warning(
                                     "Zombie delete for %s skipped because ENABLE_ZOMBIE_DELETE is False",
@@ -2919,6 +3107,14 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 if qty_int <= 0:
                     continue
                 position_params = _autopilot_position_params.get(symbol.upper(), {})
+                highest_price = safe_float(position_params.get("highest_price"), None)
+                current_price_equity = _position_price(pos, "equity")
+                if current_price_equity and (highest_price is None or current_price_equity > highest_price):
+                    highest_price = current_price_equity
+                    position_params["highest_price"] = highest_price
+                    with _autopilot_lock:
+                        _autopilot_position_params[symbol.upper()] = position_params
+                    _persist_autopilot_state()
                 plpc = _position_unrealized_plpc(pos)
                 opened_at = None
                 opened_raw = position_params.get("opened_at") if isinstance(position_params, dict) else None
@@ -2927,12 +3123,56 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         opened_at = datetime.fromisoformat(str(opened_raw))
                     except Exception:
                         opened_at = None
+                # Growth stops
+                hard_stop_pct = BALANCED_GROWTH_CONFIG.get("equity_stop_loss_pct", 0.12)
+                trail_stop_pct = BALANCED_GROWTH_CONFIG.get("equity_trailing_stop_pct", 0.15)
+                hard_stop_reason = None
+                if current_price_equity and avg_entry_price and hard_stop_pct:
+                    stop_price = avg_entry_price * (1 - hard_stop_pct)
+                    if current_price_equity <= stop_price:
+                        hard_stop_reason = f"equity_hard_stop {current_price_equity:.2f} <= {stop_price:.2f}"
+                trail_stop_reason = None
+                if current_price_equity and highest_price and trail_stop_pct:
+                    trail_price = highest_price * (1 - trail_stop_pct)
+                    if current_price_equity <= trail_price:
+                        trail_stop_reason = f"equity_trailing_stop {current_price_equity:.2f} <= {trail_price:.2f}"
                 aggressive_exit_reason: str | None = None
                 if profile.name == "high" and plpc is not None:
                     if plpc <= profile.loser_cut_threshold_plpc:
                         aggressive_exit_reason = f"loss {plpc*100:.1f}% beyond aggressive stop"
                     elif opened_at and abs(plpc) < 0.01 and (now - opened_at) > timedelta(days=4):
                         aggressive_exit_reason = "stagnant trade freeing capital"
+                stop_reason = hard_stop_reason or trail_stop_reason
+                if stop_reason:
+                    if _autopilot_order_blocked(symbol, open_orders):
+                        summary_lines.append(
+                            f"Exit pending for {symbol}; open order detected."
+                        )
+                        continue
+                    qty_int = int(math.floor(qty))
+                    if qty_int > 0:
+                        try:
+                            place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                            summary_lines.append(
+                                f"Exit {qty_int} {symbol} ({stop_reason})"
+                            )
+                            orders_placed += 1
+                            continue
+                        except AlpacaAPIError as exc:
+                            message = (getattr(exc, "api_message", "") or str(exc)).lower()
+                            if exc.status_code == 403 and "insufficient qty available for order" in message:
+                                logger.warning(
+                                    "Skip equity exit for %s: Alpaca insufficient qty (%s)", symbol, exc
+                                )
+                                summary_lines.append(
+                                    f"Skip exit for {symbol}; insufficient qty (stale position)."
+                                )
+                                continue
+                            logger.exception("Autopilot equity exit failed for %s", symbol)
+                            errors.append(f"sell {symbol} failed: {exc}")
+                        except Exception as exc:
+                            logger.exception("Autopilot equity exit failed for %s", symbol)
+                            errors.append(f"sell {symbol} failed: {exc}")
                 if aggressive_exit_reason:
                     if _autopilot_order_blocked(symbol, open_orders):
                         summary_lines.append(
@@ -3222,6 +3462,14 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 selection: OptionSelection | None = None
                 selection_diag: dict[str, Any] = {}
                 put_choice: dict[str, Any] | None = None
+                equity_growth_score: float | None = None
+                option_score: float | None = None
+                indicator_features: dict[str, Any] = {
+                    "rsi": None,
+                    "macd": None,
+                    "volatility_20d": None,
+                    "volume_rel_20d": None,
+                }
                 consider_option = bias == "bearish" or hybrid.get("option_bias") != "rare" or score >= (min_required + 0.5)
 
                 if bias == "bearish":
@@ -3253,6 +3501,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             selection_diag = selection.diagnostics or {}
                             option_available = bool(selection.contract and selection.premium and selection.premium > 0)
+                            option_score = safe_float(selection.premium, None)
                         except PriceDataError as exc:
                             errors.append(f"options {symbol} chain failed: {exc}")
                             log_candidate_outcome(
@@ -3261,14 +3510,39 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             continue
 
-                decision, decision_reason = choose_instrument_for_candidate(
-                    bias=bias,
-                    hybrid_params=hybrid,
-                    has_option=option_available,
-                    score=safe_float(score, 0.0),
-                    min_score=min_required,
-                    equity_price=equity_price,
-                )
+                # Instrument decision: equity by default, options only if clearly superior and budget allows
+                decision = "stock"
+                decision_reason = "default equity path"
+                equity_score_val = equity_growth_score if equity_growth_score is not None else safe_float(score, 0.0)
+                option_score_val = option_score if option_score is not None else safe_float(score, 0.0)
+                equity_threshold = max(min_required, 3.0)
+                if bias == "bearish":
+                    # bear path still uses existing logic (puts preferred); equity shorts remain rare
+                    decision, decision_reason = choose_instrument_for_candidate(
+                        bias=bias,
+                        hybrid_params=hybrid,
+                        has_option=option_available,
+                        score=safe_float(score, 0.0),
+                        min_score=min_required,
+                        equity_price=equity_price,
+                    )
+                else:
+                    if option_available:
+                        if (
+                            equity_score_val is not None
+                            and option_score_val is not None
+                            and option_score_val >= equity_score_val + 1.0
+                            and options_budget_remaining > 0
+                        ):
+                            decision = "option"
+                            decision_reason = "option score materially better and within options budget"
+                    if decision != "option":
+                        if equity_score_val is None or equity_score_val < equity_threshold:
+                            decision = "skip"
+                            decision_reason = f"equity score {equity_score_val} below threshold {equity_threshold}"
+                        else:
+                            decision = "stock"
+                            decision_reason = "equity favored for growth profile"
 
                 if decision == "skip":
                     log_candidate_outcome(
@@ -3277,6 +3551,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     )
                     continue
 
+                mid_price: float | None = None
                 if decision == "option":
                     if _option_on_cooldown(symbol, now):
                         summary_lines.append(
@@ -3322,7 +3597,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         mid_price = safe_float(put_choice.get("mid"), 0.0)
                         if mid_price <= 0 and bid and ask:
                             mid_price = (bid + ask) / 2.0
-                        if mid_price <= 0:
+                        if mid_price is None or mid_price <= 0:
                             summary_lines.append(
                                 f"Skip bearish {symbol}; invalid quote for {contract_symbol}."
                             )
@@ -3343,8 +3618,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
                         )
                         if mid_price > 0 and equity > 0:
-                            scaled_fraction = MAX_OPTION_NOTIONAL_FRACTION * vol_position_scale
+                            scaled_fraction = BALANCED_GROWTH_CONFIG["max_options_notional_pct"] * vol_position_scale
                             max_notional = equity * scaled_fraction
+                            if options_budget_remaining:
+                                max_notional = min(max_notional, options_budget_remaining)
                             cap_qty = max(1, int(math.floor(max_notional / mid_price)))
                             cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
                             qty = cap_qty if qty <= 0 else min(qty, cap_qty)
@@ -3390,74 +3667,87 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             logger.debug("Indicator prep failed for %s during option log", symbol, exc_info=True)
                             indicator_df = None
                         indicator_features = _extract_indicator_features(indicator_df)
-                        try:
-                            logger.info(
-                                "Placing bearish order: symbol=%s asset_class=option qty=%s side=buy",
-                                contract_symbol,
-                                qty,
-                            )
-                            log_ai_snapshot(
-                                symbol=symbol,
-                                asset_class="option",
-                                strategy_key=strategy_key,
-                                contract_symbol=contract_symbol,
-                                direction="buy",
-                                score=safe_float(score, 0.0) or 0.0,
-                                spot_price=equity_price,
-                                entry_price=mid_price * OPTION_CONTRACT_MULTIPLIER if mid_price else None,
-                                rsi=indicator_features.get("rsi"),
-                                macd=indicator_features.get("macd"),
-                                volatility_20d=indicator_features.get("volatility_20d"),
-                                volume_rel_20d=indicator_features.get("volume_rel_20d"),
-                                sector_strength=None,
-                                market_trend=None,
-                                congress_score=None,
-                                news_sentiment=None,
-                            )
-                            place_guarded_paper_order(
-                                contract_symbol,
-                                qty,
-                                "buy",
-                                order_type="limit",
-                                limit_price=round(mid_price, 2),
-                                stop_loss_pct=stop_loss_pct,
-                                take_profit_pct=take_profit_pct,
-                                time_in_force="day",
-                                asset_class="option",
-                                price_hint=mid_price,
-                                support_brackets=False,
-                                position_effect="open",
-                            )
-                            gross_notional += order_notional
-                            cash_balance = max(0.0, cash_balance - order_notional)
-                            cash_ratio = (cash_balance / equity) if equity else cash_ratio
-                            available_slots -= 1
-                            held_and_pending.add(contract_symbol)
-                            pending_underlyings.add(symbol)
-                            _remember_position_params(
-                                contract_symbol,
-                                asset_class="option",
-                                stop_loss_pct=stop_loss_pct,
-                                take_profit_pct=take_profit_pct,
-                                strategy=strategy_key,
-                                opened_at=now,
-                            )
-                            summary_lines.append(
-                                f"Buy {qty} {contract_symbol} ({symbol} put {put_choice.get('strike', 0):.2f} exp {put_choice.get('expiration')}, limit ${mid_price:.2f})"
-                            )
-                            orders_placed += 1
-                            entries_placed += 1
+                    if mid_price is None or mid_price <= 0:
+                        summary_lines.append(
+                            f"Skip bearish {symbol}; invalid quote for {contract_symbol}."
+                        )
+                        log_candidate_outcome(
+                            "bearish entry blocked, invalid option quote",
+                            "none",
+                        )
+                        continue
+                    try:
+                        logger.info(
+                            "Placing bearish order: symbol=%s asset_class=option qty=%s side=buy",
+                            contract_symbol,
+                            qty,
+                        )
+                        log_ai_snapshot(
+                            symbol=symbol,
+                            asset_class="option",
+                            strategy_key=strategy_key,
+                            contract_symbol=contract_symbol,
+                            direction="buy",
+                            score=safe_float(score, 0.0) or 0.0,
+                            spot_price=equity_price,
+                            entry_price=mid_price * OPTION_CONTRACT_MULTIPLIER if mid_price else None,
+                            rsi=indicator_features.get("rsi"),
+                            macd=indicator_features.get("macd"),
+                            volatility_20d=indicator_features.get("volatility_20d"),
+                            volume_rel_20d=indicator_features.get("volume_rel_20d"),
+                            sector_strength=None,
+                            market_trend=None,
+                            congress_score=None,
+                            news_sentiment=None,
+                        )
+                        place_guarded_paper_order(
+                            contract_symbol,
+                            qty,
+                            "buy",
+                            order_type="limit",
+                            limit_price=round(mid_price, 2),
+                            stop_loss_pct=stop_loss_pct,
+                            take_profit_pct=take_profit_pct,
+                            time_in_force="day",
+                            asset_class="option",
+                            price_hint=mid_price,
+                            support_brackets=False,
+                            position_effect="open",
+                        )
+                        gross_notional += order_notional
+                        cash_balance = max(0.0, cash_balance - order_notional)
+                        cash_ratio = (cash_balance / equity) if equity else cash_ratio
+                        available_slots -= 1
+                        held_and_pending.add(contract_symbol)
+                        pending_underlyings.add(symbol)
+                        _remember_position_params(
+                            contract_symbol,
+                            asset_class="option",
+                            stop_loss_pct=stop_loss_pct,
+                            take_profit_pct=take_profit_pct,
+                            strategy=strategy_key,
+                            opened_at=now,
+                        )
+                        summary_lines.append(
+                            f"Buy {qty} {contract_symbol} ({symbol} put {put_choice.get('strike', 0):.2f} exp {put_choice.get('expiration')}, limit ${mid_price:.2f})"
+                        )
+                        orders_placed += 1
+                        entries_placed += 1
+                        gross_option_notional += order_notional
+                        options_budget_remaining = max(
+                            0.0, options_budget_limit - gross_option_notional
+                        )
+                        log_candidate_outcome(
+                            f"bearish entry placed via option ({decision_reason})"
+                        )
+                    except Exception as exc:
+                        logger.exception("Autopilot put entry failed for %s", contract_symbol)
+                        errors.append(f"buy {contract_symbol} failed: {exc}")
+                        if not candidate_logged:
                             log_candidate_outcome(
-                                f"bearish entry placed via option ({decision_reason})"
+                                "bearish entry failed during order placement",
+                                "bearish",
                             )
-                        except Exception as exc:
-                            logger.exception("Autopilot put entry failed for %s", contract_symbol)
-                            errors.append(f"buy {contract_symbol} failed: {exc}")
-                            if not candidate_logged:
-                                log_candidate_outcome(
-                                    "bearish entry failed during order placement",
-                                    "bearish",
-                                )
                     else:
                         if not selection:
                             log_candidate_outcome(
@@ -3577,8 +3867,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
                         )
                         if premium > 0 and equity > 0:
-                            scaled_fraction = MAX_OPTION_NOTIONAL_FRACTION * vol_position_scale
+                            scaled_fraction = BALANCED_GROWTH_CONFIG["max_options_notional_pct"] * vol_position_scale
                             max_notional = equity * scaled_fraction
+                            if options_budget_remaining:
+                                max_notional = min(max_notional, options_budget_remaining)
                             cap_qty = max(1, int(math.floor(max_notional / premium)))
                             cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
                             qty = cap_qty if qty <= 0 else min(qty, cap_qty)
@@ -3677,6 +3969,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             )
                             orders_placed += 1
                             entries_placed += 1
+                            gross_option_notional += order_notional
+                            options_budget_remaining = max(
+                                0.0, options_budget_limit - gross_option_notional
+                            )
                             log_candidate_outcome(
                                 f"bullish entry placed via option ({decision_reason})"
                             )
@@ -3705,6 +4001,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         log_candidate_outcome("bullish entry blocked, no price history", "none")
                         continue
                     recalced_score, _ = score_stock(df)
+                    try:
+                        equity_growth_score, _ = score_equity_growth(symbol, df, benchmark=benchmark_df)
+                    except Exception:
+                        equity_growth_score = None
                     if recalced_score < min_entry_score:
                         log_candidate_outcome(
                             f"no entry, refreshed score {recalced_score:.2f} below min {min_entry_score:.2f}",
@@ -3730,10 +4030,17 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         position_multiplier=position_multiplier,
                         min_entry_notional=min_entry_notional,
                     )
-                    if PAPER_MAX_POSITION_NOTIONAL:
-                        target_notional = min(target_notional, PAPER_MAX_POSITION_NOTIONAL)
-                        if price > 0:
-                            qty = max(int(target_notional // price), qty)
+                    if equity > 0 and price > 0:
+                        max_equity_dollar = equity * BALANCED_GROWTH_CONFIG["max_equity_position_pct"]
+                        # Nudge sizing toward target number of positions
+                        if current_equity_positions >= BALANCED_GROWTH_CONFIG["target_num_equity_positions"]:
+                            max_equity_dollar *= 0.8
+                        shares_cap = max(1, int(math.floor(max_equity_dollar / price)))
+                        qty = min(qty, shares_cap) if qty > 0 else shares_cap
+                    if PAPER_MAX_POSITION_NOTIONAL and price > 0:
+                        paper_cap = int(PAPER_MAX_POSITION_NOTIONAL // price)
+                        if paper_cap > 0:
+                            qty = min(qty, paper_cap)
                     if gross_notional + (qty * price) > equity * max_total_allocation:
                         if not allocation_warning_logged:
                             summary_lines.append(
@@ -3756,9 +4063,10 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         continue
                     try:
                         logger.info(
-                            "Placing bullish order: symbol=%s asset_class=stock qty=%s side=buy",
+                            "Placing bullish order: symbol=%s asset_class=stock qty=%s side=buy growth_score=%s",
                             symbol,
                             qty,
+                            equity_growth_score,
                         )
                         log_ai_snapshot(
                             symbol=symbol,
@@ -3799,6 +4107,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             take_profit_pct=take_profit_pct,
                             strategy=strategy_key,
                             opened_at=now,
+                            highest_price=price,
                         )
                         summary_lines.append(
                             f"Buy {qty} {symbol} (score {score:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
