@@ -28,8 +28,8 @@ MIN_OPTION_BID = 0.15  # minimum bid required
 MAX_OPTION_SPREAD_PCT = 0.70  # allow slightly wider spreads while avoiding illiquidity
 MIN_OPTION_OI = 5  # modest open interest floor to avoid empty markets
 MIN_OPTION_VOLUME = 3  # modest volume floor to avoid empty markets
-MIN_OPTION_DTE = 7  # minimum days to expiration
-MAX_OPTION_DTE = 120  # maximum days to expiration
+MIN_OPTION_DTE = 20  # minimum days to expiration (aligned with growth profile)
+MAX_OPTION_DTE = 90  # maximum days to expiration (aligned with growth profile)
 
 
 def _safe_float(value):
@@ -607,12 +607,11 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
         contracts: list[dict],
         *,
         min_oi: float,
-        min_volume: float | None,
-        max_spread_factor: float,
-        max_spread_floor: float,
+        min_volume: float,
         min_price: float,
         min_dte: int,
         max_dte: int,
+        target_delta: float,
         track_rejections: bool = False,
     ) -> tuple[list[dict[str, object]], dict[str, int]]:
         nonlocal rejected_missing_quote, rejected_spread, rejected_open_interest, rejected_volume, rejected_mark_price, rejected_dte
@@ -689,9 +688,14 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                         rejected_mark_price += 1
                     continue
 
-                spread_limit = max(max_spread_floor, max_spread_factor * mark_price)
                 spread_abs = (ask - bid) if (ask is not None and bid is not None) else float("inf")
-                if spread_abs > spread_limit:
+                mid_val = (bid + ask) / 2.0 if bid and ask else mark_price
+                if mid_val is None or mid_val <= 0 or spread_abs <= 0:
+                    rejected_counts["spread"] += 1
+                    if track_rejections:
+                        rejected_spread += 1
+                    continue
+                if (spread_abs / mid_val > 0.05) and (spread_abs > 0.25):
                     rejected_counts["spread"] += 1
                     if track_rejections:
                         rejected_spread += 1
@@ -704,7 +708,7 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                     if track_rejections:
                         rejected_open_interest += 1
                     continue
-                if min_volume is not None and (volume is None or volume < min_volume):
+                if volume is None or volume < min_volume:
                     rejected_counts["volume"] += 1
                     if track_rejections:
                         rejected_volume += 1
@@ -714,11 +718,15 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                 if not option_symbol:
                     continue
 
-                mid = (bid + ask) / 2.0 if bid and ask else mark_price
                 delta_val = _safe_float(
                     contract.get("delta")
                     or (contract.get("greeks") or {}).get("delta")  # type: ignore[index]
                 )
+                if delta_val is not None:
+                    if target_delta > 0 and not (0.3 <= delta_val <= 0.7):
+                        continue
+                    if target_delta < 0 and not (-0.7 <= delta_val <= -0.3):
+                        continue
                 candidates_local.append(
                     {
                         "underlying": symbol.upper(),
@@ -728,12 +736,13 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
                         "bid": bid,
                         "ask": ask,
                         "last": _safe_float(contract.get("last_price") or contract.get("last_trade_price")),
-                        "mid": mid,
+                        "mid": mid_val,
                         "price": mark_price,
                         "days_out": days_out,
                         "spread_abs": spread_abs,
                         "delta": delta_val,
                         "open_interest": open_int,
+                        "volume": volume,
                     }
                 )
             except Exception:
@@ -743,35 +752,14 @@ def _choose_option_contract(symbol: str, now: datetime, option_type: str) -> Opt
     total = len(chain)
     candidates, rejected_counts = _filter_chain(
         chain,
-        min_oi=20,
-        min_volume=None,
-        max_spread_factor=0.50,
-        max_spread_floor=0.50,
+        min_oi=500,
+        min_volume=200,
         min_price=0.10,
-        min_dte=10,
-        max_dte=120,
+        min_dte=MIN_OPTION_DTE,
+        max_dte=MAX_OPTION_DTE,
+        target_delta=0.3 if kind == "call" else -0.3,
         track_rejections=True,
     )
-
-    if not candidates and total >= 20:
-        relaxed_candidates, _ = _filter_chain(
-            chain,
-            min_oi=5,
-            min_volume=None,
-            max_spread_factor=0.75,
-            max_spread_floor=0.75,
-            min_price=0.05,
-            min_dte=5,
-            max_dte=180,
-            track_rejections=False,
-        )
-        if relaxed_candidates:
-            logger.info(
-                "Option chain relaxed filters for %s: first pass 0 candidates, second pass %d candidates",
-                symbol.upper(),
-                len(relaxed_candidates),
-            )
-            candidates = relaxed_candidates
 
     rejected = total - len(candidates)
     logger.info(

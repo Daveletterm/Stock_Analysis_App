@@ -117,8 +117,8 @@ VOL_POSITION_SCALE_MIN = 0.6  # floor for position scale when volatility spikes
 VOL_POSITION_SCALE_MAX = 1.4  # ceiling for position scale when volatility is calm
 BALANCED_GROWTH_CONFIG = {
     "max_equity_position_pct": 0.10,
-    "max_options_notional_pct": 0.03,
-    "max_total_options_pct": 0.25,
+    "max_options_notional_pct": 0.01,
+    "max_total_options_pct": 0.10,
     "target_num_equity_positions": 10,
     "equity_trend_lookback": 50,
     "equity_min_relative_strength": 0.0,
@@ -3517,32 +3517,31 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 option_score_val = option_score if option_score is not None else safe_float(score, 0.0)
                 equity_threshold = max(min_required, 3.0)
                 if bias == "bearish":
-                    # bear path still uses existing logic (puts preferred); equity shorts remain rare
-                    decision, decision_reason = choose_instrument_for_candidate(
-                        bias=bias,
-                        hybrid_params=hybrid,
-                        has_option=option_available,
-                        score=safe_float(score, 0.0),
-                        min_score=min_required,
-                        equity_price=equity_price,
-                    )
+                    # Conservative bearish: only take options when available and budget allows, otherwise skip
+                    if option_available and options_budget_remaining > 0:
+                        decision = "option"
+                        decision_reason = "bearish put available within budget"
+                    else:
+                        decision = "skip"
+                        decision_reason = "bearish view but no suitable conservative options; skipping"
                 else:
-                    if option_available:
-                        if (
-                            equity_score_val is not None
-                            and option_score_val is not None
-                            and option_score_val >= equity_score_val + 1.0
-                            and options_budget_remaining > 0
-                        ):
-                            decision = "option"
-                            decision_reason = "option score materially better and within options budget"
-                    if decision != "option":
+                    if (
+                        option_available
+                        and equity_score_val is not None
+                        and equity_score_val >= equity_threshold
+                        and option_score_val is not None
+                        and option_score_val >= equity_score_val + 2.0
+                        and options_budget_remaining > 0
+                    ):
+                        decision = "option"
+                        decision_reason = "option path selected (score significantly higher and within options budget)"
+                    else:
                         if equity_score_val is None or equity_score_val < equity_threshold:
                             decision = "skip"
                             decision_reason = f"equity score {equity_score_val} below threshold {equity_threshold}"
                         else:
                             decision = "stock"
-                            decision_reason = "equity favored for growth profile"
+                            decision_reason = "equity favored for growth profile (options not clearly superior or budget limited)"
 
                 if decision == "skip":
                     log_candidate_outcome(
@@ -3619,11 +3618,19 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
                         )
                         if mid_price > 0 and equity > 0:
-                            scaled_fraction = BALANCED_GROWTH_CONFIG["max_options_notional_pct"] * vol_position_scale
-                            max_notional = equity * scaled_fraction
+                            max_option_notional = equity * BALANCED_GROWTH_CONFIG["max_options_notional_pct"]
                             if options_budget_remaining:
-                                max_notional = min(max_notional, options_budget_remaining)
-                            cap_qty = max(1, int(math.floor(max_notional / mid_price)))
+                                max_option_notional = min(max_option_notional, options_budget_remaining)
+                            cap_qty = int(max_option_notional // unit_cost) if unit_cost > 0 else 0
+                            if cap_qty <= 0:
+                                summary_lines.append(
+                                    "Option position too small under conservative risk cap"
+                                )
+                                log_candidate_outcome(
+                                    "option position too small under conservative risk cap",
+                                    "none",
+                                )
+                                continue
                             cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
                             qty = cap_qty if qty <= 0 else min(qty, cap_qty)
                         max_debit = safe_float(hybrid.get("max_position_debit"), None)
@@ -3637,6 +3644,16 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         if max_contracts:
                             qty = min(qty, max_contracts)
                         order_notional = qty * unit_cost
+                        total_options_after = gross_option_notional + order_notional
+                        if equity and total_options_after > equity * BALANCED_GROWTH_CONFIG["max_total_options_pct"]:
+                            summary_lines.append(
+                                "options budget exhausted under BalancedGrowth; skipping option entry"
+                            )
+                            log_candidate_outcome(
+                                "options budget exhausted under BalancedGrowth",
+                                "none",
+                            )
+                            break
                         if gross_notional + order_notional > equity * max_total_allocation:
                             if not allocation_warning_logged:
                                 summary_lines.append(
@@ -3861,11 +3878,20 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         contract_multiplier=OPTION_CONTRACT_MULTIPLIER,
                     )
                     if premium > 0 and equity > 0:
-                        scaled_fraction = BALANCED_GROWTH_CONFIG["max_options_notional_pct"] * vol_position_scale
-                        max_notional = equity * scaled_fraction
+                        unit_cost = premium * OPTION_CONTRACT_MULTIPLIER
+                        max_option_notional = equity * BALANCED_GROWTH_CONFIG["max_options_notional_pct"]
                         if options_budget_remaining:
-                            max_notional = min(max_notional, options_budget_remaining)
-                        cap_qty = max(1, int(math.floor(max_notional / premium)))
+                            max_option_notional = min(max_option_notional, options_budget_remaining)
+                        cap_qty = int(max_option_notional // unit_cost) if unit_cost > 0 else 0
+                        if cap_qty <= 0:
+                            summary_lines.append(
+                                "Option position too small under conservative risk cap"
+                            )
+                            log_candidate_outcome(
+                                "option position too small under conservative risk cap",
+                                "none",
+                            )
+                            continue
                         cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
                         qty = cap_qty if qty <= 0 else min(qty, cap_qty)
                     max_debit = safe_float(hybrid.get("max_position_debit"), None)
@@ -3880,6 +3906,16 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     if max_contracts:
                         qty = min(qty, max_contracts)
                     order_notional = qty * unit_cost
+                    total_options_after = gross_option_notional + order_notional
+                    if equity and total_options_after > equity * BALANCED_GROWTH_CONFIG["max_total_options_pct"]:
+                        summary_lines.append(
+                            "options budget exhausted under BalancedGrowth; skipping option entry"
+                        )
+                        log_candidate_outcome(
+                            "options budget exhausted under BalancedGrowth",
+                            "none",
+                        )
+                        break
                     if gross_notional + order_notional > equity * max_total_allocation:
                         if not allocation_warning_logged:
                             summary_lines.append(
