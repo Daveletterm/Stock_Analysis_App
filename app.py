@@ -3109,6 +3109,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 position_params = _autopilot_position_params.get(symbol.upper(), {})
                 highest_price = safe_float(position_params.get("highest_price"), None)
                 current_price_equity = _position_price(pos, "equity")
+                avg_entry_price = safe_float(pos.get("avg_entry_price"), None)
                 if current_price_equity and (highest_price is None or current_price_equity > highest_price):
                     highest_price = current_price_equity
                     position_params["highest_price"] = highest_price

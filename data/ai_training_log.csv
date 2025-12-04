@@ -217,3 +217,7 @@ timestamp,symbol,asset_class,strategy_key,contract_symbol,direction,score,spot_p
 2025-12-04T17:45:07.430764+00:00,CSCO,equity,hybrid_aggressive,,buy,5.5,77.615,77.615,,,0.016993566828757894,,,,,,enter,,
 2025-12-04T17:45:10.617193+00:00,HBAN,equity,hybrid_aggressive,,buy,5.5,17.13,17.13,,,0.014063001641384677,,,,,,enter,,
 2025-12-04T17:45:13.557872+00:00,WBD,equity,hybrid_aggressive,,buy,5.0,24.36,24.36,,,0.021407881600729026,,,,,,enter,,
+2025-12-04T18:05:22.327897+00:00,BAC,equity,hybrid_aggressive,,buy,5.5,54.51,54.51,,,0.011866347191295918,,,,,,enter,,
+2025-12-04T18:05:25.165720+00:00,CSCO,equity,hybrid_aggressive,,buy,5.5,77.44,77.44,,,0.01704152065199729,,,,,,enter,,
+2025-12-04T18:05:28.256985+00:00,HBAN,equity,hybrid_aggressive,,buy,5.5,17.145,17.145,,,0.01406070429933393,,,,,,enter,,
+2025-12-04T18:05:31.273991+00:00,WBD,equity,hybrid_aggressive,,buy,5.0,24.365,24.365,,,0.02140138886984337,,,,,,enter,,
