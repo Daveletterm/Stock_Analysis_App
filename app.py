@@ -18,6 +18,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Literal
 
 import requests
+try:
+    import yfinance as yf  # type: ignore
+except Exception:
+    yf = None  # type: ignore
 
 import pandas as pd
 try:
@@ -41,6 +45,7 @@ from paper_trading import (
     get_daily_account_snapshot,
     NoAvailableBidError,
     OptionCloseRejectedError,
+    is_regular_equity_trading_hours,
     option_pnl_percent,
 )
 from market_data import PriceDataError
@@ -4322,11 +4327,28 @@ def analyze_stock(ticker: str) -> dict:
     chart_data = chart_df[["Date", "Close", "RSI", "SMA_50", "SMA_200"]].to_dict(orient="records")
 
     latest_close = last_value(df["Close"])
+    prev_close = last_value(df["Close"].shift(1))
     latest_rsi = last_value(df["RSI"])
     latest_sma50 = last_value(df["SMA_50"])
     latest_sma200 = last_value(df["SMA_200"])
+    company_name = None
+    if yf is not None:
+        try:
+            info_fast = yf.Ticker(ticker).fast_info  # type: ignore[attr-defined]
+            company_name = getattr(info_fast, "long_name", None) or getattr(info_fast, "short_name", None)
+        except Exception:
+            company_name = None
+        if not company_name:
+            try:
+                info_full = yf.Ticker(ticker).info  # type: ignore[attr-defined]
+                if isinstance(info_full, dict):
+                    company_name = info_full.get("longName") or info_full.get("shortName")
+            except Exception:
+                company_name = None
 
     sentiment = fetch_news_sentiment(ticker) + fetch_reddit_sentiment(ticker)
+    if not company_name:
+        company_name = ""
     above_sma50 = (
         latest_close is not None
         and latest_sma50 is not None
@@ -4369,13 +4391,19 @@ def analyze_stock(ticker: str) -> dict:
 
     out = {
         "Symbol": ticker,
+        "Company": company_name,
         "Close": round(latest_close, 2) if latest_close is not None else None,
+        "PrevClose": round(prev_close, 2) if prev_close is not None else None,
+        "Change": round(latest_close - prev_close, 2) if latest_close is not None and prev_close is not None else None,
+        "ChangePct": round(((latest_close - prev_close) / prev_close) * 100, 2) if latest_close is not None and prev_close else None,
         "RSI": round(latest_rsi, 2) if latest_rsi is not None else None,
         "50-day MA": round(latest_sma50, 2) if latest_sma50 is not None else None,
         "200-day MA": round(latest_sma200, 2) if latest_sma200 is not None else None,
         "Recommendation": rec,
         "Analysis Summary": analysis_summary,
         "Chart Data": chart_data,
+        "Updated": datetime.now(timezone.utc).isoformat(),
+        "Market Status": "Market open" if is_regular_equity_trading_hours() else "Market closed",
     }
     logger.info("Analyze %s done: rows=%d chart_rows=%d", ticker, len(df), len(chart_data))
     return out

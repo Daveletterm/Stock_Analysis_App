@@ -243,49 +243,19 @@
       <section class="mb-5">
         <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
           <div>
-            <h2 class="h4 mb-0">Account &amp; Positions Charts</h2>
-            <p class="text-muted small mb-0">Quick visuals of your paper account without exporting or uploads.</p>
+            <h2 class="h4 mb-0">Your portfolio</h2>
+            <p class="text-muted small mb-0">Intraday equity performance.</p>
           </div>
         </div>
 
-        {% if dashboard_charts %}
-          {% if dashboard_charts.allocation %}
-            <div class="card mb-3">
-              <div class="card-header">Allocation</div>
-              <div class="card-body">
-                {{ dashboard_charts.allocation|safe }}
-              </div>
+        {% if dashboard_charts and dashboard_charts.todays_pl %}
+          <div class="card mb-3">
+            <div class="card-body">
+              {{ dashboard_charts.todays_pl|safe }}
             </div>
-          {% endif %}
-
-          {% if dashboard_charts.todays_pl %}
-            <div class="card mb-3">
-              <div class="card-header">Equity (intraday)</div>
-              <div class="card-body">
-                {{ dashboard_charts.todays_pl|safe }}
-              </div>
-            </div>
-          {% endif %}
-
-          {% if dashboard_charts.positions_value %}
-            <div class="card mb-3">
-              <div class="card-header">Market value by position</div>
-              <div class="card-body">
-                {{ dashboard_charts.positions_value|safe }}
-              </div>
-            </div>
-          {% endif %}
-
-          {% if dashboard_charts.unrealized_positions %}
-            <div class="card mb-3">
-              <div class="card-header">Unrealized P&amp;L</div>
-              <div class="card-body">
-                {{ dashboard_charts.unrealized_positions|safe }}
-              </div>
-            </div>
-          {% endif %}
+          </div>
         {% else %}
-          <p class="text-muted small mt-2">Charts unavailable (missing data or plotly). Install plotly and ensure account data is available.</p>
+          <p class="text-muted small mt-2">Equity chart unavailable (missing data or plotly).</p>
         {% endif %}
       </section>
 
