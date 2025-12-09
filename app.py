@@ -51,6 +51,15 @@ from paper_trading import (
 from market_data import PriceDataError
 from market_data import choose_put_contract, fetch_option_contracts
 from market_data import get_price_history as load_price_history
+from fill_ai_training_outcomes import run_fill_outcomes
+try:
+    from train_xgboost import run_training
+except ImportError as exc:
+    logger.warning("XGBoost training unavailable; install dependencies to enable (sklearn/xgboost). Error: %s", exc)
+
+    def run_training(*args, **kwargs):
+        logger.warning("run_training skipped: XGBoost dependencies missing. Skipping this training cycle.")
+        return {"status": "unavailable", "error": str(exc)}
 
 load_dotenv()
 
@@ -1367,6 +1376,7 @@ def place_guarded_paper_order(
     price_hint: float | None = None,
     support_brackets: bool = True,
     position_effect: str | None = None,
+    force_liquidation: bool = False,
 ):
     if not paper_broker.enabled:
         raise RuntimeError("Paper trading credentials are not configured")
@@ -1402,17 +1412,32 @@ def place_guarded_paper_order(
     equity = float(account.get("equity") or account.get("cash") or 0.0)
     buying_power = float(account.get("buying_power") or account.get("cash") or 0.0)
 
-    if PAPER_MAX_POSITION_NOTIONAL and notional > PAPER_MAX_POSITION_NOTIONAL:
-        raise ValueError(
-            f"Order notional ${notional:,.2f} exceeds max allowed ${PAPER_MAX_POSITION_NOTIONAL:,.2f}"
+    if not force_liquidation:
+        if PAPER_MAX_POSITION_NOTIONAL and notional > PAPER_MAX_POSITION_NOTIONAL:
+            raise ValueError(
+                f"Order notional ${notional:,.2f} exceeds max allowed ${PAPER_MAX_POSITION_NOTIONAL:,.2f}"
+            )
+        if PAPER_MAX_POSITION_PCT and equity > 0 and notional > equity * PAPER_MAX_POSITION_PCT:
+            allowed = equity * PAPER_MAX_POSITION_PCT
+            raise ValueError(
+                f"Order notional ${notional:,.2f} exceeds {PAPER_MAX_POSITION_PCT*100:.1f}% of equity (${allowed:,.2f})"
+            )
+        if side == "buy" and buying_power and notional > buying_power:
+            raise ValueError("Not enough buying power for this order")
+    else:
+        logger.info(
+            "Force liquidation enabled; bypassing notional/buying power caps for %s %s (notional=%s)",
+            side,
+            symbol,
+            f"${notional:,.2f}",
         )
-    if PAPER_MAX_POSITION_PCT and equity > 0 and notional > equity * PAPER_MAX_POSITION_PCT:
-        allowed = equity * PAPER_MAX_POSITION_PCT
-        raise ValueError(
-            f"Order notional ${notional:,.2f} exceeds {PAPER_MAX_POSITION_PCT*100:.1f}% of equity (${allowed:,.2f})"
-        )
-    if side == "buy" and buying_power and notional > buying_power:
-        raise ValueError("Not enough buying power for this order")
+        market_open = is_regular_equity_trading_hours() if not is_option else True
+        if not market_open:
+            logger.info(
+                "Force liquidation for %s %s while equity market is closed; order may rest until open.",
+                side,
+                symbol,
+            )
 
     payload: dict[str, object] = {
         "symbol": symbol,
@@ -2854,6 +2879,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             price_hint=price_hint,
                             support_brackets=False,
                             position_effect="close",
+                            force_liquidation=True,
                         )
                         if isinstance(result, dict) and result.get("status") == "rejected_uncovered":
                             warning = (
@@ -3158,7 +3184,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     qty_int = int(math.floor(qty))
                     if qty_int > 0:
                         try:
-                            place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                            place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day", force_liquidation=True)
                             summary_lines.append(
                                 f"Exit {qty_int} {symbol} ({stop_reason})"
                             )
@@ -3188,7 +3214,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     qty_int = int(math.floor(qty))
                     if qty_int > 0:
                         try:
-                            place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day")
+                            place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day", force_liquidation=True)
                             summary_lines.append(
                                 f"Exit {qty_int} {symbol} ({aggressive_exit_reason})"
                             )
@@ -4744,6 +4770,22 @@ def start_background_jobs():
             # Avoid double-run at startup by spacing the first scheduled cycle
             next_run_time=datetime.now() + timedelta(minutes=5),
             id="run_autopilot_cycle",
+            replace_existing=True,
+        )
+        _scheduler.add_job(
+            lambda: run_fill_outcomes(verbose=False),
+            "interval",
+            hours=24,
+            next_run_time=datetime.now() + timedelta(minutes=10),
+            id="fill_ai_training_outcomes",
+            replace_existing=True,
+        )
+        _scheduler.add_job(
+            lambda: run_training(verbose=False),
+            "interval",
+            hours=24,
+            next_run_time=datetime.now() + timedelta(minutes=15),
+            id="train_xgboost",
             replace_existing=True,
         )
         _scheduler.start()

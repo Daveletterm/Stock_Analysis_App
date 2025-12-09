@@ -31,6 +31,7 @@ def _parse_args() -> argparse.Namespace:
         default=0.0,
         help="Return threshold to label a trade as good (default: 0.0)",
     )
+    parser.add_argument("--quiet", action="store_true", help="Suppress progress output")
     return parser.parse_args()
 
 
@@ -75,26 +76,29 @@ def _get_close_on(df: pd.DataFrame, target_date: date) -> Optional[float]:
     return None
 
 
-def main() -> None:
-    args = _parse_args()
-    as_of_dt = datetime.now(timezone.utc)
-    if args.as_of:
-        as_of_dt = pd.to_datetime(args.as_of, utc=True).to_pydatetime()
+def run_fill_outcomes(
+    as_of: datetime | None = None, days: int = 5, good_threshold: float = 0.0, verbose: bool = True
+) -> dict[str, int]:
+    as_of_dt = as_of or datetime.now(timezone.utc)
 
     if not AI_LOG_PATH.exists():
-        print("ai_training_log.csv not found; nothing to do.")
-        return
+        if verbose:
+            print("ai_training_log.csv not found; nothing to do.")
+        return {"updated": 0, "skipped_days": 0, "skipped_data": 0, "candidates": 0}
 
     df = pd.read_csv(AI_LOG_PATH)
     if df.empty:
-        print("ai_training_log.csv is empty; nothing to do.")
-        return
+        if verbose:
+            print("ai_training_log.csv is empty; nothing to do.")
+        return {"updated": 0, "skipped_days": 0, "skipped_data": 0, "candidates": 0}
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     updated = 0
     skipped_days = 0
     skipped_data = 0
     total_candidates = 0
+    total_rows = len(df.index)
+    processed = 0
 
     for idx, row in df.iterrows():
         label_val = row.get("label_good_trade")
@@ -114,9 +118,12 @@ def main() -> None:
             continue
 
         total_candidates += 1
+        processed += 1
+        if verbose and processed % 25 == 0:
+            print(f"Processing {processed}/{total_rows} rows...", flush=True)
 
         start_window = entry_dt - timedelta(days=10)
-        end_window = as_of_dt + timedelta(days=args.days * 2 + 5)
+        end_window = as_of_dt + timedelta(days=days * 2 + 5)
         history = _load_history(symbol, start_window, end_window)
         if history is None or history.empty:
             skipped_data += 1
@@ -125,7 +132,6 @@ def main() -> None:
         history = history.sort_index()
         trading_days = [d.date() if hasattr(d, "date") else None for d in history.index]
         if entry_dt.date() not in trading_days:
-            # find first trading day on/after entry
             try:
                 entry_idx = next(i for i, d in enumerate(trading_days) if d and d >= entry_dt.date())
             except StopIteration:
@@ -134,7 +140,7 @@ def main() -> None:
         else:
             entry_idx = trading_days.index(entry_dt.date())
 
-        target_idx = entry_idx + args.days
+        target_idx = entry_idx + days
         if target_idx >= len(trading_days):
             skipped_days += 1
             continue
@@ -164,13 +170,28 @@ def main() -> None:
             realized_return = (close_price - entry_price) / entry_price
 
         df.at[idx, "realized_return_5d"] = realized_return
-        df.at[idx, "label_good_trade"] = 1 if realized_return >= args.good_threshold else 0
+        df.at[idx, "label_good_trade"] = 1 if realized_return >= good_threshold else 0
         updated += 1
 
     df.to_csv(AI_LOG_PATH, index=False)
-    print(f"Processed {total_candidates} unlabeled rows; updated {updated}.")
-    print(f"Skipped (insufficient trading days): {skipped_days}")
-    print(f"Skipped (missing price data): {skipped_data}")
+    if verbose:
+        print(f"Processed {total_candidates} unlabeled rows; updated {updated}.")
+        print(f"Skipped (insufficient trading days): {skipped_days}")
+        print(f"Skipped (missing price data): {skipped_data}")
+    return {
+        "updated": updated,
+        "skipped_days": skipped_days,
+        "skipped_data": skipped_data,
+        "candidates": total_candidates,
+    }
+
+
+def main() -> None:
+    args = _parse_args()
+    as_of_dt = datetime.now(timezone.utc)
+    if args.as_of:
+        as_of_dt = pd.to_datetime(args.as_of, utc=True).to_pydatetime()
+    run_fill_outcomes(as_of=as_of_dt, days=args.days, good_threshold=args.good_threshold, verbose=not args.quiet)
 
 
 if __name__ == "__main__":
