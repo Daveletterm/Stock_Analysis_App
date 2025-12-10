@@ -22,6 +22,7 @@ try:
     import yfinance as yf  # type: ignore
 except Exception:
     yf = None  # type: ignore
+    logger.warning("yfinance not available; company lookup may be unavailable")
 
 import pandas as pd
 try:
@@ -106,6 +107,7 @@ ENABLE_ZOMBIE_DELETE = True
 # -----------------------------
 _lock = threading.Lock()
 _sp500 = {"tickers": [], "updated": datetime.min}
+_company_cache: dict[str, str] = {}
 _price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = {}
 PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations: dict[str, Any] = {
@@ -118,6 +120,7 @@ _rec_state = {"refreshing": False, "last_completed": None, "last_error": None}
 _background_jobs_started = False
 _background_jobs_lock = threading.Lock()
 _scheduler: BackgroundScheduler | None = None
+_pending_force_liquidations: set[str] = set()
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
@@ -3139,6 +3142,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     continue
                 position_params = _autopilot_position_params.get(symbol.upper(), {})
                 highest_price = safe_float(position_params.get("highest_price"), None)
+                force_pending = bool(position_params.get("force_liquidation"))
                 current_price_equity = _position_price(pos, "equity")
                 avg_entry_price = safe_float(pos.get("avg_entry_price"), None)
                 if current_price_equity and (highest_price is None or current_price_equity > highest_price):
@@ -3159,6 +3163,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
                 hard_stop_pct = BALANCED_GROWTH_CONFIG.get("equity_stop_loss_pct", 0.12)
                 trail_stop_pct = BALANCED_GROWTH_CONFIG.get("equity_trailing_stop_pct", 0.15)
                 hard_stop_reason = None
+                force_pending = force_pending or symbol.upper() in _pending_force_liquidations
                 if current_price_equity and avg_entry_price and hard_stop_pct:
                     stop_price = avg_entry_price * (1 - hard_stop_pct)
                     if current_price_equity <= stop_price:
@@ -3175,6 +3180,8 @@ def run_autopilot_cycle(force: bool = False) -> None:
                     elif opened_at and abs(plpc) < 0.01 and (now - opened_at) > timedelta(days=4):
                         aggressive_exit_reason = "stagnant trade freeing capital"
                 stop_reason = hard_stop_reason or trail_stop_reason
+                if not stop_reason and force_pending:
+                    stop_reason = "pending_force_liquidation"
                 if stop_reason:
                     if _autopilot_order_blocked(symbol, open_orders):
                         summary_lines.append(
@@ -3182,9 +3189,39 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         )
                         continue
                     qty_int = int(math.floor(qty))
+                    # Re-query live qty to avoid stale snapshots causing insufficient qty
+                    live_qty = 0
+                    for live_pos in positions:
+                        try:
+                            if str(live_pos.get("symbol", "")).upper() != symbol.upper():
+                                continue
+                            live_qty = abs(safe_float(live_pos.get("qty"), safe_float(live_pos.get("quantity"), 0.0)))
+                            break
+                        except Exception:
+                            continue
+                    if live_qty <= 0:
+                        logger.info("No live quantity for %s; skipping equity close.", symbol)
+                        summary_lines.append(f"No open quantity for {symbol}; skipping exit.")
+                        continue
+                    qty_int = min(qty_int, int(math.floor(live_qty)))
                     if qty_int > 0:
                         try:
-                            place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day", force_liquidation=True)
+                            result = paper_broker.force_close_position(symbol)
+                            if isinstance(result, dict) and result.get("status") == "skipped_market_closed":
+                                _pending_force_liquidations.add(symbol.upper())
+                                position_params["force_liquidation"] = True
+                                with _autopilot_lock:
+                                    _autopilot_position_params[symbol.upper()] = position_params
+                                _persist_autopilot_state()
+                                summary_lines.append(
+                                    f"Exit for {symbol} queued via force close; market closed (will retry)."
+                                )
+                                continue
+                            _pending_force_liquidations.discard(symbol.upper())
+                            if position_params.pop("force_liquidation", None):
+                                with _autopilot_lock:
+                                    _autopilot_position_params[symbol.upper()] = position_params
+                                _persist_autopilot_state()
                             summary_lines.append(
                                 f"Exit {qty_int} {symbol} ({stop_reason})"
                             )
@@ -3200,6 +3237,21 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                     f"Skip exit for {symbol}; insufficient qty (stale position)."
                                 )
                                 continue
+                            if "market" in message and "closed" in message:
+                                _pending_force_liquidations.add(symbol.upper())
+                                position_params["force_liquidation"] = True
+                                with _autopilot_lock:
+                                    _autopilot_position_params[symbol.upper()] = position_params
+                                _persist_autopilot_state()
+                                logger.info(
+                                    "Force close for %s queued; market closed (%s)",
+                                    symbol,
+                                    exc,
+                                )
+                                summary_lines.append(
+                                    f"Exit for {symbol} queued via force close; market closed (will retry)."
+                                )
+                                continue
                             logger.exception("Autopilot equity exit failed for %s", symbol)
                             errors.append(f"sell {symbol} failed: {exc}")
                         except Exception as exc:
@@ -3212,9 +3264,38 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         )
                         continue
                     qty_int = int(math.floor(qty))
+                    live_qty = 0
+                    for live_pos in positions:
+                        try:
+                            if str(live_pos.get("symbol", "")).upper() != symbol.upper():
+                                continue
+                            live_qty = abs(safe_float(live_pos.get("qty"), safe_float(live_pos.get("quantity"), 0.0)))
+                            break
+                        except Exception:
+                            continue
+                    if live_qty <= 0:
+                        logger.info("No live quantity for %s; skipping equity close.", symbol)
+                        summary_lines.append(f"No open quantity for {symbol}; skipping exit.")
+                        continue
+                    qty_int = min(qty_int, int(math.floor(live_qty)))
                     if qty_int > 0:
                         try:
-                            place_guarded_paper_order(symbol, qty_int, "sell", time_in_force="day", force_liquidation=True)
+                            result = paper_broker.force_close_position(symbol)
+                            if isinstance(result, dict) and result.get("status") == "skipped_market_closed":
+                                _pending_force_liquidations.add(symbol.upper())
+                                position_params["force_liquidation"] = True
+                                with _autopilot_lock:
+                                    _autopilot_position_params[symbol.upper()] = position_params
+                                _persist_autopilot_state()
+                                summary_lines.append(
+                                    f"Exit for {symbol} queued via force close; market closed (will retry)."
+                                )
+                                continue
+                            _pending_force_liquidations.discard(symbol.upper())
+                            if position_params.pop("force_liquidation", None):
+                                with _autopilot_lock:
+                                    _autopilot_position_params[symbol.upper()] = position_params
+                                _persist_autopilot_state()
                             summary_lines.append(
                                 f"Exit {qty_int} {symbol} ({aggressive_exit_reason})"
                             )
@@ -3228,6 +3309,21 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 )
                                 summary_lines.append(
                                     f"Skip exit for {symbol}; insufficient qty (stale position)."
+                                )
+                                continue
+                            if "market" in message and "closed" in message:
+                                _pending_force_liquidations.add(symbol.upper())
+                                position_params["force_liquidation"] = True
+                                with _autopilot_lock:
+                                    _autopilot_position_params[symbol.upper()] = position_params
+                                _persist_autopilot_state()
+                                logger.info(
+                                    "Force close for %s queued; market closed (%s)",
+                                    symbol,
+                                    exc,
+                                )
+                                summary_lines.append(
+                                    f"Exit for {symbol} queued via force close; market closed (will retry)."
                                 )
                                 continue
                             logger.exception("Autopilot equity exit failed for %s", symbol)
@@ -4357,8 +4453,8 @@ def analyze_stock(ticker: str) -> dict:
     latest_rsi = last_value(df["RSI"])
     latest_sma50 = last_value(df["SMA_50"])
     latest_sma200 = last_value(df["SMA_200"])
-    company_name = None
-    if yf is not None:
+    company_name = _company_cache.get(ticker.upper())
+    if not company_name and yf is not None:
         try:
             info_fast = yf.Ticker(ticker).fast_info  # type: ignore[attr-defined]
             company_name = getattr(info_fast, "long_name", None) or getattr(info_fast, "short_name", None)
@@ -4371,10 +4467,12 @@ def analyze_stock(ticker: str) -> dict:
                     company_name = info_full.get("longName") or info_full.get("shortName")
             except Exception:
                 company_name = None
+        if company_name:
+            _company_cache[ticker.upper()] = company_name
 
     sentiment = fetch_news_sentiment(ticker) + fetch_reddit_sentiment(ticker)
     if not company_name:
-        company_name = ""
+        company_name = ticker
     above_sma50 = (
         latest_close is not None
         and latest_sma50 is not None
@@ -4388,31 +4486,23 @@ def analyze_stock(ticker: str) -> dict:
     rec = "BUY" if above_sma50 else "HOLD"
 
     summary_bits: list[str] = []
-    if above_sma50:
-        summary_bits.append(
-            "Price is above the 50-day moving average, indicating positive momentum."
-        )
-    elif latest_close is not None and latest_sma50 is not None:
-        summary_bits.append(
-            "Price is below the 50-day moving average, so momentum looks soft."
-        )
-    if above_sma200:
-        summary_bits.append(
-            "Price is also above the 200-day moving average, supporting an uptrend view."
-        )
-    elif latest_close is not None and latest_sma200 is not None:
-        summary_bits.append(
-            "Price is under the 200-day moving average, so the long-term trend is weaker."
-        )
+    # Trend context
+    if latest_close is not None and latest_sma50 is not None and latest_sma200 is not None:
+        trend_note = "Price is above both the 50- and 200-day averages, so the trend is upward." if (latest_close > latest_sma50 and latest_close > latest_sma200) else "Price is below one or both key averages, so the trend is softer."
+        summary_bits.append(trend_note)
+    # Momentum context without jargon
     if latest_rsi is not None:
         if latest_rsi >= 70:
-            summary_bits.append("RSI is elevated, suggesting overbought conditions.")
+            summary_bits.append("Recent buying has been strong; watch for pullbacks.")
         elif latest_rsi <= 30:
-            summary_bits.append("RSI is low, suggesting the stock may be oversold.")
+            summary_bits.append("Recent selling has been heavy; the stock may be recovering.")
         else:
-            summary_bits.append("RSI is neutral, so momentum is balanced.")
-    if not summary_bits:
-        summary_bits.append("Insufficient indicator data to form an opinion.")
+            summary_bits.append("Momentum is balanced; no extreme buying or selling pressure.")
+    # Simple outlook
+    if above_sma50 and above_sma200:
+        summary_bits.append("If it holds above the 50-day average, it may keep climbing; a drop below could lead to a pause or pullback.")
+    else:
+        summary_bits.append("If it moves back above the 50-day average, strength could resume; staying below may keep it choppy.")
     analysis_summary = " ".join(summary_bits)
 
     out = {

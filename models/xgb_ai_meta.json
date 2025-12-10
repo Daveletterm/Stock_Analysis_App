@@ -1,0 +1,95 @@
+{
+  "trained_at": "2025-12-10T15:26:22.684075+00:00",
+  "data_path": "data/ai_training_log.csv",
+  "model_path": "models/xgb_ai.pkl",
+  "metrics": {
+    "auc": 0.9393939393939394,
+    "accuracy": 0.8823529411764706,
+    "report": {
+      "0": {
+        "precision": 0.9090909090909091,
+        "recall": 0.9090909090909091,
+        "f1-score": 0.9090909090909091,
+        "support": 11.0
+      },
+      "1": {
+        "precision": 0.8333333333333334,
+        "recall": 0.8333333333333334,
+        "f1-score": 0.8333333333333334,
+        "support": 6.0
+      },
+      "accuracy": 0.8823529411764706,
+      "macro avg": {
+        "precision": 0.8712121212121212,
+        "recall": 0.8712121212121212,
+        "f1-score": 0.8712121212121212,
+        "support": 17.0
+      },
+      "weighted avg": {
+        "precision": 0.8823529411764706,
+        "recall": 0.8823529411764706,
+        "f1-score": 0.8823529411764706,
+        "support": 17.0
+      }
+    },
+    "rows_train": 66,
+    "rows_test": 17
+  },
+  "params": {
+    "objective": "binary:logistic",
+    "base_score": null,
+    "booster": null,
+    "callbacks": null,
+    "colsample_bylevel": null,
+    "colsample_bynode": null,
+    "colsample_bytree": 0.8,
+    "device": null,
+    "early_stopping_rounds": null,
+    "enable_categorical": false,
+    "eval_metric": "auc",
+    "feature_types": null,
+    "feature_weights": null,
+    "gamma": null,
+    "grow_policy": null,
+    "importance_type": null,
+    "interaction_constraints": null,
+    "learning_rate": 0.05,
+    "max_bin": null,
+    "max_cat_threshold": null,
+    "max_cat_to_onehot": null,
+    "max_delta_step": null,
+    "max_depth": 4,
+    "max_leaves": null,
+    "min_child_weight": null,
+    "missing": NaN,
+    "monotone_constraints": null,
+    "multi_strategy": null,
+    "n_estimators": 300,
+    "n_jobs": 4,
+    "num_parallel_tree": null,
+    "random_state": 42,
+    "reg_alpha": null,
+    "reg_lambda": null,
+    "sampling_method": null,
+    "scale_pos_weight": null,
+    "subsample": 0.8,
+    "tree_method": null,
+    "validate_parameters": null,
+    "verbosity": null
+  },
+  "features": [
+    "score",
+    "spot_price",
+    "entry_price",
+    "rsi",
+    "macd",
+    "volatility_20d",
+    "volume_rel_20d",
+    "congress_score",
+    "news_sentiment",
+    "asset_class",
+    "direction",
+    "strategy_key",
+    "market_trend"
+  ]
+}

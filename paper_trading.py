@@ -298,8 +298,54 @@ class AlpacaPaperBroker:
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/orders/{order_id}")
 
-    def close_position(self, symbol: str) -> Dict[str, Any]:
-        return self._request("DELETE", f"/positions/{symbol}")
+    def close_position(self, symbol: str, *, cancel_orders: bool = False) -> Dict[str, Any]:
+        params = {"cancel_orders": str(bool(cancel_orders)).lower()} if cancel_orders else {}
+        return self._request("DELETE", f"/positions/{symbol}", params=params)
+
+    def force_close_position(self, symbol: str) -> Dict[str, Any]:
+        """
+        Cancel all open orders for *symbol* and close the full position via the
+        Alpaca positions endpoint. This avoids 403 'insufficient qty available'
+        when a resting sell/bracket already exists (e.g., HBAN).
+        """
+
+        open_orders = list(self.list_orders(status="open", limit=200))
+        symbol_cmp = symbol.replace(" ", "").upper()
+        for order in open_orders:
+            try:
+                if str(order.get("symbol", "")).replace(" ", "").upper() != symbol_cmp:
+                    continue
+                oid = order.get("id") or order.get("client_order_id")
+                if oid:
+                    logger.info("Cancelling open order %s for %s before force close", oid, symbol_cmp)
+                    try:
+                        self.cancel_order(str(oid))
+                    except Exception as exc:  # pragma: no cover - best effort
+                        logger.warning("Cancel failed for %s (%s): %s", symbol_cmp, oid, exc)
+            except Exception:
+                continue
+
+        try:
+            pos = next(
+                (p for p in self.get_positions() if str(p.get("symbol", "")).replace(" ", "").upper() == symbol_cmp),
+                {},
+            )
+        except Exception:
+            pos = {}
+        qty = pos.get("qty") or pos.get("quantity") or pos.get("qty_available")
+        logger.info(
+            "Force closing position %s (qty=%s qty_available=%s)", symbol_cmp, pos.get("qty"), pos.get("qty_available")
+        )
+        try:
+            resp = self.close_position(symbol_cmp, cancel_orders=True)
+            logger.info("Force close response for %s: %s", symbol_cmp, resp)
+            return resp
+        except AlpacaAPIError as exc:
+            msg_lower = (exc.api_message or str(exc)).lower()
+            if exc.status_code == 403 and "market" in msg_lower and "closed" in msg_lower:
+                logger.info("Force close for %s skipped; market closed (%s)", symbol_cmp, exc.api_message)
+                return {"status": "skipped_market_closed", "symbol": symbol_cmp, "message": exc.api_message}
+            raise
 
     def delete_position(self, symbol: str) -> dict:
         """Hard-delete a position from the paper account via Alpaca API.
