@@ -108,6 +108,7 @@ ENABLE_ZOMBIE_DELETE = True
 _lock = threading.Lock()
 _sp500 = {"tickers": [], "updated": datetime.min}
 _company_cache: dict[str, str] = {}
+COMPANY_CACHE_PATH = Path(BASE_DIR) / "data" / "company_cache.json"
 _price_cache: Dict[Tuple[str, str, str, bool], Tuple[datetime, pd.DataFrame]] = {}
 PRICE_CACHE_TTL = timedelta(minutes=15)
 _recommendations: dict[str, Any] = {
@@ -4464,15 +4465,30 @@ def analyze_stock(ticker: str) -> dict:
             try:
                 info_full = yf.Ticker(ticker).info  # type: ignore[attr-defined]
                 if isinstance(info_full, dict):
-                    company_name = info_full.get("longName") or info_full.get("shortName")
+                    company_name = info_full.get("longName") or company_name or info_full.get("shortName")
             except Exception:
                 company_name = None
+        if company_name and company_name.strip().upper() != ticker.upper():
+            _company_cache[ticker.upper()] = company_name
+            _save_company_cache()
+    if not company_name:
+        # Alpaca asset fallback
+        try:
+            if paper_broker.enabled:
+                asset = paper_broker.get_asset(ticker.upper())
+                if isinstance(asset, dict):
+                    name_val = asset.get("name")
+                    if name_val and str(name_val).strip().upper() != ticker.upper():
+                        company_name = str(name_val).strip()
+        except Exception:
+            company_name = company_name
         if company_name:
             _company_cache[ticker.upper()] = company_name
+            _save_company_cache()
 
     sentiment = fetch_news_sentiment(ticker) + fetch_reddit_sentiment(ticker)
     if not company_name:
-        company_name = ticker
+        company_name = _company_cache.get(ticker.upper()) or ""
     above_sma50 = (
         latest_close is not None
         and latest_sma50 is not None
@@ -4903,6 +4919,27 @@ def _ensure_background_jobs() -> None:
     if not _background_jobs_started:
         start_background_jobs()
 
+def _load_company_cache() -> None:
+    try:
+        if COMPANY_CACHE_PATH.exists():
+            with open(COMPANY_CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    _company_cache.update({str(k).upper(): str(v) for k, v in data.items() if v})
+                    logger.info("Loaded %d entries from company cache", len(_company_cache))
+    except Exception as exc:
+        logger.warning("Failed to load company cache: %s", exc)
+
+
+def _save_company_cache() -> None:
+    try:
+        COMPANY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(COMPANY_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_company_cache, f, indent=2)
+    except Exception as exc:
+        logger.warning("Failed to save company cache: %s", exc)
+
+_load_company_cache()
 
 app.before_request(_ensure_background_jobs)
 

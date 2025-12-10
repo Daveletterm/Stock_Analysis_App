@@ -1,5 +1,5 @@
 {
-  "trained_at": "2025-12-10T15:26:22.684075+00:00",
+  "trained_at": "2025-12-10T16:20:13.328051+00:00",
   "data_path": "data/ai_training_log.csv",
   "model_path": "models/xgb_ai.pkl",
   "metrics": {

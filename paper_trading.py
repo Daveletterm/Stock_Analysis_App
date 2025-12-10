@@ -186,6 +186,10 @@ class AlpacaPaperBroker:
         data = self._request("GET", "/account/activities", params=params)
         return data if isinstance(data, list) else []
 
+    def get_asset(self, symbol: str) -> Dict[str, Any]:
+        """Fetch a single asset definition from Alpaca."""
+        return self._request("GET", f"/assets/{symbol}")
+
     def get_activities(
         self,
         activity_types: str | Iterable[str] | None = None,
