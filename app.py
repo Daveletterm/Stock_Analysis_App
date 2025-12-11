@@ -122,6 +122,7 @@ _background_jobs_started = False
 _background_jobs_lock = threading.Lock()
 _scheduler: BackgroundScheduler | None = None
 _pending_force_liquidations: set[str] = set()
+_ai_log_repaired = False
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")
 OPTION_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 OPTION_CONTRACT_MULTIPLIER = int(os.getenv("ALPACA_OPTION_MULTIPLIER", "100")) or 100
@@ -1381,6 +1382,7 @@ def place_guarded_paper_order(
     support_brackets: bool = True,
     position_effect: str | None = None,
     force_liquidation: bool = False,
+    ai_snapshot: dict[str, Any] | None = None,
 ):
     if not paper_broker.enabled:
         raise RuntimeError("Paper trading credentials are not configured")
@@ -1473,7 +1475,13 @@ def place_guarded_paper_order(
                     "stop_price": round(entry_price * (1 - stop_loss_pct), 2)
                 }
 
-    return paper_broker.submit_order(payload)
+    result = paper_broker.submit_order(payload)
+    if ai_snapshot:
+        try:
+            log_ai_snapshot(**ai_snapshot)
+        except Exception:
+            logger.exception("Failed to log AI snapshot (post-order) for %s", symbol)
+    return result
 
 
 # -----------------------------
@@ -2294,6 +2302,36 @@ def _extract_indicator_features(df: pd.DataFrame | None) -> dict[str, float | No
     return features
 
 
+def _repair_ai_training_log() -> None:
+    """Ensure ai_training_log.csv rows always carry a timestamp."""
+
+    global _ai_log_repaired
+    if _ai_log_repaired:
+        return
+    _ai_log_repaired = True
+    if not AI_LOG_PATH.exists():
+        return
+    try:
+        df = pd.read_csv(AI_LOG_PATH)
+    except Exception:
+        logger.warning("ai_training_log.csv unreadable; skipping repair", exc_info=True)
+        return
+    if "timestamp" not in df.columns:
+        return
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    missing = df["timestamp"].isna()
+    if not missing.any():
+        return
+    base = datetime.now(timezone.utc)
+    offsets = pd.to_timedelta(range(int(missing.sum())), unit="ms")
+    df.loc[missing, "timestamp"] = base + offsets
+    try:
+        df.to_csv(AI_LOG_PATH, index=False)
+        logger.info("Backfilled %d AI training log rows without timestamps", missing.sum())
+    except Exception:
+        logger.warning("Failed to backfill AI training log timestamps", exc_info=True)
+
+
 def log_ai_snapshot(
     *,
     symbol: str,
@@ -2324,6 +2362,7 @@ def log_ai_snapshot(
     """
 
     try:
+        _repair_ai_training_log()
         new_file = not AI_LOG_PATH.exists()
         with AI_LOG_PATH.open("a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=AI_LOG_COLUMNS)
@@ -3821,24 +3860,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 contract_symbol,
                                 qty,
                             )
-                            log_ai_snapshot(
-                                symbol=symbol,
-                                asset_class="option",
-                                strategy_key=strategy_key,
-                                contract_symbol=contract_symbol,
-                                direction="buy",
-                                score=safe_float(score, 0.0) or 0.0,
-                                spot_price=equity_price,
-                                entry_price=mid_price * OPTION_CONTRACT_MULTIPLIER if mid_price else None,
-                                rsi=indicator_features.get("rsi"),
-                                macd=indicator_features.get("macd"),
-                                volatility_20d=indicator_features.get("volatility_20d"),
-                                volume_rel_20d=indicator_features.get("volume_rel_20d"),
-                                sector_strength=None,
-                                market_trend=None,
-                                congress_score=None,
-                                news_sentiment=None,
-                            )
                             place_guarded_paper_order(
                                 contract_symbol,
                                 qty,
@@ -3852,6 +3873,24 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 price_hint=mid_price,
                                 support_brackets=False,
                                 position_effect="open",
+                                ai_snapshot={
+                                    "symbol": symbol,
+                                    "asset_class": "option",
+                                    "strategy_key": strategy_key,
+                                    "contract_symbol": contract_symbol,
+                                    "direction": "buy",
+                                    "score": safe_float(score, 0.0) or 0.0,
+                                    "spot_price": equity_price,
+                                    "entry_price": mid_price * OPTION_CONTRACT_MULTIPLIER if mid_price else None,
+                                    "rsi": indicator_features.get("rsi"),
+                                    "macd": indicator_features.get("macd"),
+                                    "volatility_20d": indicator_features.get("volatility_20d"),
+                                    "volume_rel_20d": indicator_features.get("volume_rel_20d"),
+                                    "sector_strength": None,
+                                    "market_trend": None,
+                                    "congress_score": None,
+                                    "news_sentiment": None,
+                                },
                             )
                             gross_notional += order_notional
                             cash_balance = max(0.0, cash_balance - order_notional)
@@ -4080,24 +4119,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             contract_symbol,
                             qty,
                         )
-                        log_ai_snapshot(
-                            symbol=symbol,
-                            asset_class="option",
-                            strategy_key=strategy_key,
-                            contract_symbol=contract_symbol,
-                            direction="buy",
-                            score=safe_float(score, 0.0) or 0.0,
-                            spot_price=equity_price,
-                            entry_price=premium * OPTION_CONTRACT_MULTIPLIER if premium else None,
-                            rsi=indicator_features.get("rsi"),
-                            macd=indicator_features.get("macd"),
-                            volatility_20d=indicator_features.get("volatility_20d"),
-                            volume_rel_20d=indicator_features.get("volume_rel_20d"),
-                            sector_strength=None,
-                            market_trend=None,
-                            congress_score=None,
-                            news_sentiment=None,
-                        )
                         place_guarded_paper_order(
                             contract_symbol,
                             qty,
@@ -4108,6 +4129,24 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             time_in_force="day",
                             asset_class="option",
                             price_hint=premium,
+                            ai_snapshot={
+                                "symbol": symbol,
+                                "asset_class": "option",
+                                "strategy_key": strategy_key,
+                                "contract_symbol": contract_symbol,
+                                "direction": "buy",
+                                "score": safe_float(score, 0.0) or 0.0,
+                                "spot_price": equity_price,
+                                "entry_price": premium * OPTION_CONTRACT_MULTIPLIER if premium else None,
+                                "rsi": indicator_features.get("rsi"),
+                                "macd": indicator_features.get("macd"),
+                                "volatility_20d": indicator_features.get("volatility_20d"),
+                                "volume_rel_20d": indicator_features.get("volume_rel_20d"),
+                                "sector_strength": None,
+                                "market_trend": None,
+                                "congress_score": None,
+                                "news_sentiment": None,
+                            },
                         )
                         gross_notional += order_notional
                         cash_balance = max(0.0, cash_balance - order_notional)
@@ -4228,24 +4267,6 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             qty,
                             equity_growth_score,
                         )
-                        log_ai_snapshot(
-                            symbol=symbol,
-                            asset_class="equity",
-                            strategy_key=strategy_key,
-                            contract_symbol="",
-                            direction="buy",
-                            score=safe_float(score, 0.0) or 0.0,
-                            spot_price=price,
-                            entry_price=price,
-                            rsi=indicators.get("rsi"),
-                            macd=indicators.get("macd"),
-                            volatility_20d=indicators.get("volatility_20d"),
-                            volume_rel_20d=indicators.get("volume_rel_20d"),
-                            sector_strength=None,
-                            market_trend=None,
-                            congress_score=None,
-                            news_sentiment=None,
-                        )
                         place_guarded_paper_order(
                             symbol,
                             qty,
@@ -4253,6 +4274,24 @@ def run_autopilot_cycle(force: bool = False) -> None:
                             stop_loss_pct=stop_loss_pct,
                             take_profit_pct=take_profit_pct,
                             time_in_force="gtc",
+                            ai_snapshot={
+                                "symbol": symbol,
+                                "asset_class": "equity",
+                                "strategy_key": strategy_key,
+                                "contract_symbol": "",
+                                "direction": "buy",
+                                "score": safe_float(score, 0.0) or 0.0,
+                                "spot_price": price,
+                                "entry_price": price,
+                                "rsi": indicators.get("rsi"),
+                                "macd": indicators.get("macd"),
+                                "volatility_20d": indicators.get("volatility_20d"),
+                                "volume_rel_20d": indicators.get("volume_rel_20d"),
+                                "sector_strength": None,
+                                "market_trend": None,
+                                "congress_score": None,
+                                "news_sentiment": None,
+                            },
                         )
                         gross_notional += qty * price
                         cash_balance = max(0.0, cash_balance - (qty * price))
@@ -5535,6 +5574,19 @@ def paper_order_submit():
         order_type = request.form.get("order_type", "market").lower()
         limit_price = request.form.get("limit_price")
         tif = request.form.get("time_in_force", "day")
+        if side == "sell":
+            try:
+                result = paper_broker.force_close_position(symbol)
+                status = str(result.get("status", "")).lower() if isinstance(result, dict) else ""
+                if status == "skipped_market_closed":
+                    flash(
+                        f"Force close queued for {symbol}; market closed ({result.get('message', 'retries next session')})."
+                    )
+                else:
+                    flash(f"Force close submitted for {symbol}; open exits cancelled first.")
+            except Exception as exc:
+                flash(f"Force close failed for {symbol}: {exc}")
+            return redirect(url_for("paper_dashboard"))
         stop_loss_pct = parse_percent(request.form.get("stop_loss_pct"), PAPER_DEFAULT_STOP_LOSS_PCT)
         take_profit_pct = parse_percent(request.form.get("take_profit_pct"), PAPER_DEFAULT_TAKE_PROFIT_PCT)
         limit_price_val = float(limit_price) if limit_price else None
@@ -5682,6 +5734,10 @@ def api_paper_order():
         order_type = str(payload.get("type", payload.get("order_type", "market"))).lower()
         limit_price = payload.get("limit_price")
         tif = str(payload.get("time_in_force", "day"))
+        if side == "sell":
+            result = paper_broker.force_close_position(symbol)
+            status = str(result.get("status", "")).lower() if isinstance(result, dict) else ""
+            return jsonify({"ok": True, "data": result, "mode": "force_close", "status": status})
         stop_loss_pct = None
         take_profit_pct = None
         if "stop_loss_pct" in payload:

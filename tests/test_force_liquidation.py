@@ -46,3 +46,26 @@ def test_sell_allows_force_liquidation(monkeypatch):
         force_liquidation=True,
     )
     assert broker.submitted, "Order should be submitted when force_liquidation is True"
+
+
+def test_manual_sell_uses_force_close(monkeypatch):
+    class ForceBroker(StubBroker):
+        def __init__(self):
+            super().__init__(equity=100000, buying_power=100000)
+            self.force_calls = []
+            self.enabled = True
+
+        def force_close_position(self, symbol):
+            self.force_calls.append(symbol)
+            return {"status": "closed", "symbol": symbol}
+
+    broker = ForceBroker()
+    monkeypatch.setattr(app, "paper_broker", broker)
+    client = app.app.test_client()
+    resp = client.post("/api/paper/order", json={"symbol": "TEST", "qty": 1, "side": "sell"})
+    data = resp.get_json()
+
+    assert resp.status_code == 200
+    assert data["ok"] is True
+    assert data["status"] == "closed"
+    assert broker.force_calls == ["TEST"]
