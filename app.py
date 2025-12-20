@@ -430,17 +430,21 @@ def _normalize_recommendations_payload(payload: Any) -> dict[str, Any]:
     bullish: list[dict[str, Any]] = []
     bearish: list[dict[str, Any]] = []
     timestamp = None
+    top: list[dict[str, Any]] | None = None
 
     if isinstance(payload, dict):
         bullish = [dict(r) for r in payload.get("bullish", []) if isinstance(r, dict)]
         bearish = [dict(r) for r in payload.get("bearish", []) if isinstance(r, dict)]
         timestamp = payload.get("timestamp")
-        if not bullish and isinstance(payload.get("top"), list):
-            bullish = [dict(r) for r in payload.get("top", []) if isinstance(r, dict)]
+        if isinstance(payload.get("top"), list):
+            top = [dict(r) for r in payload.get("top", []) if isinstance(r, dict)]
+        if not bullish and top:
+            bullish = top[:]
     elif isinstance(payload, list):
         bullish = [dict(r) for r in payload if isinstance(r, dict)]
 
-    top = bullish[:]
+    if top is None:
+        top = bullish[:]
     return {"timestamp": timestamp, "bullish": bullish, "bearish": bearish, "top": top}
 
 
@@ -1144,6 +1148,135 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["EMA_21"] = pd.NA
     return df
+
+
+def _pct_diff(current: float | None, base: float | None) -> float | None:
+    """Return percent difference between current and base."""
+    if current is None or base is None or base == 0 or not math.isfinite(base):
+        return None
+    return ((current - base) / base) * 100.0
+
+
+def _fmt_price(val: float | None) -> str | None:
+    if val is None or not math.isfinite(val):
+        return None
+    return f"${val:,.2f}"
+
+
+def _fmt_pct(val: float | None, digits: int = 1) -> str | None:
+    if val is None or not math.isfinite(val):
+        return None
+    fmt = f"{{:.{digits}f}}%"
+    return fmt.format(val)
+
+
+def _slope_pct(series: pd.Series | None, lookback: int = 5) -> float | None:
+    """Percent change of a series over a small lookback window."""
+    if series is None:
+        return None
+    s = series.dropna()
+    if len(s) <= lookback:
+        return None
+    prev = s.iloc[-(lookback + 1)]
+    curr = s.iloc[-1]
+    if prev == 0 or not math.isfinite(prev) or not math.isfinite(curr):
+        return None
+    return (curr - prev) / prev * 100.0
+
+
+def build_analysis_summary(
+    df: pd.DataFrame,
+    *,
+    latest_close: float | None,
+    latest_rsi: float | None,
+    latest_sma50: float | None,
+    latest_sma200: float | None,
+) -> str:
+    """Craft a concise, varied summary using multiple indicators."""
+    sentences: list[str] = []
+
+    pct_to_50 = _pct_diff(latest_close, latest_sma50)
+    pct_to_200 = _pct_diff(latest_close, latest_sma200)
+    slope_50 = _slope_pct(df.get("SMA_50"))
+    trend_bits: list[str] = []
+    if pct_to_50 is not None:
+        trend_bits.append(f"{'above' if pct_to_50 > 0 else 'below'} 50d ({_fmt_pct(pct_to_50)})")
+    if pct_to_200 is not None:
+        trend_bits.append(f"{'above' if pct_to_200 > 0 else 'below'} 200d ({_fmt_pct(pct_to_200)})")
+    if slope_50 is not None:
+        trend_bits.append(f"50d slope {'rising' if slope_50 > 0 else 'flat/down'} ({_fmt_pct(slope_50)})")
+    if trend_bits:
+        sentences.append("Trend: " + "; ".join(trend_bits) + ".")
+
+    momentum_bits: list[str] = []
+    if latest_rsi is not None:
+        if latest_rsi >= 70:
+            momentum_bits.append(f"Momentum is overbought (RSI {latest_rsi:.0f}); expect chop/pullbacks.")
+        elif latest_rsi >= 60:
+            momentum_bits.append(f"Momentum is strong (RSI {latest_rsi:.0f}).")
+        elif latest_rsi <= 40:
+            momentum_bits.append(f"Momentum is weak (RSI {latest_rsi:.0f}); bounce attempts can fade.")
+        else:
+            momentum_bits.append(f"Momentum is balanced (RSI {latest_rsi:.0f}).")
+
+    atr_pct = last_value(df.get("ATR_pct")) if isinstance(df, pd.DataFrame) else None
+    if atr_pct is not None:
+        atr_pct_val = atr_pct * 100
+        if atr_pct_val >= 5:
+            momentum_bits.append(f"Volatility elevated (~{_fmt_pct(atr_pct_val)} ATR).")
+        elif atr_pct_val <= 2:
+            momentum_bits.append(f"Volatility tight (~{_fmt_pct(atr_pct_val)} ATR); breakouts can move quickly.")
+        else:
+            momentum_bits.append(f"Volatility moderate (~{_fmt_pct(atr_pct_val)} ATR).")
+
+    vol_rel = None
+    vol_col = df.get("Volume") if isinstance(df, pd.DataFrame) else None
+    if vol_col is not None:
+        try:
+            vol_ma20 = vol_col.rolling(20, min_periods=1).mean()
+            latest_vol = last_value(vol_col)
+            latest_vol_ma = last_value(vol_ma20)
+            if latest_vol and latest_vol_ma:
+                vol_rel = latest_vol / latest_vol_ma if latest_vol_ma else None
+        except Exception:
+            vol_rel = None
+    if vol_rel is not None and math.isfinite(vol_rel):
+        if vol_rel >= 1.3:
+            momentum_bits.append(f"Volume running hot (~{vol_rel:.1f}x 20d avg).")
+        elif vol_rel <= 0.8:
+            momentum_bits.append(f"Volume light (~{vol_rel:.1f}x 20d avg).")
+        else:
+            momentum_bits.append(f"Volume near average (~{vol_rel:.1f}x 20d avg).")
+    if momentum_bits:
+        sentences.append("Momentum/flow: " + " ".join(momentum_bits))
+
+    hh20 = last_value(df.get("HH_20")) if isinstance(df, pd.DataFrame) else None
+    ll20 = last_value(df.get("LL_20")) if isinstance(df, pd.DataFrame) else None
+    hh252 = last_value(df.get("HH_252")) if isinstance(df, pd.DataFrame) else None
+    pct_from_52w_high = last_value(df.get("pct_from_52w_high")) if isinstance(df, pd.DataFrame) else None
+
+    support_candidates = [v for v in (latest_sma50, ll20, latest_sma200) if v is not None and math.isfinite(v)]
+    support = max(support_candidates) if support_candidates else None
+    levels_bits: list[str] = []
+    if hh20 is not None:
+        levels_bits.append(f"near-term resistance around {_fmt_price(hh20)} (20d high).")
+    if hh252 is not None and pct_from_52w_high is not None:
+        dist_high_pct = pct_from_52w_high * 100
+        if abs(dist_high_pct) <= 5:
+            levels_bits.append(f"Within {_fmt_pct(abs(dist_high_pct), 1)} of 52w high at {_fmt_price(hh252)}.")
+        elif dist_high_pct < -5:
+            levels_bits.append(f"~{_fmt_pct(abs(dist_high_pct), 1)} below 52w high {_fmt_price(hh252)}.")
+        else:
+            levels_bits.append(f"Above the prior 52w high {_fmt_price(hh252)} by {_fmt_pct(dist_high_pct, 1)}.")
+    if support is not None:
+        levels_bits.append(f"Support to watch near {_fmt_price(support)} (50d/20d zone).")
+
+    if levels_bits:
+        sentences.append("Levels/plan: " + " ".join(levels_bits) + (" Bias stays bullish while holding support." if latest_close and support and latest_close >= support else " Needs to reclaim support to turn constructive."))
+
+    if not sentences:
+        return "Analysis data insufficient for a summary."
+    return " ".join(sentences)
 
 
 def score_stock(df: pd.DataFrame) -> tuple[float, list[str]]:
@@ -2305,10 +2438,7 @@ def _extract_indicator_features(df: pd.DataFrame | None) -> dict[str, float | No
 def _repair_ai_training_log() -> None:
     """Ensure ai_training_log.csv rows always carry a timestamp."""
 
-    global _ai_log_repaired
-    if _ai_log_repaired:
-        return
-    _ai_log_repaired = True
+    # Run on every call so any newly added blank rows get backfilled.
     if not AI_LOG_PATH.exists():
         return
     try:
@@ -3720,6 +3850,7 @@ def run_autopilot_cycle(force: bool = False) -> None:
 
                 mid_price: float | None = None
                 contract_symbol: str | None = None
+                fallback_to_equity = False
                 if decision == "option":
                     if _option_on_cooldown(symbol, now):
                         summary_lines.append(
@@ -4053,13 +4184,13 @@ def run_autopilot_cycle(force: bool = False) -> None:
                         cap_qty = int(max_option_notional // unit_cost) if unit_cost > 0 else 0
                         if cap_qty <= 0:
                             summary_lines.append(
-                                "Option position too small under conservative risk cap"
+                                "Option position too small under conservative risk cap; falling back to shares"
                             )
                             log_candidate_outcome(
-                                "option position too small under conservative risk cap",
+                                "option position too small; falling back to shares",
                                 "none",
                             )
-                            continue
+                            fallback_to_equity = True
                         cap_qty = min(cap_qty, MAX_OPTION_CONTRACTS_PER_TRADE)
                         qty = cap_qty if qty <= 0 else min(qty, cap_qty)
                     max_debit = safe_float(hybrid.get("max_position_debit"), None)
@@ -4090,102 +4221,104 @@ def run_autopilot_cycle(force: bool = False) -> None:
                                 "Max portfolio allocation reached; skipping new entries."
                             )
                             allocation_warning_logged = True
-                        log_candidate_outcome(
-                            "bullish entry blocked by portfolio allocation",
-                            "none",
-                        )
+                            log_candidate_outcome(
+                                "bullish entry blocked by portfolio allocation",
+                                "none",
+                            )
                         break
                     if qty <= 0:
                         summary_lines.append(
-                            f"Skip bullish {symbol}; notional ${target_notional:.2f} too small for call cost ${unit_cost:.2f}."
+                            f"Option size too small for {symbol}; falling back to shares (target ${target_notional:.2f}, unit ${unit_cost:.2f})."
                         )
                         log_candidate_outcome(
-                            "bullish entry blocked by sizing rules",
+                            "option sizing too small; falling back to shares",
                             "none",
                         )
-                        continue
+                        fallback_to_equity = True
                     indicator_df = None
-                    try:
-                        indicator_df = _autopilot_prepare_dataframe(symbol, lookback)
-                    except PriceDataError:
-                        indicator_df = None
-                    except Exception:
-                        logger.debug("Indicator prep failed for %s during option log", symbol, exc_info=True)
-                        indicator_df = None
-                    indicator_features = _extract_indicator_features(indicator_df)
-                    try:
-                        logger.info(
-                            "Placing bullish order: symbol=%s asset_class=option qty=%s side=buy",
-                            contract_symbol,
-                            qty,
-                        )
-                        place_guarded_paper_order(
-                            contract_symbol,
-                            qty,
-                            "buy",
-                            order_type="market",
-                            stop_loss_pct=stop_loss_pct,
-                            take_profit_pct=take_profit_pct,
-                            time_in_force="day",
-                            asset_class="option",
-                            price_hint=premium,
-                            ai_snapshot={
-                                "symbol": symbol,
-                                "asset_class": "option",
-                                "strategy_key": strategy_key,
-                                "contract_symbol": contract_symbol,
-                                "direction": "buy",
-                                "score": safe_float(score, 0.0) or 0.0,
-                                "spot_price": equity_price,
-                                "entry_price": premium * OPTION_CONTRACT_MULTIPLIER if premium else None,
-                                "rsi": indicator_features.get("rsi"),
-                                "macd": indicator_features.get("macd"),
-                                "volatility_20d": indicator_features.get("volatility_20d"),
-                                "volume_rel_20d": indicator_features.get("volume_rel_20d"),
-                                "sector_strength": None,
-                                "market_trend": None,
-                                "congress_score": None,
-                                "news_sentiment": None,
-                            },
-                        )
-                        gross_notional += order_notional
-                        cash_balance = max(0.0, cash_balance - order_notional)
-                        cash_ratio = (cash_balance / equity) if equity else cash_ratio
-                        available_slots -= 1
-                        held_and_pending.add(contract_symbol)
-                        pending_underlyings.add(symbol)
-                        _remember_position_params(
-                            contract_symbol,
-                            asset_class="option",
-                            stop_loss_pct=stop_loss_pct,
-                            take_profit_pct=take_profit_pct,
-                            strategy=strategy_key,
-                            opened_at=now,
-                        )
-                        summary_lines.append(
-                            f"Buy {qty} {contract_symbol} (score {score:.2f}, premium ${premium:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
-                        )
-                        orders_placed += 1
-                        entries_placed += 1
-                        gross_option_notional += order_notional
-                        options_budget_remaining = max(
-                            0.0, options_budget_limit - gross_option_notional
-                        )
-                        log_candidate_outcome(
-                            f"bullish entry placed via option ({decision_reason})"
-                        )
-                    except Exception as exc:
-                        logger.exception(
-                            "Autopilot option entry failed for %s", contract_symbol
-                        )
-                        errors.append(f"buy {contract_symbol} failed: {exc}")
-                        if not candidate_logged:
-                            log_candidate_outcome(
-                                "bullish entry failed during order placement",
-                                "bullish",
+                    if not fallback_to_equity:
+                        try:
+                            indicator_df = _autopilot_prepare_dataframe(symbol, lookback)
+                        except PriceDataError:
+                            indicator_df = None
+                        except Exception:
+                            logger.debug("Indicator prep failed for %s during option log", symbol, exc_info=True)
+                            indicator_df = None
+                        indicator_features = _extract_indicator_features(indicator_df)
+                        try:
+                            logger.info(
+                                "Placing bullish order: symbol=%s asset_class=option qty=%s side=buy",
+                                contract_symbol,
+                                qty,
                             )
-                    continue
-                else:
+                            place_guarded_paper_order(
+                                contract_symbol,
+                                qty,
+                                "buy",
+                                order_type="market",
+                                stop_loss_pct=stop_loss_pct,
+                                take_profit_pct=take_profit_pct,
+                                time_in_force="day",
+                                asset_class="option",
+                                price_hint=premium,
+                                ai_snapshot={
+                                    "symbol": symbol,
+                                    "asset_class": "option",
+                                    "strategy_key": strategy_key,
+                                    "contract_symbol": contract_symbol,
+                                    "direction": "buy",
+                                    "score": safe_float(score, 0.0) or 0.0,
+                                    "spot_price": equity_price,
+                                    "entry_price": premium * OPTION_CONTRACT_MULTIPLIER if premium else None,
+                                    "rsi": indicator_features.get("rsi"),
+                                    "macd": indicator_features.get("macd"),
+                                    "volatility_20d": indicator_features.get("volatility_20d"),
+                                    "volume_rel_20d": indicator_features.get("volume_rel_20d"),
+                                    "sector_strength": None,
+                                    "market_trend": None,
+                                    "congress_score": None,
+                                    "news_sentiment": None,
+                                },
+                            )
+                            gross_notional += order_notional
+                            cash_balance = max(0.0, cash_balance - order_notional)
+                            cash_ratio = (cash_balance / equity) if equity else cash_ratio
+                            available_slots -= 1
+                            held_and_pending.add(contract_symbol)
+                            pending_underlyings.add(symbol)
+                            _remember_position_params(
+                                contract_symbol,
+                                asset_class="option",
+                                stop_loss_pct=stop_loss_pct,
+                                take_profit_pct=take_profit_pct,
+                                strategy=strategy_key,
+                                opened_at=now,
+                            )
+                            summary_lines.append(
+                                f"Buy {qty} {contract_symbol} (score {score:.2f}, premium ${premium:.2f}, stop {stop_loss_pct*100:.1f}%, take {take_profit_pct*100:.1f}%)"
+                            )
+                            orders_placed += 1
+                            entries_placed += 1
+                            gross_option_notional += order_notional
+                            options_budget_remaining = max(
+                                0.0, options_budget_limit - gross_option_notional
+                            )
+                            log_candidate_outcome(
+                                f"bullish entry placed via option ({decision_reason})"
+                            )
+                        except Exception as exc:
+                            logger.exception(
+                                "Autopilot option entry failed for %s", contract_symbol
+                            )
+                            errors.append(f"buy {contract_symbol} failed: {exc}")
+                            if not candidate_logged:
+                                log_candidate_outcome(
+                                    "bullish entry failed during order placement",
+                                    "bullish",
+                                )
+                        continue
+
+                if decision == "stock" or fallback_to_equity:
                     try:
                         df = _autopilot_prepare_dataframe(symbol, lookback)
                     except PriceDataError as exc:
@@ -4475,11 +4608,14 @@ def analyze_stock(ticker: str) -> dict:
     close = _col_series(hist, "Close", ticker)
     high  = _col_series(hist, "High",  ticker)
     low   = _col_series(hist, "Low",   ticker)
+    volume = _col_series(hist, "Volume", ticker) if "Volume" in hist.columns else None
 
     df = pd.DataFrame(index=hist.index.copy())
     df["Close"] = close
     df["High"]  = high
     df["Low"]   = low
+    if volume is not None:
+        df["Volume"] = volume
     df = compute_indicators(df)
 
     # Chart data: last ~180 days with ISO date strings
@@ -4533,32 +4669,15 @@ def analyze_stock(ticker: str) -> dict:
         and latest_sma50 is not None
         and latest_close > latest_sma50
     )
-    above_sma200 = (
-        latest_close is not None
-        and latest_sma200 is not None
-        and latest_close > latest_sma200
-    )
     rec = "BUY" if above_sma50 else "HOLD"
 
-    summary_bits: list[str] = []
-    # Trend context
-    if latest_close is not None and latest_sma50 is not None and latest_sma200 is not None:
-        trend_note = "Price is above both the 50- and 200-day averages, so the trend is upward." if (latest_close > latest_sma50 and latest_close > latest_sma200) else "Price is below one or both key averages, so the trend is softer."
-        summary_bits.append(trend_note)
-    # Momentum context without jargon
-    if latest_rsi is not None:
-        if latest_rsi >= 70:
-            summary_bits.append("Recent buying has been strong; watch for pullbacks.")
-        elif latest_rsi <= 30:
-            summary_bits.append("Recent selling has been heavy; the stock may be recovering.")
-        else:
-            summary_bits.append("Momentum is balanced; no extreme buying or selling pressure.")
-    # Simple outlook
-    if above_sma50 and above_sma200:
-        summary_bits.append("If it holds above the 50-day average, it may keep climbing; a drop below could lead to a pause or pullback.")
-    else:
-        summary_bits.append("If it moves back above the 50-day average, strength could resume; staying below may keep it choppy.")
-    analysis_summary = " ".join(summary_bits)
+    analysis_summary = build_analysis_summary(
+        df,
+        latest_close=latest_close,
+        latest_rsi=latest_rsi,
+        latest_sma50=latest_sma50,
+        latest_sma200=latest_sma200,
+    )
 
     out = {
         "Symbol": ticker,
@@ -4735,7 +4854,8 @@ def seek_recommendations() -> None:
                 bullish_top = results[:5]
                 payload = {
                     "timestamp": completed_at.isoformat(),
-                    "bullish": bullish_top,
+                    # Store full ranked list so callers (UI modal, API) can see all buys.
+                    "bullish": results,
                     "bearish": bearish_candidates[:20],
                     "top": bullish_top,
                 }

@@ -168,7 +168,7 @@
       <div id="rsi-chart" class="mb-5"></div>
 
       <section class="mb-5">
-        <h3 class="h5">Quick Backtest</h3>
+      <h3 class="h5">Quick Backtest</h3>
         <div class="row g-2 align-items-end mb-3">
           <div class="col-auto">
             <label for="bt-years" class="form-label">Years</label>
@@ -182,11 +182,33 @@
         <div id="bt-curve"></div>
       </section>
 
-      <h3 class="h5 mt-4">Top 5 Stock Picks</h3>
+      <div class="d-flex align-items-center gap-2 mt-4">
+        <h3 class="h5 mb-0">Top 5 Stock Picks</h3>
+        <button id="view-all-recs" type="button" class="btn btn-link btn-sm p-0">See all</button>
+      </div>
       <p id="rec-status" class="text-muted small">{{ rec_status.message if rec_status else '' }}</p>
       <ul id="recs" class="list-group mb-4"></ul>
     </div>
 
+  <!-- Full recommendations modal -->
+  <div class="modal fade" id="recs-modal" tabindex="-1" aria-labelledby="recs-modal-label" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="recs-modal-label">All recommendations</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body" id="recs-modal-body">
+          <div class="text-muted">Loading…</div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
   <script>
 let refreshCharts = () => {};
 
@@ -297,7 +319,7 @@ let refreshCharts = () => {};
   const recsUl = document.getElementById('recs');
   const recStatusEl = document.getElementById('rec-status');
   const renderRecs = (list) => {
-    const items = Array.isArray(list) ? list : [];
+    const items = Array.isArray(list) ? list.slice(0, 5) : [];
     recsUl.innerHTML = items.map(item => {
       const why = Array.isArray(item.Why) ? item.Why.slice(0,3).join('; ') : '';
       const score = (item.Score !== undefined) ? ` — score ${item.Score}` : '';
@@ -310,6 +332,64 @@ let refreshCharts = () => {};
   renderRecs(recsData);
   if (recStatusEl && recStatusData && recStatusData.message) {
     recStatusEl.textContent = recStatusData.message;
+  }
+
+  // Full recommendations modal
+  const viewAllBtn = document.getElementById('view-all-recs');
+  const recsModalEl = document.getElementById('recs-modal');
+  const recsModalBody = document.getElementById('recs-modal-body');
+  const recsModal = recsModalEl && window.bootstrap ? new bootstrap.Modal(recsModalEl) : null;
+
+  const renderFullList = (title, items) => {
+    if (!items || !items.length) {
+      return `<div class="text-muted small mb-2">${title}: none</div>`;
+    }
+    const rows = items.map(item => {
+      const why = Array.isArray(item.Why) ? item.Why.join('; ') : '';
+      const score = (item.Score !== undefined) ? ` — score ${item.Score}` : '';
+      return `<li class="list-group-item">
+                <div class="d-flex justify-content-between">
+                  <div><strong>${item.Symbol}</strong>: ${item.Recommendation}${score}</div>
+                  ${item.BearishScore !== undefined ? `<span class="text-muted small">Bearish score ${item.BearishScore}</span>` : ''}
+                </div>
+                ${why ? `<div class="text-muted small mt-1">${why}</div>` : ''}
+              </li>`;
+    }).join('');
+    return `
+      <h6 class="mb-2">${title} (${items.length})</h6>
+      <ul class="list-group list-group-flush mb-3">${rows}</ul>
+    `;
+  };
+
+  if (viewAllBtn && recsModal && recsModalBody) {
+    viewAllBtn.addEventListener('click', async () => {
+      viewAllBtn.disabled = true;
+      viewAllBtn.textContent = 'Loading…';
+      recsModalBody.innerHTML = '<div class="text-muted">Loading recommendations…</div>';
+      try {
+        const res = await fetch('/api/recommendations', { cache: 'no-store' });
+        const json = await res.json();
+        const bullish = Array.isArray(json.bullish) ? json.bullish : [];
+        const bearish = Array.isArray(json.bearish) ? json.bearish : [];
+        const buys = bullish.length;
+        const sells = bearish.length;
+        const total = buys + sells;
+        const title = `All recommendations (${buys} buy / ${sells} sell${total ? ` — ${total} total` : ''})`;
+        const label = document.getElementById('recs-modal-label');
+        if (label) label.textContent = title;
+        recsModalBody.innerHTML = `
+          ${renderFullList('Buy', bullish)}
+          ${renderFullList('Sell', bearish)}
+        `;
+      } catch (err) {
+        recsModalBody.innerHTML = '<div class="text-danger">Failed to load recommendations.</div>';
+        console.error(err);
+      } finally {
+        viewAllBtn.disabled = false;
+        viewAllBtn.textContent = 'See all';
+        recsModal.show();
+      }
+    });
   }
 
   // ----- Charts -----
